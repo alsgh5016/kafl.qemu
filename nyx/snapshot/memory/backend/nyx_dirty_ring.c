@@ -74,7 +74,7 @@ static void allocate_dirty_ring(int kvm_vcpu, int vm_fd)
     if (dirty_ring_size) {
         kvm_dirty_gfns = mmap(NULL, dirty_ring_size, PROT_READ | PROT_WRITE,
                               MAP_SHARED, kvm_vcpu,
-                              (uint64_t) PAGE_SIZE * KVM_DIRTY_LOG_PAGE_OFFSET);
+                              (uint64_t) x86_64_PAGE_SIZE * KVM_DIRTY_LOG_PAGE_OFFSET);
         if (kvm_dirty_gfns == MAP_FAILED) {
             nyx_abort("Dirty ring mmap failed!\n");
         }
@@ -311,7 +311,7 @@ static uint32_t restore_memory(nyx_dirty_ring_t          *self,
                         entry_offset_addr;
                 }
 
-                memcpy(host_addr, snapshot_addr, TARGET_PAGE_SIZE);
+                memcpy(host_addr, snapshot_addr, x86_64_PAGE_SIZE);
 
                 clear_bit(gfn, (void *)kvm_region_slot->bitmap);
                 num_dirty_pages++;
@@ -362,7 +362,7 @@ static void save_root_pages(nyx_dirty_ring_t          *self,
                 shadow_memory_track_dirty_root_pages(shadow_memory_state,
                                                      entry_offset_addr,
                                                      kvm_region_slot->region_id);
-                memcpy(incremental_addr, host_addr, TARGET_PAGE_SIZE);
+                memcpy(incremental_addr, host_addr, x86_64_PAGE_SIZE);
 
                 clear_bit(gfn, (void *)kvm_region_slot->bitmap);
             }

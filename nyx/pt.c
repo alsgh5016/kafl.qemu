@@ -227,11 +227,24 @@ void pt_init_decoder(CPUState *cpu)
     assert(GET_GLOBAL_STATE()->decoder == NULL);
     assert(GET_GLOBAL_STATE()->shared_bitmap_ptr != NULL);
     assert(GET_GLOBAL_STATE()->shared_bitmap_size != 0);
+
+
+    if (GET_GLOBAL_STATE()->pt_ip_filter_configured[0] == false && 
+        GET_GLOBAL_STATE()->pt_ip_filter_configured[1] == false && 
+        GET_GLOBAL_STATE()->pt_ip_filter_configured[2] == false && 
+        GET_GLOBAL_STATE()->pt_ip_filter_configured[3] == false) {
+        nyx_abort("Intel PT mode cannot be enabled without any IP filters configured...\n");
+    }
+
     GET_GLOBAL_STATE()->decoder =
         libxdc_init(filters, (void *(*)(void *, uint64_t, bool *))page_cache_fetch2,
                     GET_GLOBAL_STATE()->page_cache,
                     GET_GLOBAL_STATE()->shared_bitmap_ptr,
                     GET_GLOBAL_STATE()->shared_bitmap_size);
+
+    if (GET_GLOBAL_STATE()->decoder == (void*)-1) {
+        nyx_abort("libxdc_init() has failed ...\n");
+    }
 
     libxdc_register_bb_callback(GET_GLOBAL_STATE()->decoder,
                                 (void (*)(void *, disassembler_mode_t, uint64_t,
@@ -326,7 +339,7 @@ void pt_pre_kvm_run(CPUState *cpu)
                 nyx_abort("ToPA allocation failure. Check kernel logs.\n");
             }
 
-            assert(ret % PAGE_SIZE == 0);
+            assert(ret % x86_64_PAGE_SIZE == 0);
             cpu->pt_mmap = mmap((void *)PT_BUFFER_MMAP_ADDR, ret,
                                 PROT_READ | PROT_WRITE, MAP_SHARED, cpu->pt_fd, 0);
             assert(cpu->pt_mmap != (void *)0xFFFFFFFFFFFFFFFF);

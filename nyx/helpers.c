@@ -121,6 +121,11 @@ static void resize_coverage_bitmap(uint32_t new_bitmap_size)
 {
     uint32_t new_bitmap_shm_size = new_bitmap_size;
 
+    /* check if we really need to resize the shared memory buffer */
+    if (new_bitmap_size == GET_GLOBAL_STATE()->shared_bitmap_size) {
+        return;
+    }
+
     if (new_bitmap_shm_size % 64 > 0) {
         new_bitmap_shm_size = ((new_bitmap_shm_size + 64) >> 6) << 6;
     }
@@ -134,9 +139,9 @@ static void resize_coverage_bitmap(uint32_t new_bitmap_size)
     GET_GLOBAL_STATE()->auxilary_buffer->capabilites.agent_coverage_bitmap_size =
         new_bitmap_size;
 
-    if (new_bitmap_size & (PAGE_SIZE - 1)) {
+    if (new_bitmap_size & (x86_64_PAGE_SIZE - 1)) {
         GET_GLOBAL_STATE()->shared_bitmap_size =
-            (new_bitmap_size & ~(PAGE_SIZE - 1)) + PAGE_SIZE;
+            (new_bitmap_size & ~(x86_64_PAGE_SIZE - 1)) + x86_64_PAGE_SIZE;
     }
 }
 

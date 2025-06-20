@@ -45,7 +45,7 @@ static bool reload_addresses(page_cache_t *self)
                     nyx_warn("Load page: %lx (UNMAPPED)\n", addr);
                 } else {
                     k = kh_put(PC_CACHE, self->lookup, addr, &ret);
-                    kh_value(self->lookup, k) = (offset - 1) * PAGE_SIZE;
+                    kh_value(self->lookup, k) = (offset - 1) * x86_64_PAGE_SIZE;
                 }
             } else {
                 /* likely a bug / race condition in page_cache itself! */
@@ -55,9 +55,9 @@ static bool reload_addresses(page_cache_t *self)
         }
 
         /* reload page dump file */
-        munmap(self->page_data, self->num_pages * PAGE_SIZE);
+        munmap(self->page_data, self->num_pages * x86_64_PAGE_SIZE);
         self->num_pages = self_offset / PAGE_CACHE_ADDR_LINE_SIZE;
-        self->page_data = mmap(NULL, (self->num_pages) * PAGE_SIZE,
+        self->page_data = mmap(NULL, (self->num_pages) * x86_64_PAGE_SIZE,
                                PROT_READ | PROT_WRITE, MAP_SHARED,
                                self->fd_page_file, 0);
 
@@ -71,31 +71,31 @@ static bool append_page(page_cache_t *self, uint64_t page, uint64_t cr3)
 {
     bool success = true;
     if (!self->num_pages) {
-        assert(!ftruncate(self->fd_page_file, (self->num_pages + 1) * PAGE_SIZE));
-        self->page_data = mmap(NULL, (self->num_pages + 1) * PAGE_SIZE,
+        assert(!ftruncate(self->fd_page_file, (self->num_pages + 1) * x86_64_PAGE_SIZE));
+        self->page_data = mmap(NULL, (self->num_pages + 1) * x86_64_PAGE_SIZE,
                                PROT_READ | PROT_WRITE, MAP_SHARED,
                                self->fd_page_file, 0);
     } else {
-        munmap(self->page_data, self->num_pages * PAGE_SIZE);
-        assert(!ftruncate(self->fd_page_file, (self->num_pages + 1) * PAGE_SIZE));
-        self->page_data = mmap(NULL, (self->num_pages + 1) * PAGE_SIZE,
+        munmap(self->page_data, self->num_pages * x86_64_PAGE_SIZE);
+        assert(!ftruncate(self->fd_page_file, (self->num_pages + 1) * x86_64_PAGE_SIZE));
+        self->page_data = mmap(NULL, (self->num_pages + 1) * x86_64_PAGE_SIZE,
                                PROT_READ | PROT_WRITE, MAP_SHARED,
                                self->fd_page_file, 0);
     }
 
-    if (!dump_page_cr3_ht(page, self->page_data + (PAGE_SIZE * self->num_pages),
+    if (!dump_page_cr3_ht(page, self->page_data + (x86_64_PAGE_SIZE * self->num_pages),
                           self->cpu, GET_GLOBAL_STATE()->pt_c3_filter))
     {
-        if (!dump_page_cr3_ht(page, self->page_data + (PAGE_SIZE * self->num_pages),
+        if (!dump_page_cr3_ht(page, self->page_data + (x86_64_PAGE_SIZE * self->num_pages),
                               self->cpu, GET_GLOBAL_STATE()->parent_cr3))
         {
             if (!dump_page_cr3_snapshot(page,
-                                        self->page_data + (PAGE_SIZE * self->num_pages),
+                                        self->page_data + (x86_64_PAGE_SIZE * self->num_pages),
                                         self->cpu, GET_GLOBAL_STATE()->parent_cr3))
             {
-                munmap(self->page_data, (self->num_pages + 1) * PAGE_SIZE);
-                assert(!ftruncate(self->fd_page_file, (self->num_pages) * PAGE_SIZE));
-                self->page_data = mmap(NULL, (self->num_pages) * PAGE_SIZE,
+                munmap(self->page_data, (self->num_pages + 1) * x86_64_PAGE_SIZE);
+                assert(!ftruncate(self->fd_page_file, (self->num_pages) * x86_64_PAGE_SIZE));
+                self->page_data = mmap(NULL, (self->num_pages) * x86_64_PAGE_SIZE,
                                        PROT_READ | PROT_WRITE, MAP_SHARED,
                                        self->fd_page_file, 0);
 
@@ -170,7 +170,7 @@ static bool update_page_cache(page_cache_t *self, uint64_t page, khiter_t *k)
                 *k = kh_put(PC_CACHE, self->lookup, page, &ret);
                 assert(write(self->fd_address_file, &page,
                              PAGE_CACHE_ADDR_LINE_SIZE) == PAGE_CACHE_ADDR_LINE_SIZE);
-                kh_value(self->lookup, *k) = (self->num_pages - 1) * PAGE_SIZE;
+                kh_value(self->lookup, *k) = (self->num_pages - 1) * x86_64_PAGE_SIZE;
             } else {
                 page_cache_unlock(self);
                 return false;

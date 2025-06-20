@@ -37,6 +37,7 @@
 #include "nyx/snapshot/devices/state_reallocation.h"
 #include "nyx/snapshot/devices/vm_change_state_handlers.h"
 #include "nyx/snapshot/devices/nyx_qio_buffer.h"
+#include "nyx/snapshot/helper.h"
 
 #define STATE_BUFFER 0x8000000 /* up to 128MB */
 
@@ -158,7 +159,7 @@ static void fast_qemu_savevm_state_complete_precopy(QEMUFile *f, bool iterable_o
 
     vmdesc = json_writer_new(false);
     json_writer_start_object(vmdesc, NULL);
-    json_writer_int64(vmdesc, "page_size", TARGET_PAGE_SIZE);
+    json_writer_int64(vmdesc, "page_size", x86_64_PAGE_SIZE);
     json_writer_start_array(vmdesc, "devices");
     QTAILQ_FOREACH (se, &savevm_state.handlers, entry) {
         if (strcmp(se->idstr, "ram") && strcmp(se->idstr, "block")) {

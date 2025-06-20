@@ -95,7 +95,7 @@ uint32_t nyx_snapshot_user_fdl_restore(nyx_fdl_user_t  *self,
                 printf("%s -> %p <-- %p\n", __func__, host_addr, snapshot_addr);
 #endif
                 clear_bit(entry_offset_addr >> 12, (void *)self->entry[i].bitmap);
-                memcpy(host_addr, snapshot_addr, TARGET_PAGE_SIZE);
+                memcpy(host_addr, snapshot_addr, x86_64_PAGE_SIZE);
                 num_dirty_pages++;
             }
         }
@@ -250,7 +250,7 @@ void nyx_snapshot_nyx_fdl_user_save_root_pages(nyx_fdl_user_t  *self,
             clear_bit(entry_offset_addr >> 12, (void *)self->entry[i].bitmap);
             shadow_memory_track_dirty_root_pages(shadow_memory_state,
                                                  entry_offset_addr, i);
-            memcpy(incremental_addr, host_addr, TARGET_PAGE_SIZE);
+            memcpy(incremental_addr, host_addr, x86_64_PAGE_SIZE);
         }
     }
 

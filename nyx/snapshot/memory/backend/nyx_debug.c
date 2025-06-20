@@ -56,7 +56,7 @@ uint32_t nyx_snapshot_debug_restore(shadow_memory_t           *shadow_memory_sta
             uint64_t physical_addr = addr + shadow_memory_state->ram_regions[i].base;
 
             /* check first if the page is dirty (this is super slow, but quite useful for debugging) */
-            if (memcmp(host_addr, snapshot_addr, TARGET_PAGE_SIZE)) {
+            if (memcmp(host_addr, snapshot_addr, x86_64_PAGE_SIZE)) {
                 /* check if page is not on the block list */
                 if (snapshot_page_blocklist_check_phys_addr(blocklist,
                                                             physical_addr) == false)
@@ -70,7 +70,7 @@ uint32_t nyx_snapshot_debug_restore(shadow_memory_t           *shadow_memory_sta
                         counter++;
                     }
 
-                    memcpy(host_addr, snapshot_addr, TARGET_PAGE_SIZE);
+                    memcpy(host_addr, snapshot_addr, x86_64_PAGE_SIZE);
                     num_dirty_pages++;
                 }
             }
@@ -108,7 +108,7 @@ void nyx_snapshot_debug_save_root_pages(shadow_memory_t *shadow_memory_state,
                 shadow_memory_state->ram_regions[i].incremental_region_ptr + addr;
 
             /* check first if the page is dirty (this is super slow, but quite useful for debugging) */
-            if (memcmp(host_addr, snapshot_addr, TARGET_PAGE_SIZE)) {
+            if (memcmp(host_addr, snapshot_addr, x86_64_PAGE_SIZE)) {
                 /* check if page is not on the block list */
                 if (snapshot_page_blocklist_check_phys_addr(blocklist,
                                                             physical_addr) == false)
@@ -125,7 +125,7 @@ void nyx_snapshot_debug_save_root_pages(shadow_memory_t *shadow_memory_state,
                     }
 
                     shadow_memory_track_dirty_root_pages(shadow_memory_state, addr, i);
-                    memcpy(incremental_addr, host_addr, TARGET_PAGE_SIZE);
+                    memcpy(incremental_addr, host_addr, x86_64_PAGE_SIZE);
                 }
             }
         }

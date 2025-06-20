@@ -341,9 +341,9 @@ void shadow_memory_restore_memory(shadow_memory_t *self)
         slot = self->root_track_pages_stack[i] & 0xFFF;
 
         memcpy(self->ram_regions[slot].host_region_ptr + addr,
-               self->ram_regions[slot].snapshot_region_ptr + addr, TARGET_PAGE_SIZE);
+               self->ram_regions[slot].snapshot_region_ptr + addr, x86_64_PAGE_SIZE);
         memcpy(self->ram_regions[slot].incremental_region_ptr + addr,
-               self->ram_regions[slot].snapshot_region_ptr + addr, TARGET_PAGE_SIZE);
+               self->ram_regions[slot].snapshot_region_ptr + addr, x86_64_PAGE_SIZE);
     }
 
     self->root_track_pages_num = 0;

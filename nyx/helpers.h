@@ -1,9 +1,6 @@
 #pragma once
 
-#ifdef PAGE_SIZE
-#undef PAGE_SIZE
-#endif
-#define PAGE_SIZE qemu_real_host_page_size()
+#define x86_64_PAGE_SIZE 0x1000
 
 uint64_t get_rip(CPUState *cpu);
 

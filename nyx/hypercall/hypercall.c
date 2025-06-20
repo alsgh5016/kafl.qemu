@@ -56,11 +56,7 @@ along with QEMU-PT.  If not, see <http://www.gnu.org/licenses/>.
 #include "nyx/state/state.h"
 #include "nyx/synchronization.h"
 
-#define HPRINTF_SIZE 0x1000 /* FIXME: take from nyx.h */
-
 bool hypercall_enabled = false;
-char hprintf_buffer[HPRINTF_SIZE];
-
 static bool init_state = true;
 
 void skip_init(void)
@@ -118,12 +114,17 @@ bool handle_hypercall_kafl_next_payload(struct kvm_run *run,
                                        REQUEST_SAVE_SNAPSHOT_ROOT_FIX_RIP);
                 setup_snapshot_once = true;
 
-                for (int i = 0; i < INTEL_PT_MAX_RANGES; i++) {
-                    if (GET_GLOBAL_STATE()->pt_ip_filter_configured[i]) {
-                        pt_enable_ip_filtering(cpu, i, true, false);
+                /* At this point we need to check if PT mode is enabled
+                 * and configured. Otherwise, libxdc_init() will fail.
+                 */
+                if(GET_GLOBAL_STATE()->nyx_pt && GET_GLOBAL_STATE()->cap_compile_time_tracing == false) {
+                    for (int i = 0; i < INTEL_PT_MAX_RANGES; i++) {
+                        if (GET_GLOBAL_STATE()->pt_ip_filter_configured[i]) {
+                            pt_enable_ip_filtering(cpu, i, true, false);
+                        }
                     }
+                    pt_init_decoder(cpu);
                 }
-                pt_init_decoder(cpu);
                 request_fast_vm_reload(GET_GLOBAL_STATE()->reload_state,
                                        REQUEST_LOAD_SNAPSHOT_ROOT);
 
@@ -540,17 +541,18 @@ static void handle_hypercall_kafl_panic_extended(struct kvm_run *run,
                                                  CPUState       *cpu,
                                                  uint64_t        hypercall_arg)
 {
-    read_virtual_memory(hypercall_arg, (uint8_t *)hprintf_buffer, HPRINTF_SIZE, cpu);
+    uint32_t hprintf_size = misc_data_size();
+    read_virtual_memory(hypercall_arg, (uint8_t *)GET_GLOBAL_STATE()->hprintf_tmp_buffer, hprintf_size, cpu);
 
     if (fast_reload_snapshot_exists(get_fast_reload_snapshot()) &&
         GET_GLOBAL_STATE()->in_fuzzing_mode)
     {
         set_crash_reason_auxiliary_buffer(GET_GLOBAL_STATE()->auxilary_buffer,
-                                          hprintf_buffer, strlen(hprintf_buffer));
+                                          GET_GLOBAL_STATE()->hprintf_tmp_buffer, strnlen(GET_GLOBAL_STATE()->hprintf_tmp_buffer, hprintf_size));
         synchronization_lock_crash_found();
     } else {
         nyx_abort("Agent has crashed before initializing the fuzzing loop: %s",
-                  hprintf_buffer);
+                  GET_GLOBAL_STATE()->hprintf_tmp_buffer);
     }
 }
 
@@ -591,12 +593,11 @@ static void handle_hypercall_kafl_printf(struct kvm_run *run,
                                          CPUState       *cpu,
                                          uint64_t        hypercall_arg)
 {
-    read_virtual_memory(hypercall_arg, (uint8_t *)hprintf_buffer, HPRINTF_SIZE, cpu);
-    // hprintf_buffer[HPRINTF_SIZE] = 0;
-    // nyx_debug("%s: %s\n", __func__, hprintf_buffer);
+    uint32_t hprintf_size = misc_data_size();
+    read_virtual_memory(hypercall_arg, (uint8_t *)GET_GLOBAL_STATE()->hprintf_tmp_buffer, hprintf_size, cpu);
 
-    set_hprintf_auxiliary_buffer(GET_GLOBAL_STATE()->auxilary_buffer, hprintf_buffer,
-                                 strnlen(hprintf_buffer, HPRINTF_SIZE));
+    set_hprintf_auxiliary_buffer(GET_GLOBAL_STATE()->auxilary_buffer, GET_GLOBAL_STATE()->hprintf_tmp_buffer,
+                                 strnlen(GET_GLOBAL_STATE()->hprintf_tmp_buffer, hprintf_size));
     synchronization_lock();
 }
 
@@ -676,10 +677,11 @@ static void handle_hypercall_kafl_user_abort(struct kvm_run *run,
                                              CPUState       *cpu,
                                              uint64_t        hypercall_arg)
 {
-    read_virtual_memory(hypercall_arg, (uint8_t *)hprintf_buffer, HPRINTF_SIZE, cpu);
+    uint32_t hprintf_size = misc_data_size();
+    read_virtual_memory(hypercall_arg, (uint8_t *)GET_GLOBAL_STATE()->hprintf_tmp_buffer, hprintf_size, cpu);
     set_abort_reason_auxiliary_buffer(GET_GLOBAL_STATE()->auxilary_buffer,
-                                      hprintf_buffer,
-                                      strnlen(hprintf_buffer, HPRINTF_SIZE));
+                                      GET_GLOBAL_STATE()->hprintf_tmp_buffer,
+                                      strnlen(GET_GLOBAL_STATE()->hprintf_tmp_buffer, hprintf_size));
     synchronization_lock();
 }
 
@@ -780,17 +782,17 @@ static void handle_hypercall_kafl_dump_file(struct kvm_run *run,
 
     uint32_t pos     = 0;
     int32_t  bytes   = file_obj.bytes;
-    void    *page    = malloc(PAGE_SIZE);
+    void    *page    = malloc(x86_64_PAGE_SIZE);
     uint32_t written = 0;
 
     nyx_debug_p(CORE_PREFIX, "Dump %d bytes to %s (append=%u)\n", bytes, host_path,
                 file_obj.append);
 
     while (bytes > 0) {
-        if (bytes >= PAGE_SIZE) {
-            read_virtual_memory(file_obj.data_ptr + pos, (uint8_t *)page, PAGE_SIZE,
+        if (bytes >= x86_64_PAGE_SIZE) {
+            read_virtual_memory(file_obj.data_ptr + pos, (uint8_t *)page, x86_64_PAGE_SIZE,
                                 cpu);
-            written = fwrite(page, 1, PAGE_SIZE, f);
+            written = fwrite(page, 1, x86_64_PAGE_SIZE, f);
         } else {
             read_virtual_memory(file_obj.data_ptr + pos, (uint8_t *)page, bytes, cpu);
             written = fwrite(page, 1, bytes, f);

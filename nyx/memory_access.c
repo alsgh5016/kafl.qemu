@@ -42,7 +42,6 @@ static uint64_t get_48_paging_phys_addr(uint64_t cr3,
                                         uint64_t addr,
                                         bool     read_from_snapshot);
 
-#define x86_64_PAGE_SIZE 0x1000
 #define x86_64_PAGE_MASK ~(x86_64_PAGE_SIZE - 1)
 
 mem_mode_t get_current_mem_mode(CPUState *cpu)
@@ -270,8 +269,8 @@ void resize_shared_memory(uint32_t new_size, uint32_t *shm_size, void **shm_ptr,
     assert(fd && *shm_size);
 
     /* check if the new_size is a multiple of PAGE_SIZE */
-    if (new_size & (PAGE_SIZE - 1)) {
-        new_size = (new_size & ~(PAGE_SIZE - 1)) + PAGE_SIZE;
+    if (new_size & (x86_64_PAGE_SIZE - 1)) {
+        new_size = (new_size & ~(x86_64_PAGE_SIZE - 1)) + x86_64_PAGE_SIZE;
     }
 
     if (*shm_size >= new_size) {
