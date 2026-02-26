@@ -403,10 +403,17 @@ static void handle_hypercall_kafl_cr3(struct kvm_run *run,
                                       uint64_t        hypercall_arg)
 {
     if (hypercall_enabled) {
-        nyx_debug_p(CORE_PREFIX, "Setting CR3 filter: %lx\n", hypercall_arg);
-        pt_set_cr3(cpu, hypercall_arg & 0xFFFFFFFFFFFFF000ULL, false);
+        uint64_t cr3_val = hypercall_arg & 0xFFFFFFFFFFFFF000ULL;
+        if (cr3_val == 0) {
+            /* arg=0: auto-capture current vCPU CR3 */
+            kvm_arch_get_registers(cpu);
+            CPUX86State *env = &(X86_CPU(cpu))->env;
+            cr3_val = env->cr[3] & 0xFFFFFFFFFFFFF000ULL;
+        }
+        nyx_debug_p(CORE_PREFIX, "Setting CR3 filter: %lx\n", cr3_val);
+        pt_set_cr3(cpu, cr3_val, false);
         if (GET_GLOBAL_STATE()->dump_page) {
-            set_page_dump_bp(cpu, hypercall_arg & 0xFFFFFFFFFFFFF000ULL,
+            set_page_dump_bp(cpu, cr3_val,
                              GET_GLOBAL_STATE()->dump_page_addr);
         }
     }
