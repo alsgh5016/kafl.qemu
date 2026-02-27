@@ -157,6 +157,22 @@ void handle_hypercall_kafl_acquire(struct kvm_run *run,
 {
     if (hypercall_enabled) {
         if (!init_state) {
+            /*
+             * If NEXT_PAYLOAD was never called (single-shot mode),
+             * initialize PT hardware here: push IP filters to KVM,
+             * init decoder, and set in_fuzzing_mode so pt_dump()
+             * actually writes trace data.
+             */
+            if (!setup_snapshot_once) {
+                for (int i = 0; i < INTEL_PT_MAX_RANGES; i++) {
+                    if (GET_GLOBAL_STATE()->pt_ip_filter_configured[i]) {
+                        pt_enable_ip_filtering(cpu, i, true, false);
+                    }
+                }
+                pt_init_decoder(cpu);
+                GET_GLOBAL_STATE()->in_fuzzing_mode = true;
+                setup_snapshot_once = true;
+            }
             acquire_print_once(cpu);
             synchronization_enter_fuzzing_loop(cpu);
         }
