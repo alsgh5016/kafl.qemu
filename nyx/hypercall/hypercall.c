@@ -702,6 +702,25 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
     X86CPU      *cpux86 = X86_CPU(cpu);
     CPUX86State *env    = &cpux86->env;
 
+    /* ===== API Hook check ===== */
+    if (GET_GLOBAL_STATE()->api_hook_mode) {
+        uint64_t hit_addr = env->eip;
+        for (int i = 0; i < GET_GLOBAL_STATE()->num_api_hooks; i++) {
+            if (GET_GLOBAL_STATE()->api_hooks[i].active &&
+                GET_GLOBAL_STATE()->api_hooks[i].addr == hit_addr) {
+                nyx_printf(">>> API HOOK HIT: %s @ 0x%lx <<<\n",
+                           GET_GLOBAL_STATE()->api_hooks[i].name, hit_addr);
+                /* Remove BP, single-step, then re-insert */
+                remove_breakpoint(cpu, hit_addr, 1);
+                GET_GLOBAL_STATE()->api_hook_saved_rip = hit_addr;
+                GET_GLOBAL_STATE()->api_hook_step_idx = i;
+                kvm_vcpu_ioctl(cpu, KVM_VMX_PT_ENABLE_MTF);
+                return true;
+            }
+        }
+    }
+    /* ===== End API Hook check ===== */
+
     for (uint8_t i = 0; i < INTEL_PT_MAX_RANGES; i++) {
         if (GET_GLOBAL_STATE()->redqueen_state &&
             (env->eip >= GET_GLOBAL_STATE()->pt_ip_filter_a[i]) &&
