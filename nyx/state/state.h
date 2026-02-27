@@ -159,6 +159,18 @@ typedef struct qemu_nyx_state_s {
     auxilary_buffer_config_t shadow_config;
     sharedir_t              *sharedir;
 
+     /* API Hook for unpacking analysis */
+    #define MAX_API_HOOKS 16
+    struct {
+        uint64_t addr;
+        char     name[64];
+        bool     active;
+    } api_hooks[MAX_API_HOOKS];
+    int      num_api_hooks;
+    bool     api_hook_mode;        /* true when API hooks are installed */
+    uint64_t api_hook_saved_rip;   /* for single-step resume */
+    int      api_hook_step_idx;    /* which hook is being single-stepped */
+
     QTAILQ_HEAD(, kvm_sw_breakpoint) redqueen_breakpoints;
 } qemu_nyx_state_t;
 
