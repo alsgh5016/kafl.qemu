@@ -358,17 +358,24 @@ struct kvm_set_guest_debug_data {
 
 void handle_hypercall_kafl_mtf(struct kvm_run *run, CPUState *cpu, uint64_t hypercall_arg)
 {
-    // assert(false);
     kvm_arch_get_registers_fast(cpu);
-
     nyx_printf("%s --> %lx\n", __func__, get_rip(cpu));
-
     kvm_vcpu_ioctl(cpu, KVM_VMX_PT_DISABLE_MTF);
-
+    /* Check if this MTF is for API hook single-step resume */
+    if (GET_GLOBAL_STATE()->api_hook_mode &&
+        GET_GLOBAL_STATE()->api_hook_step_idx >= 0) {
+        int idx = GET_GLOBAL_STATE()->api_hook_step_idx;
+        uint64_t hook_addr = GET_GLOBAL_STATE()->api_hook_saved_rip;
+        nyx_printf("  MTF: re-inserting API hook[%d] at 0x%lx\n", idx, hook_addr);
+        /* Re-insert the breakpoint */
+        insert_breakpoint(cpu, hook_addr, 1);
+        GET_GLOBAL_STATE()->api_hook_step_idx = -1;
+        return;
+    }
+    /* Original MTF behavior (page dump) */
     kvm_remove_all_breakpoints(cpu);
     kvm_insert_breakpoint(cpu, GET_GLOBAL_STATE()->dump_page_addr, 1, 1);
     kvm_update_guest_debug(cpu, 0);
-
     kvm_vcpu_ioctl(cpu, KVM_VMX_PT_SET_PAGE_DUMP_CR3,
                    GET_GLOBAL_STATE()->pt_c3_filter);
     kvm_vcpu_ioctl(cpu, KVM_VMX_PT_ENABLE_PAGE_DUMP_CR3);
@@ -379,23 +386,44 @@ void handle_hypercall_kafl_page_dump_bp(struct kvm_run *run,
                                         uint64_t        hypercall_arg,
                                         uint64_t        page)
 {
-    // nyx_trace();
     kvm_arch_get_registers_fast(cpu);
-    nyx_debug("%s --> %lx\n", __func__, get_rip(cpu));
+    uint64_t hit_addr = page;  /* = run->debug.arch.pc */
+    nyx_printf("%s --> hit at 0x%lx\n", __func__, hit_addr);
     kvm_vcpu_ioctl(cpu, KVM_VMX_PT_DISABLE_MTF);
-
+    /* Check if this is an API hook hit */
+    if (GET_GLOBAL_STATE()->api_hook_mode) {
+        for (int i = 0; i < GET_GLOBAL_STATE()->num_api_hooks; i++) {
+            if (GET_GLOBAL_STATE()->api_hooks[i].active &&
+                GET_GLOBAL_STATE()->api_hooks[i].addr == hit_addr) {
+                nyx_printf(">>> API HOOK HIT: %s @ 0x%lx <<<\n",
+                           GET_GLOBAL_STATE()->api_hooks[i].name, hit_addr);
+                /* Dump process memory via hprintf log */
+                char log_msg[256];
+                snprintf(log_msg, sizeof(log_msg),
+                         "[API_HOOK] %s called at RIP=0x%lx\n",
+                         GET_GLOBAL_STATE()->api_hooks[i].name, hit_addr);
+                set_hprintf_auxiliary_buffer(
+                    GET_GLOBAL_STATE()->auxilary_buffer,
+                    log_msg, strlen(log_msg));
+                /* Remove BP, enable single-step (MTF) to execute the original instruction,
+                 * then re-insert BP */
+                remove_breakpoint(cpu, hit_addr, 1);
+                GET_GLOBAL_STATE()->api_hook_saved_rip = hit_addr;
+                GET_GLOBAL_STATE()->api_hook_step_idx = i;
+                kvm_vcpu_ioctl(cpu, KVM_VMX_PT_ENABLE_MTF);
+                return;
+            }
+        }
+    }
+    /* Fallback to original page dump behavior */
     bool success = false;
-    // nyx_printf("page_cache_fetch = %lx\n",
-    // page_cache_fetch(GET_GLOBAL_STATE()->page_cache, page, &success, false));
     page_cache_fetch(GET_GLOBAL_STATE()->page_cache, page, &success, false);
     if (success) {
         nyx_debug("%s: SUCCESS: %d\n", __func__, success);
         kvm_remove_all_breakpoints(cpu);
         kvm_vcpu_ioctl(cpu, KVM_VMX_PT_DISABLE_PAGE_DUMP_CR3);
-
     } else {
         nyx_debug("%s: FAIL: %d\n", __func__, success);
-
         kvm_remove_all_breakpoints(cpu);
         kvm_vcpu_ioctl(cpu, KVM_VMX_PT_DISABLE_PAGE_DUMP_CR3);
         kvm_vcpu_ioctl(cpu, KVM_VMX_PT_ENABLE_MTF);
@@ -850,6 +878,43 @@ static void handle_hypercall_kafl_persist_page_past_snapshot(struct kvm_run *run
     fast_reload_blacklist_page(get_fast_reload_snapshot(), phys_addr);
 }
 
+/*
+ * API Hook handler - receives API addresses from harness,
+ * installs INT3 breakpoints for Windows API call detection.
+ */
+static void handle_hypercall_kafl_hook_api(struct kvm_run *run,
+                                           CPUState       *cpu,
+                                           uint64_t        hypercall_arg)
+{
+    typedef struct {
+        uint64_t num_hooks;
+        uint64_t addresses[16];
+        char     names[16][64];
+    } __attribute__((packed)) kafl_api_hook_t;
+    kafl_api_hook_t hook_data;
+    kvm_arch_get_registers(cpu);
+    read_virtual_memory(hypercall_arg, (uint8_t *)&hook_data, sizeof(hook_data), cpu);
+    if (hook_data.num_hooks > 16) {
+        nyx_error("HOOK_API: too many hooks (%lu)\n", hook_data.num_hooks);
+        hook_data.num_hooks = 16;
+    }
+    nyx_printf("=== Installing %lu API hooks ===\n", hook_data.num_hooks);
+    /* Store hooks in global state */
+    GET_GLOBAL_STATE()->num_api_hooks = (int)hook_data.num_hooks;
+    GET_GLOBAL_STATE()->api_hook_mode = true;
+    for (int i = 0; i < (int)hook_data.num_hooks; i++) {
+        GET_GLOBAL_STATE()->api_hooks[i].addr = hook_data.addresses[i];
+        GET_GLOBAL_STATE()->api_hooks[i].active = true;
+        memcpy(GET_GLOBAL_STATE()->api_hooks[i].name, hook_data.names[i], 64);
+        nyx_printf("  Hook[%d]: %s @ 0x%lx\n", i,
+                   GET_GLOBAL_STATE()->api_hooks[i].name,
+                   hook_data.addresses[i]);
+        /* Install INT3 breakpoint */
+        insert_breakpoint(cpu, hook_data.addresses[i], 1);
+    }
+    nyx_printf("=== API hooks installed ===\n");
+}
+
 int handle_kafl_hypercall(struct kvm_run *run,
                           CPUState       *cpu,
                           uint64_t        hypercall,
@@ -1018,6 +1083,10 @@ int handle_kafl_hypercall(struct kvm_run *run,
         break;
     case KVM_EXIT_KAFL_PERSIST_PAGE_PAST_SNAPSHOT:
         handle_hypercall_kafl_persist_page_past_snapshot(run, cpu, arg);
+        ret = 0;
+        break;
+    case KVM_EXIT_KAFL_HOOK_API:
+        handle_hypercall_kafl_hook_api(run, cpu, arg);
         ret = 0;
         break;
     }
