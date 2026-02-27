@@ -92,42 +92,41 @@ static inline int pt_ioctl(int fd, unsigned long request, unsigned long arg)
 
 void pt_dump(CPUState *cpu, int bytes)
 {
-    // TODO(mino): test pt dump
-    nyx_debug("pt_dump called: bytes=%d, in_fuzzing=%d, decoder=%p, page_fault=%d, dump_page=%d\n",
-                bytes,
-                GET_GLOBAL_STATE()->in_fuzzing_mode,
-                GET_GLOBAL_STATE()->decoder,
-                GET_GLOBAL_STATE()->decoder_page_fault,
-                GET_GLOBAL_STATE()->dump_page);
     if (!(GET_GLOBAL_STATE()->redqueen_state &&
           GET_GLOBAL_STATE()->redqueen_state->intercept_mode))
     {
         if (GET_GLOBAL_STATE()->in_fuzzing_mode &&
             GET_GLOBAL_STATE()->decoder_page_fault == false &&
-            GET_GLOBAL_STATE()->decoder && !GET_GLOBAL_STATE()->dump_page)
+            !GET_GLOBAL_STATE()->dump_page)
         {
             GET_GLOBAL_STATE()->pt_trace_size += bytes;
             pt_write_pt_dump_file(cpu->pt_mmap, bytes);
-            decoder_result_t result =
+
+            /* Only decode if decoder was initialized (requires snapshot).
+             * In single-shot mode without NEXT_PAYLOAD, decoder is NULL
+             * and we just write raw PT data for offline analysis. */
+            if (GET_GLOBAL_STATE()->decoder) {
+                decoder_result_t result =
                 libxdc_decode(GET_GLOBAL_STATE()->decoder, cpu->pt_mmap, bytes);
-            switch (result) {
-            case decoder_success:
-                break;
-            case decoder_success_pt_overflow:
-                cpu->intel_pt_run_trashed = true;
-                break;
-            case decoder_page_fault:
-                // nyx_warn("Page not found => 0x%lx\n", libxdc_get_page_fault_addr(GET_GLOBAL_STATE()->decoder));
-                GET_GLOBAL_STATE()->decoder_page_fault = true;
-                GET_GLOBAL_STATE()->decoder_page_fault_addr =
-                    libxdc_get_page_fault_addr(GET_GLOBAL_STATE()->decoder);
-                break;
-            case decoder_unkown_packet:
-                nyx_warn("libxdc_decode returned unknown_packet\n");
-                break;
-            case decoder_error:
-                nyx_warn("libxdc_decode returned decoder_error\n");
-                break;
+                switch (result) {
+                case decoder_success:
+                    break;
+                case decoder_success_pt_overflow:
+                    cpu->intel_pt_run_trashed = true;
+                    break;
+                case decoder_page_fault:
+                    // nyx_warn("Page not found => 0x%lx\n", libxdc_get_page_fault_addr(GET_GLOBAL_STATE()->decoder));
+                    GET_GLOBAL_STATE()->decoder_page_fault = true;
+                    GET_GLOBAL_STATE()->decoder_page_fault_addr =
+                        libxdc_get_page_fault_addr(GET_GLOBAL_STATE()->decoder);
+                    break;
+                case decoder_unkown_packet:
+                    nyx_warn("libxdc_decode returned unknown_packet\n");
+                    break;
+                case decoder_error:
+                    nyx_warn("libxdc_decode returned decoder_error\n");
+                    break;
+                }
             }
         }
     }

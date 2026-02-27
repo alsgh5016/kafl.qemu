@@ -169,7 +169,6 @@ void handle_hypercall_kafl_acquire(struct kvm_run *run,
                         pt_enable_ip_filtering(cpu, i, true, false);
                     }
                 }
-                pt_init_decoder(cpu);
                 GET_GLOBAL_STATE()->in_fuzzing_mode = true;
                 setup_snapshot_once = true;
             }
