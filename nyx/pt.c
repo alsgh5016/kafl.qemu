@@ -92,6 +92,13 @@ static inline int pt_ioctl(int fd, unsigned long request, unsigned long arg)
 
 void pt_dump(CPUState *cpu, int bytes)
 {
+    // TODO(mino): test pt dump
+    nyx_debug("pt_dump called: bytes=%d, in_fuzzing=%d, decoder=%p, page_fault=%d, dump_page=%d\n",
+                bytes,
+                GET_GLOBAL_STATE()->in_fuzzing_mode,
+                GET_GLOBAL_STATE()->decoder,
+                GET_GLOBAL_STATE()->decoder_page_fault,
+                GET_GLOBAL_STATE()->dump_page);
     if (!(GET_GLOBAL_STATE()->redqueen_state &&
           GET_GLOBAL_STATE()->redqueen_state->intercept_mode))
     {
