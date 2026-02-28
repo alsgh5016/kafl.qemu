@@ -454,6 +454,7 @@ static void handle_hypercall_kafl_cr3(struct kvm_run *run,
             cr3_val = env->cr[3] & 0xFFFFFFFFFFFFF000ULL;
         }
         nyx_debug_p(CORE_PREFIX, "Setting CR3 filter: %lx\n", cr3_val);
+        GET_GLOBAL_STATE()->parent_cr3 = cr3_val;
         pt_set_cr3(cpu, cr3_val, false);
         if (GET_GLOBAL_STATE()->dump_page) {
             set_page_dump_bp(cpu, cr3_val,
@@ -704,7 +705,7 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
 
     /* ===== API Hook check ===== */
     if (GET_GLOBAL_STATE()->api_hook_mode) {
-        uint64_t hit_addr = env->eip;
+        uint64_t hit_addr = run->debug.arch.pc;
         for (int i = 0; i < GET_GLOBAL_STATE()->num_api_hooks; i++) {
             if (GET_GLOBAL_STATE()->api_hooks[i].active &&
                 GET_GLOBAL_STATE()->api_hooks[i].addr == hit_addr) {
