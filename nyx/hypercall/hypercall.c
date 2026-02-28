@@ -918,7 +918,8 @@ static void handle_hypercall_kafl_hook_api(struct kvm_run *run,
         nyx_error("HOOK_API: too many hooks (%lu)\n", hook_data.num_hooks);
         hook_data.num_hooks = 16;
     }
-    nyx_printf("=== Installing %lu API hooks ===\n", hook_data.num_hooks);
+    nyx_printf("=== Installing %lu API hooks (using CR3: 0x%lx) ===\n", 
+               hook_data.num_hooks, (uint64_t)GET_GLOBAL_STATE()->parent_cr3);
     /* Store hooks in global state */
     GET_GLOBAL_STATE()->num_api_hooks = (int)hook_data.num_hooks;
     GET_GLOBAL_STATE()->api_hook_mode = true;
