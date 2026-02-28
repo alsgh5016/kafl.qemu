@@ -359,14 +359,14 @@ struct kvm_set_guest_debug_data {
 void handle_hypercall_kafl_mtf(struct kvm_run *run, CPUState *cpu, uint64_t hypercall_arg)
 {
     kvm_arch_get_registers_fast(cpu);
-    nyx_printf("%s --> %lx\n", __func__, get_rip(cpu));
+    nyx_debug_p(CORE_PREFIX, "%s --> %lx\n", __func__, get_rip(cpu));
     kvm_vcpu_ioctl(cpu, KVM_VMX_PT_DISABLE_MTF);
     /* Check if this MTF is for API hook single-step resume */
     if (GET_GLOBAL_STATE()->api_hook_mode &&
         GET_GLOBAL_STATE()->api_hook_step_idx >= 0) {
         int idx = GET_GLOBAL_STATE()->api_hook_step_idx;
         uint64_t hook_addr = GET_GLOBAL_STATE()->api_hook_saved_rip;
-        nyx_printf("  MTF: re-inserting API hook[%d] at 0x%lx\n", idx, hook_addr);
+        nyx_debug_p(CORE_PREFIX, "  MTF: re-inserting API hook[%d] at 0x%lx\n", idx, hook_addr);
         /* Re-insert the breakpoint */
         insert_breakpoint(cpu, hook_addr, 1);
         GET_GLOBAL_STATE()->api_hook_step_idx = -1;
@@ -388,14 +388,14 @@ void handle_hypercall_kafl_page_dump_bp(struct kvm_run *run,
 {
     kvm_arch_get_registers_fast(cpu);
     uint64_t hit_addr = page;  /* = run->debug.arch.pc */
-    nyx_printf("%s --> hit at 0x%lx\n", __func__, hit_addr);
+    nyx_debug_p(CORE_PREFIX, "%s --> hit at 0x%lx\n", __func__, hit_addr);
     kvm_vcpu_ioctl(cpu, KVM_VMX_PT_DISABLE_MTF);
     /* Check if this is an API hook hit */
     if (GET_GLOBAL_STATE()->api_hook_mode) {
         for (int i = 0; i < GET_GLOBAL_STATE()->num_api_hooks; i++) {
             if (GET_GLOBAL_STATE()->api_hooks[i].active &&
                 GET_GLOBAL_STATE()->api_hooks[i].addr == hit_addr) {
-                nyx_printf(">>> API HOOK HIT: %s @ 0x%lx <<<\n",
+                nyx_debug_p(CORE_PREFIX, ">>> API HOOK HIT: %s @ 0x%lx <<<\n",
                            GET_GLOBAL_STATE()->api_hooks[i].name, hit_addr);
                 /* Dump process memory via hprintf log */
                 char log_msg[256];
@@ -709,7 +709,7 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
         for (int i = 0; i < GET_GLOBAL_STATE()->num_api_hooks; i++) {
             if (GET_GLOBAL_STATE()->api_hooks[i].active &&
                 GET_GLOBAL_STATE()->api_hooks[i].addr == hit_addr) {
-                nyx_printf(">>> API HOOK HIT: %s @ 0x%lx <<<\n",
+                nyx_debug_p(CORE_PREFIX, ">>> API HOOK HIT: %s @ 0x%lx <<<\n",
                            GET_GLOBAL_STATE()->api_hooks[i].name, hit_addr);
                 /* Remove BP, single-step, then re-insert */
                 remove_breakpoint(cpu, hit_addr, 1);
