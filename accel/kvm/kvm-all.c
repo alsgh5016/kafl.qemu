@@ -2678,8 +2678,6 @@ int kvm_cpu_exec(CPUState *cpu)
             break;
 
         case KVM_EXIT_DEBUG:
-            fprintf(stderr, "[DEBUG] KVM_EXIT_DEBUG triggered, pc=0x%llx\n", 
-                    (unsigned long long)run->debug.arch.pc);
             kvm_arch_get_registers(cpu);
             if (!handle_hypercall_kafl_hook(run, cpu, (uint64_t)run->hypercall.args[0]))
             {
