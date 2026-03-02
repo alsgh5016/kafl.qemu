@@ -713,7 +713,8 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
                 nyx_debug_p(CORE_PREFIX, ">>> API HOOK HIT: %s @ 0x%lx <<<\n",
                            api_name, hit_addr);
                 
-                /* GetProcAddress argument logging (32-bit stdcall) */
+                /* GetProcAddress argument logging (32-bit stdcall) - temporarily disabled */
+                #if 0
                 if (strstr(api_name, "GetProcAddress") != NULL) {
                     uint32_t esp = env->regs[R_ESP] & 0xFFFFFFFF;
                     uint32_t hModule = 0, lpProcName = 0;
@@ -735,6 +736,7 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
                                    hModule, lpProcName);
                     }
                 }
+                #endif
                 /* Remove BP, single-step, then re-insert */
                 remove_breakpoint(cpu, hit_addr, 1);
                 GET_GLOBAL_STATE()->api_hook_saved_rip = hit_addr;
