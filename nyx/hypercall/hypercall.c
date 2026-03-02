@@ -703,10 +703,19 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
     X86CPU      *cpux86 = X86_CPU(cpu);
     CPUX86State *env    = &cpux86->env;
 
+    /* DEBUG: trace entry */
+    nyx_printf("[DEBUG] handle_hypercall_kafl_hook ENTERED, pc=0x%lx\n", run->debug.arch.pc);
+
     /* ===== API Hook check ===== */
     if (GET_GLOBAL_STATE()->api_hook_mode) {
         uint64_t hit_addr = run->debug.arch.pc;
+        nyx_printf("[DEBUG] api_hook_mode=ON, hit_addr=0x%lx, num_hooks=%d\n",
+                   hit_addr, GET_GLOBAL_STATE()->num_api_hooks);
         for (int i = 0; i < GET_GLOBAL_STATE()->num_api_hooks; i++) {
+            nyx_printf("[DEBUG]   hook[%d]: active=%d, addr=0x%lx, match=%d\n",
+                       i, GET_GLOBAL_STATE()->api_hooks[i].active,
+                       GET_GLOBAL_STATE()->api_hooks[i].addr,
+                       GET_GLOBAL_STATE()->api_hooks[i].addr == hit_addr);
             if (GET_GLOBAL_STATE()->api_hooks[i].active &&
                 GET_GLOBAL_STATE()->api_hooks[i].addr == hit_addr) {
                 const char *api_name = GET_GLOBAL_STATE()->api_hooks[i].name;
