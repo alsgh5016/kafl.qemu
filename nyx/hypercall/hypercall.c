@@ -713,19 +713,20 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
                 nyx_printf(">>> API HOOK HIT: %s @ 0x%lx <<<\n",
                            api_name, hit_addr);
                 
-                /* GetProcAddress argument logging (32-bit stdcall) */
+                /* GetProcAddress argument logging + memory dump (32-bit stdcall) */
                 if (strstr(api_name, "GetProcAddress") != NULL) {
+                    static int dump_seq = 0;
                     uint32_t esp = env->regs[R_ESP] & 0xFFFFFFFF;
                     uint32_t hModule = 0, lpProcName = 0;
-                    
+                    char proc_name[256];
+                    memset(proc_name, 0, sizeof(proc_name));
+
                     /* Stack: [ESP+0]=RetAddr, [ESP+4]=hModule, [ESP+8]=lpProcName */
                     if (read_virtual_memory(esp + 4, (uint8_t*)&hModule, 4, cpu) &&
                         read_virtual_memory(esp + 8, (uint8_t*)&lpProcName, 4, cpu)) {
-                        
+
                         if (lpProcName > 0xFFFF) {
                             /* lpProcName is a string pointer */
-                            char proc_name[256];
-                            memset(proc_name, 0, sizeof(proc_name));
                             if (read_virtual_memory(lpProcName, (uint8_t*)proc_name, 255, cpu)) {
                                 nyx_printf("    -> GetProcAddress(0x%x, \"%s\")\n",
                                            hModule, proc_name);
@@ -735,10 +736,125 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
                             }
                         } else {
                             /* lpProcName is an ordinal */
+                            snprintf(proc_name, sizeof(proc_name), "ordinal_%u", lpProcName);
                             nyx_printf("    -> GetProcAddress(0x%x, ordinal=%u)\n",
                                        hModule, lpProcName);
                         }
                     }
+
+                    /* ===== Memory dump on every GetProcAddress call ===== */
+                    do {
+                        /* 1. Get ImageBaseAddress via FS -> TEB -> PEB (32-bit) */
+                        uint32_t fs_base = (uint32_t)(env->segs[R_FS].base);
+                        uint32_t peb_ptr = 0;
+                        uint32_t image_base = 0;
+
+                        /* TEB32 + 0x30 = pointer to PEB32 */
+                        if (!read_virtual_memory((uint64_t)(fs_base + 0x30),
+                                                 (uint8_t*)&peb_ptr, 4, cpu)) {
+                            nyx_printf("    [DUMP] Failed to read PEB pointer from TEB (FS:0x%x+0x30)\n",
+                                       fs_base);
+                            break;
+                        }
+                        /* PEB32 + 0x08 = ImageBaseAddress */
+                        if (!read_virtual_memory((uint64_t)(peb_ptr + 0x08),
+                                                 (uint8_t*)&image_base, 4, cpu)) {
+                            nyx_printf("    [DUMP] Failed to read ImageBaseAddress from PEB (0x%x+0x08)\n",
+                                       peb_ptr);
+                            break;
+                        }
+
+                        nyx_printf("    [DUMP] FS base=0x%x, PEB=0x%x, ImageBase=0x%x\n",
+                                   fs_base, peb_ptr, image_base);
+
+                        /* 2. Parse PE header to get SizeOfImage */
+                        uint8_t pe_hdr_buf[4096];
+                        memset(pe_hdr_buf, 0, sizeof(pe_hdr_buf));
+                        if (!read_virtual_memory((uint64_t)image_base,
+                                                 pe_hdr_buf, sizeof(pe_hdr_buf), cpu)) {
+                            nyx_printf("    [DUMP] Failed to read PE header at 0x%x\n",
+                                       image_base);
+                            break;
+                        }
+
+                        /* DOS header: check MZ signature */
+                        if (pe_hdr_buf[0] != 'M' || pe_hdr_buf[1] != 'Z') {
+                            nyx_printf("    [DUMP] Invalid DOS signature at 0x%x\n",
+                                       image_base);
+                            break;
+                        }
+
+                        /* e_lfanew at offset 0x3C */
+                        uint32_t e_lfanew = *(uint32_t*)(pe_hdr_buf + 0x3C);
+                        if (e_lfanew + 0x60 > sizeof(pe_hdr_buf)) {
+                            nyx_printf("    [DUMP] e_lfanew too large: 0x%x\n", e_lfanew);
+                            break;
+                        }
+
+                        /* PE signature check */
+                        if (pe_hdr_buf[e_lfanew] != 'P' || pe_hdr_buf[e_lfanew + 1] != 'E' ||
+                            pe_hdr_buf[e_lfanew + 2] != 0 || pe_hdr_buf[e_lfanew + 3] != 0) {
+                            nyx_printf("    [DUMP] Invalid PE signature at offset 0x%x\n",
+                                       e_lfanew);
+                            break;
+                        }
+
+                        /* OptionalHeader starts at e_lfanew + 24 */
+                        /* SizeOfImage at OptionalHeader + 0x38 (same for PE32 and PE32+) */
+                        uint32_t size_of_image = *(uint32_t*)(pe_hdr_buf + e_lfanew + 24 + 0x38);
+                        if (size_of_image == 0 || size_of_image > 256 * 1024 * 1024) {
+                            nyx_printf("    [DUMP] SizeOfImage suspicious: 0x%x\n",
+                                       size_of_image);
+                            break;
+                        }
+
+                        nyx_printf("    [DUMP] SizeOfImage=0x%x (%u bytes)\n",
+                                   size_of_image, size_of_image);
+
+                        /* 3. Create dump file */
+                        char *dump_path = NULL;
+                        const char *fname = (proc_name[0] != '\0') ? proc_name : "unknown";
+                        int seq = dump_seq++;
+                        assert(asprintf(&dump_path, "%s/dump/memdump_%03d_%s.bin",
+                                        GET_GLOBAL_STATE()->workdir_path,
+                                        seq, fname) != -1);
+
+                        FILE *f = fopen(dump_path, "w");
+                        if (!f) {
+                            nyx_printf("    [DUMP] Failed to open %s: %s\n",
+                                       dump_path, strerror(errno));
+                            free(dump_path);
+                            break;
+                        }
+
+                        /* 4. Dump page by page */
+                        uint8_t *page_buf = malloc(4096);
+                        uint32_t offset = 0;
+                        uint32_t pages_ok = 0, pages_fail = 0;
+
+                        while (offset < size_of_image) {
+                            uint32_t chunk = (size_of_image - offset > 4096)
+                                             ? 4096 : (size_of_image - offset);
+                            if (read_virtual_memory((uint64_t)(image_base + offset),
+                                                    page_buf, chunk, cpu)) {
+                                fwrite(page_buf, 1, chunk, f);
+                                pages_ok++;
+                            } else {
+                                /* Zero-fill unreadable pages */
+                                memset(page_buf, 0, chunk);
+                                fwrite(page_buf, 1, chunk, f);
+                                pages_fail++;
+                            }
+                            offset += chunk;
+                        }
+
+                        free(page_buf);
+                        fclose(f);
+
+                        nyx_printf("    [DUMP] Saved %s (%u pages OK, %u pages zeroed)\n",
+                                   dump_path, pages_ok, pages_fail);
+                        free(dump_path);
+                    } while (0);
                 }
                 /* Remove BP, single-step, then re-insert */
                 remove_breakpoint(cpu, hit_addr, 1);
