@@ -696,6 +696,206 @@ static void handle_hypercall_kafl_user_submit_mode(struct kvm_run *run,
     }
 }
 
+
+/* ===== Full process memory dump (reusable) ===== */
+/* Dumps all mapped user-space memory regions (exe, DLLs, stack, heap, etc.)
+ * into fulldump_NNN_LABEL/ directory with per-region files and memory_map.txt.
+ *
+ * Parameters:
+ *   cpu   - CPU state
+ *   env   - x86 CPU environment (must have fresh registers)
+ *   label - human-readable label for this dump (e.g. API name, hook name)
+ */
+typedef struct { uint32_t base; uint32_t size; char name[128]; } mod_info_t;
+#define MAX_MODS 256
+
+static int dump_seq_counter = 0;
+
+static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
+                                     const char *label)
+{
+    int seq = dump_seq_counter++;
+
+    /* --- 1. Read TEB/PEB for module enumeration (32-bit WOW64) --- */
+    uint32_t fs_base = (uint32_t)(env->segs[R_FS].base);
+    uint32_t peb_ptr = 0;
+    if (!read_virtual_memory((uint64_t)(fs_base + 0x30),
+                             (uint8_t*)&peb_ptr, 4, cpu)) {
+        nyx_printf("    [FULLDUMP] Failed to read PEB ptr (FS:0x%x+0x30)\n",
+                   fs_base);
+        return;
+    }
+
+    /* --- 2. Enumerate loaded modules via PEB->Ldr --- */
+    /*    PEB32+0x0C -> Ldr (PEB_LDR_DATA)             */
+    /*    Ldr+0x14   -> InMemoryOrderModuleList         */
+    mod_info_t *modules = calloc(MAX_MODS, sizeof(mod_info_t));
+    int num_modules = 0;
+
+    uint32_t ldr_ptr = 0;
+    if (read_virtual_memory((uint64_t)(peb_ptr + 0x0C),
+                            (uint8_t*)&ldr_ptr, 4, cpu) && ldr_ptr != 0) {
+        /* InMemoryOrderModuleList head = Ldr + 0x14 */
+        uint32_t list_head = ldr_ptr + 0x14;
+        uint32_t flink = 0;
+        read_virtual_memory((uint64_t)list_head, (uint8_t*)&flink, 4, cpu);
+
+        uint32_t cur = flink;
+        while (cur != 0 && cur != list_head && num_modules < MAX_MODS) {
+            /*  cur points to InMemoryOrderLinks (+0x08 in LDR_DATA_TABLE_ENTRY)
+             *  DllBase      = cur + 0x10   (entry+0x18)
+             *  SizeOfImage  = cur + 0x18   (entry+0x20)
+             *  BaseDllName  = cur + 0x24   (entry+0x2C, UNICODE_STRING)
+             */
+            uint32_t dll_base = 0, dll_size = 0;
+            read_virtual_memory((uint64_t)(cur + 0x10), (uint8_t*)&dll_base, 4, cpu);
+            read_virtual_memory((uint64_t)(cur + 0x18), (uint8_t*)&dll_size, 4, cpu);
+
+            /* BaseDllName: UNICODE_STRING { Length(2), MaxLen(2), Buffer(4) } */
+            uint16_t name_len = 0;
+            uint32_t name_buf = 0;
+            read_virtual_memory((uint64_t)(cur + 0x24), (uint8_t*)&name_len, 2, cpu);
+            read_virtual_memory((uint64_t)(cur + 0x24 + 4), (uint8_t*)&name_buf, 4, cpu);
+
+            modules[num_modules].base = dll_base;
+            modules[num_modules].size = dll_size;
+            memset(modules[num_modules].name, 0, 128);
+
+            if (name_len > 0 && name_buf != 0) {
+                uint16_t wbuf[128];
+                memset(wbuf, 0, sizeof(wbuf));
+                int nchars = (name_len / 2 < 127) ? name_len / 2 : 127;
+                read_virtual_memory((uint64_t)name_buf, (uint8_t*)wbuf, nchars * 2, cpu);
+                for (int c = 0; c < nchars; c++)
+                    modules[num_modules].name[c] = (char)(wbuf[c] & 0xFF);
+            }
+
+            num_modules++;
+
+            /* Follow Flink */
+            uint32_t next = 0;
+            if (!read_virtual_memory((uint64_t)cur, (uint8_t*)&next, 4, cpu))
+                break;
+            if (next == cur) break;
+            cur = next;
+        }
+    }
+
+    nyx_printf("    [FULLDUMP] #%03d (%s): PEB=0x%x, %d modules loaded\n",
+               seq, label, peb_ptr, num_modules);
+    for (int m = 0; m < num_modules; m++) {
+        nyx_printf("    [FULLDUMP]   %-30s @ 0x%08x  size=0x%x\n",
+                   modules[m].name, modules[m].base, modules[m].size);
+    }
+
+    /* --- 3. Create dump directory --- */
+    char *dump_dir = NULL;
+    assert(asprintf(&dump_dir, "%s/dump/fulldump_%03d_%s",
+                    GET_GLOBAL_STATE()->workdir_path,
+                    seq, label) != -1);
+    mkdir(dump_dir, 0755);
+
+    /* --- 4. Open memory map file --- */
+    char *map_path = NULL;
+    assert(asprintf(&map_path, "%s/memory_map.txt", dump_dir) != -1);
+    FILE *map_f = fopen(map_path, "w");
+    if (!map_f) {
+        nyx_printf("    [FULLDUMP] Failed to create %s\n", map_path);
+        free(map_path); free(dump_dir); free(modules);
+        return;
+    }
+    fprintf(map_f, "# Full process memory dump #%03d\n", seq);
+    fprintf(map_f, "# Trigger: %s\n", label);
+    fprintf(map_f, "# Modules: %d\n\n", num_modules);
+    fprintf(map_f, "# %-10s  %-10s  %-10s  %-40s  %s\n",
+            "START", "END", "SIZE", "FILE", "MODULE");
+
+    /* Write module list */
+    for (int m = 0; m < num_modules; m++) {
+        fprintf(map_f, "# MODULE: %-30s  base=0x%08x  size=0x%08x\n",
+                modules[m].name, modules[m].base, modules[m].size);
+    }
+    fprintf(map_f, "\n");
+
+    /* --- 5. Scan entire user-space VA and dump mapped regions --- */
+    uint64_t cr3 = env->cr[3];
+    uint32_t va = 0x10000;
+    int region_count = 0;
+    uint64_t total_bytes = 0;
+    uint8_t *page_buf = malloc(0x1000);
+
+    while (va < 0x7FFF0000) {
+        /* Find start of a mapped region */
+        if (!is_addr_mapped_cr3((uint64_t)va, cpu, cr3)) {
+            va += 0x1000;
+            if (va == 0) break;
+            continue;
+        }
+
+        /* Found a mapped page - scan forward to find region end */
+        uint32_t region_start = va;
+        while (va < 0x7FFF0000 &&
+               is_addr_mapped_cr3((uint64_t)va, cpu, cr3)) {
+            va += 0x1000;
+            if (va == 0) break;
+        }
+        uint32_t region_size = va - region_start;
+
+        /* Identify module for this region */
+        const char *mod_name = NULL;
+        for (int m = 0; m < num_modules; m++) {
+            if (region_start >= modules[m].base &&
+                region_start < modules[m].base + modules[m].size) {
+                mod_name = modules[m].name;
+                break;
+            }
+        }
+
+        /* Create region file */
+        char *reg_path = NULL;
+        assert(asprintf(&reg_path, "%s/region_%08x_%x.bin",
+                        dump_dir, region_start, region_size) != -1);
+        FILE *rf = fopen(reg_path, "w");
+        if (rf) {
+            uint32_t off = 0;
+            while (off < region_size) {
+                uint32_t chunk = (region_size - off > 0x1000)
+                                 ? 0x1000 : (region_size - off);
+                if (read_virtual_memory((uint64_t)(region_start + off),
+                                        page_buf, chunk, cpu)) {
+                    fwrite(page_buf, 1, chunk, rf);
+                } else {
+                    memset(page_buf, 0, chunk);
+                    fwrite(page_buf, 1, chunk, rf);
+                }
+                off += chunk;
+            }
+            fclose(rf);
+        }
+
+        fprintf(map_f, "  0x%08x  0x%08x  0x%08x  region_%08x_%x.bin  %s\n",
+                region_start, va, region_size,
+                region_start, region_size,
+                mod_name ? mod_name : "");
+
+        region_count++;
+        total_bytes += region_size;
+        free(reg_path);
+    }
+
+    free(page_buf);
+    fprintf(map_f, "\n# Total: %d regions, %lu bytes\n",
+            region_count, (unsigned long)total_bytes);
+    fclose(map_f);
+
+    nyx_printf("    [FULLDUMP] Saved %d regions (%lu bytes) -> %s/\n",
+               region_count, (unsigned long)total_bytes, dump_dir);
+
+    free(modules);
+    free(map_path);
+    free(dump_dir);
+}
+
 bool handle_hypercall_kafl_hook(struct kvm_run *run,
                                 CPUState       *cpu,
                                 uint64_t        hypercall_arg)
@@ -715,7 +915,6 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
                 
                 /* GetProcAddress argument logging + memory dump (32-bit stdcall) */
                 if (strstr(api_name, "GetProcAddress") != NULL) {
-                    static int dump_seq = 0;
                     uint32_t esp = env->regs[R_ESP] & 0xFFFFFFFF;
                     uint32_t hModule = 0, lpProcName = 0;
                     char proc_name[256];
@@ -742,119 +941,11 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
                         }
                     }
 
-                    /* ===== Memory dump on every GetProcAddress call ===== */
-                    do {
-                        /* 1. Get ImageBaseAddress via FS -> TEB -> PEB (32-bit) */
-                        uint32_t fs_base = (uint32_t)(env->segs[R_FS].base);
-                        uint32_t peb_ptr = 0;
-                        uint32_t image_base = 0;
-
-                        /* TEB32 + 0x30 = pointer to PEB32 */
-                        if (!read_virtual_memory((uint64_t)(fs_base + 0x30),
-                                                 (uint8_t*)&peb_ptr, 4, cpu)) {
-                            nyx_printf("    [DUMP] Failed to read PEB pointer from TEB (FS:0x%x+0x30)\n",
-                                       fs_base);
-                            break;
-                        }
-                        /* PEB32 + 0x08 = ImageBaseAddress */
-                        if (!read_virtual_memory((uint64_t)(peb_ptr + 0x08),
-                                                 (uint8_t*)&image_base, 4, cpu)) {
-                            nyx_printf("    [DUMP] Failed to read ImageBaseAddress from PEB (0x%x+0x08)\n",
-                                       peb_ptr);
-                            break;
-                        }
-
-                        nyx_printf("    [DUMP] FS base=0x%x, PEB=0x%x, ImageBase=0x%x\n",
-                                   fs_base, peb_ptr, image_base);
-
-                        /* 2. Parse PE header to get SizeOfImage */
-                        uint8_t pe_hdr_buf[4096];
-                        memset(pe_hdr_buf, 0, sizeof(pe_hdr_buf));
-                        if (!read_virtual_memory((uint64_t)image_base,
-                                                 pe_hdr_buf, sizeof(pe_hdr_buf), cpu)) {
-                            nyx_printf("    [DUMP] Failed to read PE header at 0x%x\n",
-                                       image_base);
-                            break;
-                        }
-
-                        /* DOS header: check MZ signature */
-                        if (pe_hdr_buf[0] != 'M' || pe_hdr_buf[1] != 'Z') {
-                            nyx_printf("    [DUMP] Invalid DOS signature at 0x%x\n",
-                                       image_base);
-                            break;
-                        }
-
-                        /* e_lfanew at offset 0x3C */
-                        uint32_t e_lfanew = *(uint32_t*)(pe_hdr_buf + 0x3C);
-                        if (e_lfanew + 0x60 > sizeof(pe_hdr_buf)) {
-                            nyx_printf("    [DUMP] e_lfanew too large: 0x%x\n", e_lfanew);
-                            break;
-                        }
-
-                        /* PE signature check */
-                        if (pe_hdr_buf[e_lfanew] != 'P' || pe_hdr_buf[e_lfanew + 1] != 'E' ||
-                            pe_hdr_buf[e_lfanew + 2] != 0 || pe_hdr_buf[e_lfanew + 3] != 0) {
-                            nyx_printf("    [DUMP] Invalid PE signature at offset 0x%x\n",
-                                       e_lfanew);
-                            break;
-                        }
-
-                        /* OptionalHeader starts at e_lfanew + 24 */
-                        /* SizeOfImage at OptionalHeader + 0x38 (same for PE32 and PE32+) */
-                        uint32_t size_of_image = *(uint32_t*)(pe_hdr_buf + e_lfanew + 24 + 0x38);
-                        if (size_of_image == 0 || size_of_image > 256 * 1024 * 1024) {
-                            nyx_printf("    [DUMP] SizeOfImage suspicious: 0x%x\n",
-                                       size_of_image);
-                            break;
-                        }
-
-                        nyx_printf("    [DUMP] SizeOfImage=0x%x (%u bytes)\n",
-                                   size_of_image, size_of_image);
-
-                        /* 3. Create dump file */
-                        char *dump_path = NULL;
-                        const char *fname = (proc_name[0] != '\0') ? proc_name : "unknown";
-                        int seq = dump_seq++;
-                        assert(asprintf(&dump_path, "%s/dump/memdump_%03d_%s.bin",
-                                        GET_GLOBAL_STATE()->workdir_path,
-                                        seq, fname) != -1);
-
-                        FILE *f = fopen(dump_path, "w");
-                        if (!f) {
-                            nyx_printf("    [DUMP] Failed to open %s: %s\n",
-                                       dump_path, strerror(errno));
-                            free(dump_path);
-                            break;
-                        }
-
-                        /* 4. Dump page by page */
-                        uint8_t *page_buf = malloc(4096);
-                        uint32_t offset = 0;
-                        uint32_t pages_ok = 0, pages_fail = 0;
-
-                        while (offset < size_of_image) {
-                            uint32_t chunk = (size_of_image - offset > 4096)
-                                             ? 4096 : (size_of_image - offset);
-                            if (read_virtual_memory((uint64_t)(image_base + offset),
-                                                    page_buf, chunk, cpu)) {
-                                fwrite(page_buf, 1, chunk, f);
-                                pages_ok++;
-                            } else {
-                                /* Zero-fill unreadable pages */
-                                memset(page_buf, 0, chunk);
-                                fwrite(page_buf, 1, chunk, f);
-                                pages_fail++;
-                            }
-                            offset += chunk;
-                        }
-
-                        free(page_buf);
-                        fclose(f);
-
-                        nyx_printf("    [DUMP] Saved %s (%u pages OK, %u pages zeroed)\n",
-                                   dump_path, pages_ok, pages_fail);
-                        free(dump_path);
-                    } while (0);
+                    /* Full process memory dump */
+                    {
+                        const char *dump_label = (proc_name[0] != '\0') ? proc_name : "unknown";
+                        dump_full_process_memory(cpu, env, dump_label);
+                    }
                 }
                 /* Remove BP, single-step, then re-insert */
                 remove_breakpoint(cpu, hit_addr, 1);
