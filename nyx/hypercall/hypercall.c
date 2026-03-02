@@ -710,7 +710,7 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
             if (GET_GLOBAL_STATE()->api_hooks[i].active &&
                 GET_GLOBAL_STATE()->api_hooks[i].addr == hit_addr) {
                 const char *api_name = GET_GLOBAL_STATE()->api_hooks[i].name;
-                nyx_debug_p(CORE_PREFIX, ">>> API HOOK HIT: %s @ 0x%lx <<<\n",
+                nyx_printf(">>> API HOOK HIT: %s @ 0x%lx <<<\n",
                            api_name, hit_addr);
                 
                 /* GetProcAddress argument logging (32-bit stdcall) */
