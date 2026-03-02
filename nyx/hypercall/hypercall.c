@@ -727,15 +727,15 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
                             char proc_name[256];
                             memset(proc_name, 0, sizeof(proc_name));
                             if (read_virtual_memory(lpProcName, (uint8_t*)proc_name, 255, cpu)) {
-                                nyx_debug_p(CORE_PREFIX, "    -> GetProcAddress(0x%x, \"%s\")\n",
+                                nyx_printf("    -> GetProcAddress(0x%x, \"%s\")\n",
                                            hModule, proc_name);
                             } else {
-                                nyx_debug_p(CORE_PREFIX, "    -> GetProcAddress(0x%x, <read failed>)\n",
+                                nyx_printf("    -> GetProcAddress(0x%x, <read failed>)\n",
                                            hModule);
                             }
                         } else {
                             /* lpProcName is an ordinal */
-                            nyx_debug_p(CORE_PREFIX, "    -> GetProcAddress(0x%x, ordinal=%u)\n",
+                            nyx_printf("    -> GetProcAddress(0x%x, ordinal=%u)\n",
                                        hModule, lpProcName);
                         }
                     }
