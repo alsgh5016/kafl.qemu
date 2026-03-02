@@ -433,9 +433,10 @@ static int redqueen_insert_sw_breakpoint(CPUState *cs, struct kvm_sw_breakpoint 
     int asidx = cpu_asidx_from_attrs(cs, MEMTXATTRS_UNSPECIFIED);
 
     /* Debug: log VA->PA translation for API hook breakpoints */
-    nyx_debug_p(CORE_PREFIX, "BP insert: VA 0x%lx -> PA 0x%lx (CR3: 0x%lx)\n",
+    nyx_printf("[DEBUG] BP insert: VA 0x%lx -> PA 0x%lx (CR3: 0x%lx, mem_mode=%d)\n",
                 (uint64_t)bp->pc, (uint64_t)phys_addr, 
-                (uint64_t)GET_GLOBAL_STATE()->parent_cr3);
+                (uint64_t)GET_GLOBAL_STATE()->parent_cr3,
+                GET_GLOBAL_STATE()->mem_mode);
 
     if (phys_addr == 0 || phys_addr == (hwaddr)-1) {
         nyx_error("BP insert FAILED: VA 0x%lx -> invalid PA (CR3 mismatch?)\n", 
