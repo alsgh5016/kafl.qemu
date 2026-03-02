@@ -713,30 +713,33 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
                 nyx_debug_p(CORE_PREFIX, ">>> API HOOK HIT: %s @ 0x%lx <<<\n",
                            api_name, hit_addr);
                 
-                /* GetProcAddress argument logging (32-bit stdcall) - temporarily disabled */
-                #if 0
+                /* GetProcAddress argument logging (32-bit stdcall) */
                 if (strstr(api_name, "GetProcAddress") != NULL) {
                     uint32_t esp = env->regs[R_ESP] & 0xFFFFFFFF;
                     uint32_t hModule = 0, lpProcName = 0;
                     
                     /* Stack: [ESP+0]=RetAddr, [ESP+4]=hModule, [ESP+8]=lpProcName */
-                    read_virtual_memory(esp + 4, (uint8_t*)&hModule, 4, cpu);
-                    read_virtual_memory(esp + 8, (uint8_t*)&lpProcName, 4, cpu);
-                    
-                    if (lpProcName > 0xFFFF) {
-                        /* lpProcName is a string pointer */
-                        char proc_name[256] = {0};
-                        read_virtual_memory(lpProcName, (uint8_t*)proc_name, 255, cpu);
-                        proc_name[255] = '\0';
-                        nyx_debug_p(CORE_PREFIX, "    -> GetProcAddress(hModule=0x%x, \"%s\")\n",
-                                   hModule, proc_name);
-                    } else {
-                        /* lpProcName is an ordinal */
-                        nyx_debug_p(CORE_PREFIX, "    -> GetProcAddress(hModule=0x%x, ordinal=%u)\n",
-                                   hModule, lpProcName);
+                    if (read_virtual_memory(esp + 4, (uint8_t*)&hModule, 4, cpu) &&
+                        read_virtual_memory(esp + 8, (uint8_t*)&lpProcName, 4, cpu)) {
+                        
+                        if (lpProcName > 0xFFFF) {
+                            /* lpProcName is a string pointer */
+                            char proc_name[256];
+                            memset(proc_name, 0, sizeof(proc_name));
+                            if (read_virtual_memory(lpProcName, (uint8_t*)proc_name, 255, cpu)) {
+                                nyx_debug_p(CORE_PREFIX, "    -> GetProcAddress(0x%x, \"%s\")\n",
+                                           hModule, proc_name);
+                            } else {
+                                nyx_debug_p(CORE_PREFIX, "    -> GetProcAddress(0x%x, <read failed>)\n",
+                                           hModule);
+                            }
+                        } else {
+                            /* lpProcName is an ordinal */
+                            nyx_debug_p(CORE_PREFIX, "    -> GetProcAddress(0x%x, ordinal=%u)\n",
+                                       hModule, lpProcName);
+                        }
                     }
                 }
-                #endif
                 /* Remove BP, single-step, then re-insert */
                 remove_breakpoint(cpu, hit_addr, 1);
                 GET_GLOBAL_STATE()->api_hook_saved_rip = hit_addr;
