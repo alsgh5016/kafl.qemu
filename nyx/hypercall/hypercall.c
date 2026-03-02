@@ -909,9 +909,18 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
         for (int i = 0; i < GET_GLOBAL_STATE()->num_api_hooks; i++) {
             if (GET_GLOBAL_STATE()->api_hooks[i].active &&
                 GET_GLOBAL_STATE()->api_hooks[i].addr == hit_addr) {
+                /* CR3 filter: only handle target process, skip system processes */
+                uint64_t current_cr3 = env->cr[3] & 0xFFFFFFFFFFFFF000ULL;
+                uint64_t target_cr3 = GET_GLOBAL_STATE()->parent_cr3;
+
+                if (current_cr3 != target_cr3) {
+                    /* Non-target process hit the BP — still need to single-step past it */
+                    goto hook_single_step;
+                }
+
                 const char *api_name = GET_GLOBAL_STATE()->api_hooks[i].name;
-                nyx_printf(">>> API HOOK HIT: %s @ 0x%lx <<<\n",
-                           api_name, hit_addr);
+                nyx_printf(">>> API HOOK HIT: %s @ 0x%lx (CR3=0x%lx) <<<\n",
+                           api_name, hit_addr, current_cr3);
                 
                 /* GetProcAddress argument logging + memory dump (32-bit stdcall) */
                 if (strstr(api_name, "GetProcAddress") != NULL) {
@@ -947,6 +956,7 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
                         dump_full_process_memory(cpu, env, dump_label);
                     }
                 }
+hook_single_step:
                 /* Remove BP, single-step, then re-insert */
                 remove_breakpoint(cpu, hit_addr, 1);
                 GET_GLOBAL_STATE()->api_hook_saved_rip = hit_addr;
