@@ -1791,7 +1791,7 @@ void wox_periodic_dirty_scan(CPUState *cpu)
         /* Dump full process memory */
         char dump_label[64];
         snprintf(dump_label, sizeof(dump_label), "wox_round%d", wox_round);
-        dump_full_process_memory(cpu, env, dump_label);
+        // [TEST]         dump_full_process_memory(cpu, env, dump_label);
 
         /* Reset for next round */
         wox_round++;
@@ -1919,7 +1919,7 @@ static void wox_final_wox_check(CPUState *cpu)
 
         char dump_label[64];
         snprintf(dump_label, sizeof(dump_label), "wox_final_%d", final_round);
-        dump_full_process_memory(cpu, env, dump_label);
+        // [TEST]         dump_full_process_memory(cpu, env, dump_label);
 
         final_round++;
     }
@@ -2482,7 +2482,7 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
                     /* Full process memory dump */
                     {
                         const char *dump_label = (proc_name[0] != '\0') ? proc_name : "unknown";
-                        dump_full_process_memory(cpu, env, dump_label);
+                    // [TEST]                         dump_full_process_memory(cpu, env, dump_label);
                     }
                 }
 hook_single_step:
