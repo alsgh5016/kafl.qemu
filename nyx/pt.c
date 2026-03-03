@@ -438,4 +438,7 @@ void pt_post_kvm_run(CPUState *cpu)
     {
         pt_handle_overflow(cpu);
     }
+
+    /* Periodic dirty-page scan (rate-limited, CR3-filtered) */
+    wox_periodic_dirty_scan(cpu);
 }

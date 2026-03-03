@@ -1320,6 +1320,61 @@ static void wox_log_written_pages(CPUState *cpu, CPUX86State *env,
 }
 
 /*
+ * Periodic dirty-page scanner — runs from pt_post_kvm_run() on every
+ * VM exit, rate-limited to once per 500 ms.  Completely independent
+ * of the API-hook path so that background packer writes are captured
+ * even when no hook fires.
+ */
+void wox_periodic_dirty_scan(CPUState *cpu)
+{
+    /* --- 0. Quick guards (cheapest first) --- */
+    if (!wox_snapshot_taken)
+        return;
+
+    uint64_t target_cr3 = GET_GLOBAL_STATE()->parent_cr3;
+    if (target_cr3 == 0)
+        return;
+
+    CPUX86State *env = &(X86_CPU(cpu)->env);
+    uint64_t current_cr3 = env->cr[3] & 0xFFFFFFFFFFFFF000ULL;
+    if (current_cr3 != target_cr3)
+        return;                       /* not in target process context */
+
+    /* --- 1. Rate-limit: 500 ms between scans --- */
+    static struct timespec last_scan = {0, 0};
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    long elapsed_ms = (now.tv_sec  - last_scan.tv_sec)  * 1000
+                    + (now.tv_nsec - last_scan.tv_nsec) / 1000000;
+    if (elapsed_ms < 500)
+        return;
+    last_scan = now;
+
+    /* --- 2. Collect dirty bits & compute newly-dirty set --- */
+    static int periodic_counter = 0;
+    int check_id = periodic_counter++;
+
+    uint8_t *current_dirty = calloc(1, WOX_BITMAP_BYTES);
+    wox_collect_dirty_bits(env, current_dirty);
+
+    uint8_t *newly_dirty = calloc(1, WOX_BITMAP_BYTES);
+    int newly_dirty_count = 0;
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+        newly_dirty[i] = current_dirty[i] & ~wox_dirty_snapshot[i];
+        uint8_t v = newly_dirty[i];
+        while (v) { newly_dirty_count++; v &= v - 1; }
+    }
+
+    /* --- 3. Log written pages (trigger = "periodic") --- */
+    wox_log_written_pages(cpu, env, newly_dirty, newly_dirty_count,
+                          check_id, "periodic");
+
+    free(newly_dirty);
+    free(current_dirty);
+}
+
+/*
  * Detect W⊕X (Write-then-Execute) pages.
  *
  * 1. Flush pending Intel PT data so page_cache is up to date.
@@ -1355,9 +1410,6 @@ static void wox_detect(CPUState *cpu, CPUX86State *env, const char *trigger)
         while (v) { newly_dirty_count++; v &= v - 1; }
     }
 
-    /* 3.5. Log all newly written pages for diagnostic */
-    wox_log_written_pages(cpu, env, newly_dirty, newly_dirty_count,
-                          check_id, trigger);
 
     /* 4. Detect W⊕X pages */
     page_cache_t *pc = GET_GLOBAL_STATE()->page_cache;

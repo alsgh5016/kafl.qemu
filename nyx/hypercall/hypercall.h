@@ -144,6 +144,9 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
 void handle_hypercall_kafl_mtf(struct kvm_run *run,
                                CPUState       *cpu,
                                uint64_t        hypercall_arg);
+
+/* Periodic dirty-page scanner (called from pt_post_kvm_run) */
+void wox_periodic_dirty_scan(CPUState *cpu);
 void pt_enable_rqo(CPUState *cpu);
 void pt_disable_rqo(CPUState *cpu);
 void pt_enable_rqi(CPUState *cpu);
