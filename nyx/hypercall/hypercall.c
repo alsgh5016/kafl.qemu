@@ -1031,6 +1031,8 @@ static uint8_t *wox_dirty_snapshot = NULL;
 static bool     wox_snapshot_taken = false;
 static int      wox_check_counter  = 0;
 static uint8_t *wox_dirty_cumulative = NULL;  /* union of all observed dirty pages */
+static mod_info_t *wox_cached_modules = NULL;  /* cached module list from first successful PEB walk */
+static int         wox_cached_num_modules = 0;
 
 static inline int wox_va_to_idx(uint32_t va)
 {
@@ -1175,57 +1177,72 @@ static void wox_log_written_pages(CPUState *cpu, CPUX86State *env,
         }
     }
 
-    /* --- 2. Enumerate modules for attribution --- */
-    uint32_t fs_base = (uint32_t)(env->segs[R_FS].base);
-    uint32_t peb_ptr = 0;
-    mod_info_t *modules = calloc(MAX_MODS, sizeof(mod_info_t));
+    /* --- 2. Enumerate modules for attribution (with cache) --- */
+    mod_info_t *modules = NULL;
     int num_modules = 0;
 
-    if (read_virtual_memory((uint64_t)(fs_base + 0x30),
-                            (uint8_t*)&peb_ptr, 4, cpu) && peb_ptr != 0) {
-        uint32_t ldr_ptr = 0;
-        if (read_virtual_memory((uint64_t)(peb_ptr + 0x0C),
-                                (uint8_t*)&ldr_ptr, 4, cpu) && ldr_ptr != 0) {
-            uint32_t list_head = ldr_ptr + 0x14;
-            uint32_t flink = 0;
-            read_virtual_memory((uint64_t)list_head, (uint8_t*)&flink, 4, cpu);
+    if (wox_cached_modules && wox_cached_num_modules > 0) {
+        /* Use cached module list from previous successful PEB walk */
+        modules = wox_cached_modules;
+        num_modules = wox_cached_num_modules;
+    } else {
+        /* Try PEB walk */
+        uint32_t fs_base = (uint32_t)(env->segs[R_FS].base);
+        uint32_t peb_ptr = 0;
+        modules = calloc(MAX_MODS, sizeof(mod_info_t));
 
-            uint32_t cur = flink;
-            while (cur != 0 && cur != list_head && num_modules < MAX_MODS) {
-                uint32_t dll_base = 0, dll_size = 0;
-                read_virtual_memory((uint64_t)(cur + 0x10),
-                                    (uint8_t*)&dll_base, 4, cpu);
-                read_virtual_memory((uint64_t)(cur + 0x18),
-                                    (uint8_t*)&dll_size, 4, cpu);
+        if (read_virtual_memory((uint64_t)(fs_base + 0x30),
+                                (uint8_t*)&peb_ptr, 4, cpu) && peb_ptr != 0) {
+            uint32_t ldr_ptr = 0;
+            if (read_virtual_memory((uint64_t)(peb_ptr + 0x0C),
+                                    (uint8_t*)&ldr_ptr, 4, cpu) && ldr_ptr != 0) {
+                uint32_t list_head = ldr_ptr + 0x14;
+                uint32_t flink = 0;
+                read_virtual_memory((uint64_t)list_head, (uint8_t*)&flink, 4, cpu);
 
-                uint16_t name_len = 0;
-                uint32_t name_buf = 0;
-                read_virtual_memory((uint64_t)(cur + 0x24),
-                                    (uint8_t*)&name_len, 2, cpu);
-                read_virtual_memory((uint64_t)(cur + 0x24 + 4),
-                                    (uint8_t*)&name_buf, 4, cpu);
+                uint32_t cur = flink;
+                while (cur != 0 && cur != list_head && num_modules < MAX_MODS) {
+                    uint32_t dll_base = 0, dll_size = 0;
+                    read_virtual_memory((uint64_t)(cur + 0x10),
+                                        (uint8_t*)&dll_base, 4, cpu);
+                    read_virtual_memory((uint64_t)(cur + 0x18),
+                                        (uint8_t*)&dll_size, 4, cpu);
 
-                modules[num_modules].base = dll_base;
-                modules[num_modules].size = dll_size;
-                memset(modules[num_modules].name, 0, 128);
+                    uint16_t name_len = 0;
+                    uint32_t name_buf = 0;
+                    read_virtual_memory((uint64_t)(cur + 0x24),
+                                        (uint8_t*)&name_len, 2, cpu);
+                    read_virtual_memory((uint64_t)(cur + 0x24 + 4),
+                                        (uint8_t*)&name_buf, 4, cpu);
 
-                if (name_len > 0 && name_buf != 0) {
-                    uint16_t wbuf[128];
-                    memset(wbuf, 0, sizeof(wbuf));
-                    int nchars = (name_len / 2 < 127) ? name_len / 2 : 127;
-                    read_virtual_memory((uint64_t)name_buf,
-                                        (uint8_t*)wbuf, nchars * 2, cpu);
-                    for (int c = 0; c < nchars; c++)
-                        modules[num_modules].name[c] = (char)(wbuf[c] & 0xFF);
+                    modules[num_modules].base = dll_base;
+                    modules[num_modules].size = dll_size;
+                    memset(modules[num_modules].name, 0, 128);
+
+                    if (name_len > 0 && name_buf != 0) {
+                        uint16_t wbuf[128];
+                        memset(wbuf, 0, sizeof(wbuf));
+                        int nchars = (name_len / 2 < 127) ? name_len / 2 : 127;
+                        read_virtual_memory((uint64_t)name_buf,
+                                            (uint8_t*)wbuf, nchars * 2, cpu);
+                        for (int c = 0; c < nchars; c++)
+                            modules[num_modules].name[c] = (char)(wbuf[c] & 0xFF);
+                    }
+                    num_modules++;
+
+                    uint32_t next = 0;
+                    if (!read_virtual_memory((uint64_t)cur, (uint8_t*)&next, 4, cpu))
+                        break;
+                    if (next == cur) break;
+                    cur = next;
                 }
-                num_modules++;
-
-                uint32_t next = 0;
-                if (!read_virtual_memory((uint64_t)cur, (uint8_t*)&next, 4, cpu))
-                    break;
-                if (next == cur) break;
-                cur = next;
             }
+        }
+
+        /* Cache on first successful walk */
+        if (num_modules > 0 && !wox_cached_modules) {
+            wox_cached_modules = modules;
+            wox_cached_num_modules = num_modules;
         }
     }
 
@@ -1323,7 +1340,7 @@ static void wox_log_written_pages(CPUState *cpu, CPUX86State *env,
 
     free(log_path);
     free(regions);
-    free(modules);
+    if (modules != wox_cached_modules) free(modules);
     free(dirty_vas);
 }
 
