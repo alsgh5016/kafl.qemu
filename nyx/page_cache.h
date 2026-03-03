@@ -44,3 +44,5 @@ bool page_cache_disassemble_iter(page_cache_t       *self,
 cs_insn *page_cache_cs_malloc(page_cache_t *self, disassembler_mode_t mode);
 
 uint64_t page_cache_fetch2(page_cache_t *self, uint64_t page, bool *success);
+/* W⊕X support: extract executed page VAs from internal hash map */
+int page_cache_get_executed_pages(page_cache_t *self, uint64_t *pages_out, int max_count);

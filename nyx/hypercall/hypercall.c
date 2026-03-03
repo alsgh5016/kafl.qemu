@@ -50,6 +50,7 @@ along with QEMU-PT.  If not, see <http://www.gnu.org/licenses/>.
 #include "nyx/pt.h"
 #include "nyx/redqueen.h"
 #include "nyx/state/state.h"
+#include "nyx/page_cache.h"
 #include "nyx/synchronization.h"
 
 bool hypercall_enabled = false;
@@ -1002,6 +1003,322 @@ static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
     free(dump_dir);
 }
 
+/* =====================================================================
+ * W⊕X (Write-then-Execute) Detection
+ *
+ * Detects unpacked code by finding pages that were:
+ *   1. Written to AFTER the initial snapshot (PTE Dirty Bit tracking)
+ *   2. Actually executed (Intel PT → page_cache tracking)
+ *
+ * Architecture:
+ *   - Write tracking: x86 PTE Dirty Bit (bit 6), set automatically by CPU
+ *   - Execute tracking: Intel PT → libxdc decode → page_cache hash keys
+ *   - Detection: intersection of {newly written} ∩ {executed}
+ * ===================================================================== */
+
+#define WOX_USER_VA_START  0x10000
+#define WOX_USER_VA_END    0x7FFF0000
+#define WOX_PAGE_COUNT     ((WOX_USER_VA_END - WOX_USER_VA_START) / 0x1000)
+#define WOX_BITMAP_BYTES   ((WOX_PAGE_COUNT + 7) / 8)
+
+static uint8_t *wox_dirty_snapshot = NULL;
+static bool     wox_snapshot_taken = false;
+static int      wox_check_counter  = 0;
+
+static inline int wox_va_to_idx(uint32_t va)
+{
+    return (int)((va - WOX_USER_VA_START) / 0x1000);
+}
+
+static inline void wox_bitmap_set(uint8_t *bm, int idx)
+{
+    bm[idx >> 3] |= (1 << (idx & 7));
+}
+
+static inline bool wox_bitmap_test(const uint8_t *bm, int idx)
+{
+    return !!(bm[idx >> 3] & (1 << (idx & 7)));
+}
+
+/*
+ * Bulk page-table walk collecting PTE Dirty bits for all mapped user pages.
+ * Reuses the same PML4→PDPT→PD→PT pattern as dump_full_process_memory().
+ */
+static void wox_collect_dirty_bits(CPUX86State *env, uint8_t *bitmap)
+{
+    memset(bitmap, 0, WOX_BITMAP_BYTES);
+
+    uint64_t cr3 = env->cr[3];
+    uint64_t pml4_base = cr3 & 0x000FFFFFFFFFF000ULL;
+    uint64_t pml4_table[512];
+    cpu_physical_memory_read(pml4_base, pml4_table, 4096);
+
+    uint64_t pml4e = pml4_table[0];
+    if (!(pml4e & 1)) return;
+
+    uint64_t pdpt_base = pml4e & 0x000FFFFFFFFFF000ULL;
+    uint64_t pdpt_table[512];
+    cpu_physical_memory_read(pdpt_base, pdpt_table, 4096);
+
+    for (int pdpte_idx = 0; pdpte_idx < 2; pdpte_idx++) {
+        uint64_t pdpte = pdpt_table[pdpte_idx];
+        if (!(pdpte & 1)) continue;
+        if (pdpte & (1ULL << 7)) continue;  /* 1GB huge page — skip */
+
+        uint64_t pd_base = pdpte & 0x000FFFFFFFFFF000ULL;
+        uint64_t pd_table[512];
+        cpu_physical_memory_read(pd_base, pd_table, 4096);
+
+        for (int pde_idx = 0; pde_idx < 512; pde_idx++) {
+            uint64_t pde = pd_table[pde_idx];
+            if (!(pde & 1)) continue;
+
+            if (pde & (1ULL << 7)) {
+                /* 2MB huge page — dirty bit is on the PDE itself */
+                if (!(pde & (1ULL << 6))) continue;  /* not dirty */
+                uint32_t base_va = ((uint32_t)pdpte_idx << 30) |
+                                   ((uint32_t)pde_idx << 21);
+                for (int k = 0; k < 512; k++) {
+                    uint32_t va = base_va + ((uint32_t)k << 12);
+                    if (va >= WOX_USER_VA_START && va < WOX_USER_VA_END)
+                        wox_bitmap_set(bitmap, wox_va_to_idx(va));
+                }
+                continue;
+            }
+
+            /* 4KB pages */
+            uint64_t pt_base = pde & 0x000FFFFFFFFFF000ULL;
+            uint64_t pt_table[512];
+            cpu_physical_memory_read(pt_base, pt_table, 4096);
+
+            for (int pte_idx = 0; pte_idx < 512; pte_idx++) {
+                uint64_t pte = pt_table[pte_idx];
+                if (!(pte & 1)) continue;
+                if (!(pte & (1ULL << 6))) continue;  /* not dirty */
+
+                uint32_t va = ((uint32_t)pdpte_idx << 30) |
+                              ((uint32_t)pde_idx << 21) |
+                              ((uint32_t)pte_idx << 12);
+                if (va >= WOX_USER_VA_START && va < WOX_USER_VA_END)
+                    wox_bitmap_set(bitmap, wox_va_to_idx(va));
+            }
+        }
+    }
+}
+
+/*
+ * Take initial PTE dirty-bit snapshot (baseline before unpacking).
+ */
+static void wox_take_snapshot(CPUState *cpu, CPUX86State *env)
+{
+    if (!wox_dirty_snapshot) {
+        wox_dirty_snapshot = calloc(1, WOX_BITMAP_BYTES);
+    }
+    wox_collect_dirty_bits(env, wox_dirty_snapshot);
+    wox_snapshot_taken = true;
+
+    /* Count baseline dirty pages */
+    int baseline = 0;
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+        uint8_t v = wox_dirty_snapshot[i];
+        while (v) { baseline++; v &= v - 1; }
+    }
+    nyx_printf("[WOX] Dirty-bit snapshot taken: %d baseline dirty pages\n",
+               baseline);
+}
+
+/*
+ * Detect W⊕X (Write-then-Execute) pages.
+ *
+ * 1. Flush pending Intel PT data so page_cache is up to date.
+ * 2. Collect current PTE dirty bits.
+ * 3. Newly written = current_dirty & ~snapshot_dirty
+ * 4. Executed pages = page_cache hash keys (populated by Intel PT decode)
+ * 5. W⊕X = newly_written ∩ executed
+ */
+static void wox_detect(CPUState *cpu, CPUX86State *env, const char *trigger)
+{
+    int check_id = wox_check_counter++;
+
+    if (!wox_snapshot_taken) {
+        wox_take_snapshot(cpu, env);
+        return;
+    }
+
+    /* 1. Flush pending PT trace data for up-to-date page_cache */
+    if (cpu->pt_fd) {
+        pt_handle_overflow(cpu);
+    }
+
+    /* 2. Collect current dirty bits */
+    uint8_t *current_dirty = calloc(1, WOX_BITMAP_BYTES);
+    wox_collect_dirty_bits(env, current_dirty);
+
+    /* 3. Newly dirty = pages written AFTER snapshot */
+    uint8_t *newly_dirty = calloc(1, WOX_BITMAP_BYTES);
+    int newly_dirty_count = 0;
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+        newly_dirty[i] = current_dirty[i] & ~wox_dirty_snapshot[i];
+        uint8_t v = newly_dirty[i];
+        while (v) { newly_dirty_count++; v &= v - 1; }
+    }
+
+    /* 4. Get executed pages from Intel PT page_cache */
+    page_cache_t *pc = GET_GLOBAL_STATE()->page_cache;
+    int exec_count = 0;
+    int wox_count = 0;
+
+    if (pc) {
+        int max_exec = 65536;
+        uint64_t *exec_pages = malloc(max_exec * sizeof(uint64_t));
+        exec_count = page_cache_get_executed_pages(pc, exec_pages, max_exec);
+
+        nyx_printf("[WOX] Check #%d (%s): newly_dirty=%d pages, "
+                   "executed(PT)=%d pages\n",
+                   check_id, trigger, newly_dirty_count, exec_count);
+
+        /* 5. Intersection: W ∩ X */
+        for (int e = 0; e < exec_count; e++) {
+            uint32_t va = (uint32_t)(exec_pages[e] & 0xFFFFFFFF);
+            if (va < WOX_USER_VA_START || va >= WOX_USER_VA_END) continue;
+
+            int idx = wox_va_to_idx(va);
+            if (wox_bitmap_test(newly_dirty, idx)) {
+                nyx_printf("[WOX]   *** W+X page: VA=0x%08x ***\n", va);
+                wox_count++;
+            }
+        }
+        free(exec_pages);
+    } else {
+        /*
+         * Fallback: page_cache not available (decoder not initialized).
+         * Use NX bit: Written ∩ Executable (weaker signal, may have FP).
+         */
+        nyx_printf("[WOX] Check #%d (%s): newly_dirty=%d pages, "
+                   "page_cache unavailable — using NX-bit fallback\n",
+                   check_id, trigger, newly_dirty_count);
+
+        /* Re-walk PT to get NX bits for newly-dirty pages */
+        uint64_t cr3 = env->cr[3];
+        uint64_t pml4_base = cr3 & 0x000FFFFFFFFFF000ULL;
+        uint64_t pml4_table[512];
+        cpu_physical_memory_read(pml4_base, pml4_table, 4096);
+
+        uint64_t pml4e = pml4_table[0];
+        if (pml4e & 1) {
+            bool pml4_x = !(pml4e & (1ULL << 63));
+            uint64_t pdpt_base = pml4e & 0x000FFFFFFFFFF000ULL;
+            uint64_t pdpt_table[512];
+            cpu_physical_memory_read(pdpt_base, pdpt_table, 4096);
+
+            for (int pdpte_idx = 0; pdpte_idx < 2; pdpte_idx++) {
+                uint64_t pdpte = pdpt_table[pdpte_idx];
+                if (!(pdpte & 1)) continue;
+                if (pdpte & (1ULL << 7)) continue;
+                bool pdpt_x = pml4_x && !(pdpte & (1ULL << 63));
+
+                uint64_t pd_base = pdpte & 0x000FFFFFFFFFF000ULL;
+                uint64_t pd_table[512];
+                cpu_physical_memory_read(pd_base, pd_table, 4096);
+
+                for (int pde_idx = 0; pde_idx < 512; pde_idx++) {
+                    uint64_t pde = pd_table[pde_idx];
+                    if (!(pde & 1)) continue;
+                    bool pd_x = pdpt_x && !(pde & (1ULL << 63));
+
+                    if (pde & (1ULL << 7)) {
+                        /* 2MB huge */
+                        uint32_t base_va = ((uint32_t)pdpte_idx << 30) |
+                                           ((uint32_t)pde_idx << 21);
+                        for (int k = 0; k < 512; k++) {
+                            uint32_t va = base_va + ((uint32_t)k << 12);
+                            if (va < WOX_USER_VA_START || va >= WOX_USER_VA_END)
+                                continue;
+                            int idx = wox_va_to_idx(va);
+                            if (wox_bitmap_test(newly_dirty, idx) && pd_x) {
+                                nyx_printf("[WOX]   *** W+X page (NX-fb): "
+                                           "VA=0x%08x ***\n", va);
+                                wox_count++;
+                            }
+                        }
+                        continue;
+                    }
+
+                    uint64_t pt_base = pde & 0x000FFFFFFFFFF000ULL;
+                    uint64_t pt_table[512];
+                    cpu_physical_memory_read(pt_base, pt_table, 4096);
+
+                    for (int pte_idx = 0; pte_idx < 512; pte_idx++) {
+                        uint64_t pte = pt_table[pte_idx];
+                        if (!(pte & 1)) continue;
+
+                        uint32_t va = ((uint32_t)pdpte_idx << 30) |
+                                      ((uint32_t)pde_idx << 21) |
+                                      ((uint32_t)pte_idx << 12);
+                        if (va < WOX_USER_VA_START || va >= WOX_USER_VA_END)
+                            continue;
+
+                        int idx = wox_va_to_idx(va);
+                        bool x = pd_x && !(pte & (1ULL << 63));
+                        if (wox_bitmap_test(newly_dirty, idx) && x) {
+                            nyx_printf("[WOX]   *** W+X page (NX-fb): "
+                                       "VA=0x%08x ***\n", va);
+                            wox_count++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    nyx_printf("[WOX] Result: %d W+X pages detected (check #%d)\n",
+               wox_count, check_id);
+
+    /* Save results to file */
+    if (wox_count > 0) {
+        char *result_path = NULL;
+        /* Ensure dump directory exists */
+        char *dump_base = NULL;
+        assert(asprintf(&dump_base, "%s/dump", GET_GLOBAL_STATE()->workdir_path) != -1);
+        mkdir(dump_base, 0755);
+        free(dump_base);
+        assert(asprintf(&result_path, "%s/dump/wox_check_%03d_%s.txt",
+                        GET_GLOBAL_STATE()->workdir_path,
+                        check_id, trigger) != -1);
+        FILE *rf = fopen(result_path, "w");
+        if (rf) {
+            fprintf(rf, "# W⊕X Detection Result\n");
+            fprintf(rf, "# Check: #%d\n", check_id);
+            fprintf(rf, "# Trigger: %s\n", trigger);
+            fprintf(rf, "# Newly written pages: %d\n", newly_dirty_count);
+            fprintf(rf, "# Executed pages (PT): %d\n", exec_count);
+            fprintf(rf, "# W+X pages: %d\n\n", wox_count);
+
+            /* Re-iterate to write addresses (simpler than storing) */
+            if (pc) {
+                int max_exec = 65536;
+                uint64_t *exec_pages = malloc(max_exec * sizeof(uint64_t));
+                int ec = page_cache_get_executed_pages(pc, exec_pages, max_exec);
+                for (int e = 0; e < ec; e++) {
+                    uint32_t va = (uint32_t)(exec_pages[e] & 0xFFFFFFFF);
+                    if (va < WOX_USER_VA_START || va >= WOX_USER_VA_END)
+                        continue;
+                    if (wox_bitmap_test(newly_dirty, wox_va_to_idx(va)))
+                        fprintf(rf, "0x%08x\n", va);
+                }
+                free(exec_pages);
+            }
+            fclose(rf);
+            nyx_printf("[WOX] Results saved to %s\n", result_path);
+        }
+        free(result_path);
+    }
+
+    free(current_dirty);
+    free(newly_dirty);
+}
+
+
 bool handle_hypercall_kafl_hook(struct kvm_run *run,
                                 CPUState       *cpu,
                                 uint64_t        hypercall_arg)
@@ -1028,6 +1345,9 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
                 nyx_printf(">>> API HOOK HIT: %s @ 0x%lx (CR3=0x%lx) <<<\n",
                            api_name, hit_addr, current_cr3);
                 
+
+                /* W⊕X detection: check for Write-then-Execute on every hook hit */
+                wox_detect(cpu, env, api_name);
                 /* GetProcAddress argument logging + memory dump (32-bit stdcall) */
                 if (strstr(api_name, "GetProcAddress") != NULL) {
                     uint32_t esp = env->regs[R_ESP] & 0xFFFFFFFF;

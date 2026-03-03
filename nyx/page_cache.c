@@ -350,3 +350,18 @@ bool page_cache_disassemble_iter(page_cache_t       *self,
                               &code_size, address, insn);
     }
 }
+
+/* --- W⊕X support: extract executed page VAs from khash --- */
+int page_cache_get_executed_pages(page_cache_t *self, uint64_t *pages_out, int max_count)
+{
+    if (!self || !self->lookup) return 0;
+
+    int count = 0;
+    khiter_t k;
+    for (k = kh_begin(self->lookup); k != kh_end(self->lookup); ++k) {
+        if (!kh_exist(self->lookup, k)) continue;
+        if (count >= max_count) break;
+        pages_out[count++] = kh_key(self->lookup, k);
+    }
+    return count;
+}
