@@ -1128,6 +1128,198 @@ static void wox_take_snapshot(CPUState *cpu, CPUX86State *env)
 }
 
 /*
+ * Log all newly-written (dirty) page addresses in user-space.
+ *
+ * Groups contiguous pages into regions and cross-references with loaded
+ * modules via PEB->Ldr walk.  Output goes to both nyx_printf (console)
+ * and a file under <workdir>/dump/dirty_log_<id>_<trigger>.txt.
+ *
+ * This is the "Write side" diagnostic: useful for verifying that the
+ * packer's memory writes are correctly tracked before Intel PT (Execute
+ * side) is activated.
+ */
+static void wox_log_written_pages(CPUState *cpu, CPUX86State *env,
+                                  const uint8_t *newly_dirty,
+                                  int newly_dirty_count,
+                                  int check_id, const char *trigger)
+{
+    if (newly_dirty_count == 0) {
+        nyx_printf("[DIRTY] Check #%d (%s): no newly written pages\n",
+                   check_id, trigger);
+        return;
+    }
+
+    /* --- 1. Collect all newly dirty VAs --- */
+    int va_cap = newly_dirty_count + 16;
+    uint32_t *dirty_vas = malloc(va_cap * sizeof(uint32_t));
+    int va_count = 0;
+
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+        uint8_t byte = newly_dirty[i];
+        if (!byte) continue;
+        for (int bit = 0; bit < 8; bit++) {
+            if (byte & (1 << bit)) {
+                int idx = i * 8 + bit;
+                uint32_t va = WOX_USER_VA_START + (uint32_t)idx * 0x1000;
+                if (va_count < va_cap)
+                    dirty_vas[va_count++] = va;
+            }
+        }
+    }
+
+    /* --- 2. Enumerate modules for attribution --- */
+    uint32_t fs_base = (uint32_t)(env->segs[R_FS].base);
+    uint32_t peb_ptr = 0;
+    mod_info_t *modules = calloc(MAX_MODS, sizeof(mod_info_t));
+    int num_modules = 0;
+
+    if (read_virtual_memory((uint64_t)(fs_base + 0x30),
+                            (uint8_t*)&peb_ptr, 4, cpu) && peb_ptr != 0) {
+        uint32_t ldr_ptr = 0;
+        if (read_virtual_memory((uint64_t)(peb_ptr + 0x0C),
+                                (uint8_t*)&ldr_ptr, 4, cpu) && ldr_ptr != 0) {
+            uint32_t list_head = ldr_ptr + 0x14;
+            uint32_t flink = 0;
+            read_virtual_memory((uint64_t)list_head, (uint8_t*)&flink, 4, cpu);
+
+            uint32_t cur = flink;
+            while (cur != 0 && cur != list_head && num_modules < MAX_MODS) {
+                uint32_t dll_base = 0, dll_size = 0;
+                read_virtual_memory((uint64_t)(cur + 0x10),
+                                    (uint8_t*)&dll_base, 4, cpu);
+                read_virtual_memory((uint64_t)(cur + 0x18),
+                                    (uint8_t*)&dll_size, 4, cpu);
+
+                uint16_t name_len = 0;
+                uint32_t name_buf = 0;
+                read_virtual_memory((uint64_t)(cur + 0x24),
+                                    (uint8_t*)&name_len, 2, cpu);
+                read_virtual_memory((uint64_t)(cur + 0x24 + 4),
+                                    (uint8_t*)&name_buf, 4, cpu);
+
+                modules[num_modules].base = dll_base;
+                modules[num_modules].size = dll_size;
+                memset(modules[num_modules].name, 0, 128);
+
+                if (name_len > 0 && name_buf != 0) {
+                    uint16_t wbuf[128];
+                    memset(wbuf, 0, sizeof(wbuf));
+                    int nchars = (name_len / 2 < 127) ? name_len / 2 : 127;
+                    read_virtual_memory((uint64_t)name_buf,
+                                        (uint8_t*)wbuf, nchars * 2, cpu);
+                    for (int c = 0; c < nchars; c++)
+                        modules[num_modules].name[c] = (char)(wbuf[c] & 0xFF);
+                }
+                num_modules++;
+
+                uint32_t next = 0;
+                if (!read_virtual_memory((uint64_t)cur, (uint8_t*)&next, 4, cpu))
+                    break;
+                if (next == cur) break;
+                cur = next;
+            }
+        }
+    }
+
+    /* --- 3. Group contiguous pages into regions --- */
+    typedef struct { uint32_t start; uint32_t end; int page_count; } dirty_region_t;
+    int reg_cap = 512;
+    dirty_region_t *regions = malloc(reg_cap * sizeof(dirty_region_t));
+    int reg_count = 0;
+
+    int ri = 0;
+    while (ri < va_count) {
+        uint32_t region_start = dirty_vas[ri];
+        uint32_t region_end   = dirty_vas[ri] + 0x1000;
+        int      pg = 1;
+        while (ri + 1 < va_count &&
+               dirty_vas[ri + 1] == dirty_vas[ri] + 0x1000) {
+            ri++;
+            region_end = dirty_vas[ri] + 0x1000;
+            pg++;
+        }
+        ri++;
+        if (reg_count < reg_cap) {
+            regions[reg_count].start      = region_start;
+            regions[reg_count].end        = region_end;
+            regions[reg_count].page_count = pg;
+            reg_count++;
+        }
+    }
+
+    /* --- 4. Log to console --- */
+    nyx_printf("[DIRTY] Check #%d (%s): %d newly written pages in %d regions\n",
+               check_id, trigger, newly_dirty_count, reg_count);
+
+    for (int r = 0; r < reg_count; r++) {
+        const char *mod_name = NULL;
+        for (int m = 0; m < num_modules; m++) {
+            if (regions[r].start >= modules[m].base &&
+                regions[r].start < modules[m].base + modules[m].size) {
+                mod_name = modules[m].name;
+                break;
+            }
+        }
+        nyx_printf("[DIRTY]   0x%08x - 0x%08x  (%3d pages, 0x%x bytes)  %s\n",
+                   regions[r].start, regions[r].end,
+                   regions[r].page_count,
+                   regions[r].page_count * 0x1000,
+                   mod_name ? mod_name : "(unmapped/heap/stack)");
+    }
+
+    /* --- 5. Save to file --- */
+    char *dump_base = NULL;
+    assert(asprintf(&dump_base, "%s/dump",
+                    GET_GLOBAL_STATE()->workdir_path) != -1);
+    mkdir(dump_base, 0755);
+    free(dump_base);
+
+    char *log_path = NULL;
+    assert(asprintf(&log_path, "%s/dump/dirty_log_%03d_%s.txt",
+                    GET_GLOBAL_STATE()->workdir_path,
+                    check_id, trigger) != -1);
+    FILE *lf = fopen(log_path, "w");
+    if (lf) {
+        fprintf(lf, "# Dirty Page Log (Write Tracking)\n");
+        fprintf(lf, "# Check: #%d\n", check_id);
+        fprintf(lf, "# Trigger: %s\n", trigger);
+        fprintf(lf, "# Total newly written pages: %d\n", newly_dirty_count);
+        fprintf(lf, "# Contiguous regions: %d\n", reg_count);
+        fprintf(lf, "# Modules loaded: %d\n\n", num_modules);
+
+        fprintf(lf, "# %-12s  %-12s  %-8s  %-10s  %s\n",
+                "START", "END", "PAGES", "SIZE", "MODULE");
+        for (int r = 0; r < reg_count; r++) {
+            const char *mod_name = NULL;
+            for (int m = 0; m < num_modules; m++) {
+                if (regions[r].start >= modules[m].base &&
+                    regions[r].start < modules[m].base + modules[m].size) {
+                    mod_name = modules[m].name;
+                    break;
+                }
+            }
+            fprintf(lf, "  0x%08x    0x%08x    %5d     0x%08x  %s\n",
+                    regions[r].start, regions[r].end,
+                    regions[r].page_count,
+                    regions[r].page_count * 0x1000,
+                    mod_name ? mod_name : "(unmapped/heap/stack)");
+        }
+
+        fprintf(lf, "\n# Individual pages:\n");
+        for (int v = 0; v < va_count; v++) {
+            fprintf(lf, "0x%08x\n", dirty_vas[v]);
+        }
+        fclose(lf);
+        nyx_printf("[DIRTY] Log saved: %s\n", log_path);
+    }
+
+    free(log_path);
+    free(regions);
+    free(modules);
+    free(dirty_vas);
+}
+
+/*
  * Detect W⊕X (Write-then-Execute) pages.
  *
  * 1. Flush pending Intel PT data so page_cache is up to date.
@@ -1162,6 +1354,10 @@ static void wox_detect(CPUState *cpu, CPUX86State *env, const char *trigger)
         uint8_t v = newly_dirty[i];
         while (v) { newly_dirty_count++; v &= v - 1; }
     }
+
+    /* 3.5. Log all newly written pages for diagnostic */
+    wox_log_written_pages(cpu, env, newly_dirty, newly_dirty_count,
+                          check_id, trigger);
 
     /* 4. Detect W⊕X pages */
     page_cache_t *pc = GET_GLOBAL_STATE()->page_cache;
