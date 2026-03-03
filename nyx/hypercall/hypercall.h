@@ -147,6 +147,8 @@ void handle_hypercall_kafl_mtf(struct kvm_run *run,
 
 /* Periodic dirty-page scanner (called from pt_post_kvm_run) */
 void wox_periodic_dirty_scan(CPUState *cpu);
+/* Dirty-bit baseline snapshot (called at HYPERCALL_KAFL_ACQUIRE) */
+void wox_take_snapshot(CPUState *cpu);
 /* Final dirty-page report (called at HYPERCALL_KAFL_RELEASE) */
 void wox_final_dirty_report(CPUState *cpu);
 void pt_enable_rqo(CPUState *cpu);

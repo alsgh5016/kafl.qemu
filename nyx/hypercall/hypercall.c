@@ -172,6 +172,9 @@ void handle_hypercall_kafl_acquire(struct kvm_run *run,
                 }
                 GET_GLOBAL_STATE()->in_fuzzing_mode = true;
                 setup_snapshot_once = true;
+
+                /* Take W⊕X dirty-bit baseline snapshot at tracing start */
+                wox_take_snapshot(cpu);
             }
             acquire_print_once(cpu);
             synchronization_enter_fuzzing_loop(cpu);
@@ -1112,8 +1115,9 @@ static void wox_collect_dirty_bits(CPUX86State *env, uint8_t *bitmap)
 /*
  * Take initial PTE dirty-bit snapshot (baseline before unpacking).
  */
-static void wox_take_snapshot(CPUState *cpu, CPUX86State *env)
+void wox_take_snapshot(CPUState *cpu)
 {
+    CPUX86State *env = &(X86_CPU(cpu)->env);
     if (!wox_dirty_snapshot) {
         wox_dirty_snapshot = calloc(1, WOX_BITMAP_BYTES);
     }
@@ -1427,7 +1431,7 @@ static void wox_detect(CPUState *cpu, CPUX86State *env, const char *trigger)
     int check_id = wox_check_counter++;
 
     if (!wox_snapshot_taken) {
-        wox_take_snapshot(cpu, env);
+        wox_take_snapshot(cpu);
         return;
     }
 
