@@ -695,11 +695,12 @@ static void handle_hypercall_kafl_user_submit_mode(struct kvm_run *run,
         break;
     }
 }
-
-
-/* ===== Full process memory dump (reusable) ===== */
-/* Dumps all mapped user-space memory regions (exe, DLLs, stack, heap, etc.)
- * into fulldump_NNN_LABEL/ directory with per-region files and memory_map.txt.
+/* ===== Full process memory dump (reusable, optimized) =====
+ * Uses bulk page table walk (Strategy 1) + direct physical read (Strategy 3)
+ * to avoid per-page VA→PA translation overhead.
+ *
+ * Old approach: 520K × is_addr_mapped_cr3() = ~2M physical reads
+ * New approach: ~4 table loads + N physical reads (N = mapped page count)
  *
  * Parameters:
  *   cpu   - CPU state
@@ -707,6 +708,7 @@ static void handle_hypercall_kafl_user_submit_mode(struct kvm_run *run,
  *   label - human-readable label for this dump (e.g. API name, hook name)
  */
 typedef struct { uint32_t base; uint32_t size; char name[128]; } mod_info_t;
+typedef struct { uint32_t va; uint64_t phys; uint8_t perm; } mapped_page_t;
 #define MAX_MODS 256
 
 static int dump_seq_counter = 0;
@@ -727,31 +729,22 @@ static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
     }
 
     /* --- 2. Enumerate loaded modules via PEB->Ldr --- */
-    /*    PEB32+0x0C -> Ldr (PEB_LDR_DATA)             */
-    /*    Ldr+0x14   -> InMemoryOrderModuleList         */
     mod_info_t *modules = calloc(MAX_MODS, sizeof(mod_info_t));
     int num_modules = 0;
 
     uint32_t ldr_ptr = 0;
     if (read_virtual_memory((uint64_t)(peb_ptr + 0x0C),
                             (uint8_t*)&ldr_ptr, 4, cpu) && ldr_ptr != 0) {
-        /* InMemoryOrderModuleList head = Ldr + 0x14 */
         uint32_t list_head = ldr_ptr + 0x14;
         uint32_t flink = 0;
         read_virtual_memory((uint64_t)list_head, (uint8_t*)&flink, 4, cpu);
 
         uint32_t cur = flink;
         while (cur != 0 && cur != list_head && num_modules < MAX_MODS) {
-            /*  cur points to InMemoryOrderLinks (+0x08 in LDR_DATA_TABLE_ENTRY)
-             *  DllBase      = cur + 0x10   (entry+0x18)
-             *  SizeOfImage  = cur + 0x18   (entry+0x20)
-             *  BaseDllName  = cur + 0x24   (entry+0x2C, UNICODE_STRING)
-             */
             uint32_t dll_base = 0, dll_size = 0;
             read_virtual_memory((uint64_t)(cur + 0x10), (uint8_t*)&dll_base, 4, cpu);
             read_virtual_memory((uint64_t)(cur + 0x18), (uint8_t*)&dll_size, 4, cpu);
 
-            /* BaseDllName: UNICODE_STRING { Length(2), MaxLen(2), Buffer(4) } */
             uint16_t name_len = 0;
             uint32_t name_buf = 0;
             read_virtual_memory((uint64_t)(cur + 0x24), (uint8_t*)&name_len, 2, cpu);
@@ -772,7 +765,6 @@ static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
 
             num_modules++;
 
-            /* Follow Flink */
             uint32_t next = 0;
             if (!read_virtual_memory((uint64_t)cur, (uint8_t*)&next, 4, cpu))
                 break;
@@ -807,39 +799,161 @@ static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
     fprintf(map_f, "# Full process memory dump #%03d\n", seq);
     fprintf(map_f, "# Trigger: %s\n", label);
     fprintf(map_f, "# Modules: %d\n\n", num_modules);
-    fprintf(map_f, "# %-10s  %-10s  %-10s  %-40s  %s\n",
-            "START", "END", "SIZE", "FILE", "MODULE");
+    fprintf(map_f, "# %-10s  %-10s  %-10s  %-5s  %-40s  %s\n",
+            "START", "END", "SIZE", "PERM", "FILE", "MODULE");
 
-    /* Write module list */
     for (int m = 0; m < num_modules; m++) {
         fprintf(map_f, "# MODULE: %-30s  base=0x%08x  size=0x%08x\n",
                 modules[m].name, modules[m].base, modules[m].size);
     }
     fprintf(map_f, "\n");
 
-    /* --- 5. Scan entire user-space VA and dump mapped regions --- */
+    /* --- 5. Bulk page table walk to collect mapped user-space pages --- */
+    /*
+     * Instead of probing 520K VAs one-by-one (each = 4-level PT walk),
+     * we load entire page tables in bulk:
+     *   PML4 (1 read) → PDPT (1 read) → PD (~2 reads) → PT (per valid PDE)
+     * Total reads: ~tens to hundreds, vs ~2 million before.
+     *
+     * Permission bits extracted from PT entries:
+     *   bit 1  (R/W): 0=read-only, 1=read-write
+     *   bit 63 (NX):  0=executable, 1=no-execute
+     *   Effective = AND of all levels (PML4, PDPT, PD, PT)
+     */
+    int pg_capacity = 65536;
+    int pg_count = 0;
+    mapped_page_t *pages = malloc(pg_capacity * sizeof(mapped_page_t));
+
     uint64_t cr3 = env->cr[3];
-    uint32_t va = 0x10000;
+    uint64_t pml4_base = cr3 & 0x000FFFFFFFFFF000ULL;
+    uint64_t pml4_table[512];
+    cpu_physical_memory_read(pml4_base, pml4_table, 4096);
+
+    /* PML4[0] covers user-space VA 0x000000000000 - 0x007FFFFFFFFFFF */
+    uint64_t pml4e = pml4_table[0];
+    if (pml4e & 1) {
+        bool pml4_w = !!(pml4e & (1ULL << 1));
+        bool pml4_x = !(pml4e & (1ULL << 63));
+
+        uint64_t pdpt_base = pml4e & 0x000FFFFFFFFFF000ULL;
+        uint64_t pdpt_table[512];
+        cpu_physical_memory_read(pdpt_base, pdpt_table, 4096);
+
+        /* PDPT[0..1] covers VA 0x00000000 - 0x7FFFFFFF (32-bit user space) */
+        for (int pdpte_idx = 0; pdpte_idx < 2; pdpte_idx++) {
+            uint64_t pdpte = pdpt_table[pdpte_idx];
+            if (!(pdpte & 1)) continue;
+            if (pdpte & (1ULL << 7)) continue; /* 1GB huge page - skip */
+
+            bool pdpt_w = pml4_w && !!(pdpte & (1ULL << 1));
+            bool pdpt_x = pml4_x && !(pdpte & (1ULL << 63));
+
+            uint64_t pd_base = pdpte & 0x000FFFFFFFFFF000ULL;
+            uint64_t pd_table[512];
+            cpu_physical_memory_read(pd_base, pd_table, 4096);
+
+            for (int pde_idx = 0; pde_idx < 512; pde_idx++) {
+                uint64_t pde = pd_table[pde_idx];
+                if (!(pde & 1)) continue;
+
+                bool pd_w = pdpt_w && !!(pde & (1ULL << 1));
+                bool pd_x = pdpt_x && !(pde & (1ULL << 63));
+
+                if (pde & (1ULL << 7)) {
+                    /* 2MB huge page: physical base uses bits 21-51 */
+                    uint64_t page_phys = pde & 0x000FFFFFFFE00000ULL;
+                    uint32_t base_va = ((uint32_t)pdpte_idx << 30) |
+                                       ((uint32_t)pde_idx << 21);
+
+                    for (int k = 0; k < 512; k++) {
+                        uint32_t va = base_va + ((uint32_t)k << 12);
+                        if (va < 0x10000 || va >= 0x7FFF0000) continue;
+
+                        if (pg_count >= pg_capacity) {
+                            pg_capacity *= 2;
+                            pages = realloc(pages,
+                                            pg_capacity * sizeof(mapped_page_t));
+                        }
+                        pages[pg_count].va   = va;
+                        pages[pg_count].phys = page_phys + ((uint64_t)k << 12);
+                        pages[pg_count].perm = 0x01
+                                             | (pd_w ? 0x02 : 0)
+                                             | (pd_x ? 0x04 : 0);
+                        pg_count++;
+                    }
+                    continue;
+                }
+
+                /* 4KB pages: load the page table */
+                uint64_t pt_base = pde & 0x000FFFFFFFFFF000ULL;
+                uint64_t pt_table[512];
+                cpu_physical_memory_read(pt_base, pt_table, 4096);
+
+                for (int pte_idx = 0; pte_idx < 512; pte_idx++) {
+                    uint64_t pte = pt_table[pte_idx];
+                    if (!(pte & 1)) continue;
+
+                    uint32_t va = ((uint32_t)pdpte_idx << 30) |
+                                  ((uint32_t)pde_idx << 21) |
+                                  ((uint32_t)pte_idx << 12);
+                    if (va < 0x10000 || va >= 0x7FFF0000) continue;
+
+                    uint64_t phys = pte & 0x000FFFFFFFFFF000ULL;
+                    bool w = pd_w && !!(pte & (1ULL << 1));
+                    bool x = pd_x && !(pte & (1ULL << 63));
+
+                    if (pg_count >= pg_capacity) {
+                        pg_capacity *= 2;
+                        pages = realloc(pages,
+                                        pg_capacity * sizeof(mapped_page_t));
+                    }
+                    pages[pg_count].va   = va;
+                    pages[pg_count].phys = phys;
+                    pages[pg_count].perm = 0x01
+                                         | (w ? 0x02 : 0)
+                                         | (x ? 0x04 : 0);
+                    pg_count++;
+                }
+            }
+        }
+    }
+
+    nyx_printf("    [FULLDUMP] PT walk done: %d mapped pages in user space\n",
+               pg_count);
+
+    /* --- 6. Merge contiguous pages into regions & dump via phys read --- */
+    /*
+     * Pages are already in VA order (PT walk is ordered).
+     * Merge adjacent pages with same permissions into regions.
+     * Read each page directly by physical address (no VA→PA re-translation).
+     */
+    uint8_t *page_buf = malloc(0x1000);
     int region_count = 0;
     uint64_t total_bytes = 0;
-    uint8_t *page_buf = malloc(0x1000);
+    int i = 0;
 
-    while (va < 0x7FFF0000) {
-        /* Find start of a mapped region */
-        if (!is_addr_mapped_cr3((uint64_t)va, cpu, cr3)) {
-            va += 0x1000;
-            if (va == 0) break;
-            continue;
-        }
+    while (i < pg_count) {
+        uint32_t region_start = pages[i].va;
+        uint8_t  region_perm  = pages[i].perm;
+        int      region_first = i;
 
-        /* Found a mapped page - scan forward to find region end */
-        uint32_t region_start = va;
-        while (va < 0x7FFF0000 &&
-               is_addr_mapped_cr3((uint64_t)va, cpu, cr3)) {
-            va += 0x1000;
-            if (va == 0) break;
+        /* Extend region while VA is contiguous and permissions match */
+        while (i + 1 < pg_count &&
+               pages[i + 1].va == pages[i].va + 0x1000 &&
+               pages[i + 1].perm == region_perm) {
+            i++;
         }
-        uint32_t region_size = va - region_start;
+        int region_last = i;
+        i++;
+
+        uint32_t region_size = (uint32_t)(region_last - region_first + 1) * 0x1000;
+
+        /* Build permission string: r--/rw-/r-x/rwx */
+        char perm_str[4];
+        perm_str[0] = 'r';
+        perm_str[1] = (region_perm & 0x02) ? 'w' : '-';
+        perm_str[2] = (region_perm & 0x04) ? 'x' : '-';
+        perm_str[3] = '\0';
 
         /* Identify module for this region */
         const char *mod_name = NULL;
@@ -851,31 +965,22 @@ static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
             }
         }
 
-        /* Create region file */
+        /* Write region file: read each page by physical address directly */
         char *reg_path = NULL;
-        assert(asprintf(&reg_path, "%s/region_%08x_%x.bin",
-                        dump_dir, region_start, region_size) != -1);
+        assert(asprintf(&reg_path, "%s/region_%08x_%x_%s.bin",
+                        dump_dir, region_start, region_size, perm_str) != -1);
         FILE *rf = fopen(reg_path, "w");
         if (rf) {
-            uint32_t off = 0;
-            while (off < region_size) {
-                uint32_t chunk = (region_size - off > 0x1000)
-                                 ? 0x1000 : (region_size - off);
-                if (read_virtual_memory((uint64_t)(region_start + off),
-                                        page_buf, chunk, cpu)) {
-                    fwrite(page_buf, 1, chunk, rf);
-                } else {
-                    memset(page_buf, 0, chunk);
-                    fwrite(page_buf, 1, chunk, rf);
-                }
-                off += chunk;
+            for (int p = region_first; p <= region_last; p++) {
+                cpu_physical_memory_read(pages[p].phys, page_buf, 0x1000);
+                fwrite(page_buf, 1, 0x1000, rf);
             }
             fclose(rf);
         }
 
-        fprintf(map_f, "  0x%08x  0x%08x  0x%08x  region_%08x_%x.bin  %s\n",
-                region_start, va, region_size,
-                region_start, region_size,
+        fprintf(map_f, "  0x%08x  0x%08x  0x%08x  %-5s  region_%08x_%x_%s.bin  %s\n",
+                region_start, region_start + region_size, region_size,
+                perm_str, region_start, region_size, perm_str,
                 mod_name ? mod_name : "");
 
         region_count++;
@@ -884,12 +989,13 @@ static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
     }
 
     free(page_buf);
-    fprintf(map_f, "\n# Total: %d regions, %lu bytes\n",
-            region_count, (unsigned long)total_bytes);
+    free(pages);
+    fprintf(map_f, "\n# Total: %d regions, %lu bytes (%d pages)\n",
+            region_count, (unsigned long)total_bytes, pg_count);
     fclose(map_f);
 
-    nyx_printf("    [FULLDUMP] Saved %d regions (%lu bytes) -> %s/\n",
-               region_count, (unsigned long)total_bytes, dump_dir);
+    nyx_printf("    [FULLDUMP] Saved %d regions (%lu bytes, %d pages) -> %s/\n",
+               region_count, (unsigned long)total_bytes, pg_count, dump_dir);
 
     free(modules);
     free(map_path);
