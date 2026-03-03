@@ -170,6 +170,18 @@ void handle_hypercall_kafl_acquire(struct kvm_run *run,
                         pt_enable_ip_filtering(cpu, i, true, false);
                     }
                 }
+
+                /* Initialize PT decoder for real-time trace decoding.
+                 * In normal kAFL mode this happens in NEXT_PAYLOAD, but
+                 * single-shot mode never calls NEXT_PAYLOAD.  The decoder
+                 * is required so libxdc_decode() can populate page_cache
+                 * with executed-page addresses for W⊕X detection.
+                 */
+                if (GET_GLOBAL_STATE()->nyx_pt &&
+                    GET_GLOBAL_STATE()->cap_compile_time_tracing == false) {
+                    pt_init_decoder(cpu);
+                    nyx_printf("[WOX] PT decoder initialized (single-shot mode)\n");
+                }
                 GET_GLOBAL_STATE()->in_fuzzing_mode = true;
                 setup_snapshot_once = true;
 
@@ -1031,6 +1043,7 @@ static uint8_t *wox_dirty_snapshot = NULL;
 static bool     wox_snapshot_taken = false;
 static int      wox_check_counter  = 0;
 static uint8_t *wox_dirty_cumulative = NULL;  /* union of all observed dirty pages */
+static uint8_t *wox_exec_baseline = NULL;     /* executed pages bitmap at round start */
 static mod_info_t *wox_cached_modules = NULL;  /* cached module list from first successful PEB walk */
 static int         wox_cached_num_modules = 0;
 static uint8_t   **wox_page_content = NULL;   /* per-page content snapshot */
@@ -1474,6 +1487,7 @@ void wox_periodic_dirty_scan(CPUState *cpu)
 
     /* --- 2. Collect dirty bits & compute newly-dirty set --- */
     static int periodic_counter = 0;
+    static int wox_round = 0;
     int check_id = periodic_counter++;
 
     uint8_t *current_dirty = calloc(1, WOX_BITMAP_BYTES);
@@ -1493,12 +1507,121 @@ void wox_periodic_dirty_scan(CPUState *cpu)
     for (int i = 0; i < WOX_BITMAP_BYTES; i++)
         wox_dirty_cumulative[i] |= newly_dirty[i];
 
-    /* --- 3. Log written pages (trigger = "periodic") --- */
-    wox_log_written_pages(cpu, env, newly_dirty, newly_dirty_count,
-                          check_id, "periodic");
+    /* Count cumulative dirty pages for logging */
+    int cumulative_count = 0;
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+        uint8_t v = wox_dirty_cumulative[i];
+        while (v) { cumulative_count++; v &= v - 1; }
+    }
 
     free(newly_dirty);
     free(current_dirty);
+
+    /* --- 3. Real-time W⊕X cross-check: dirty ∩ executed --- */
+    page_cache_t *pc = GET_GLOBAL_STATE()->page_cache;
+    if (!pc || !GET_GLOBAL_STATE()->decoder) {
+        /* Decoder not yet initialized — skip execute-side check.
+         * Still accumulate dirty pages above for when decoder is ready. */
+        nyx_printf("[WOX] Scan #%d: %d cumulative dirty pages (decoder not ready)\n",
+                   check_id, cumulative_count);
+        return;
+    }
+
+    /* Flush pending PT data so page_cache is fully up to date */
+    pt_handle_overflow(cpu);
+
+    /* Get executed pages from page_cache (populated by libxdc_decode) */
+    int max_exec = 65536;
+    uint64_t *exec_pages = malloc(max_exec * sizeof(uint64_t));
+    int exec_count = page_cache_get_executed_pages(pc, exec_pages, max_exec);
+
+    /* Build bitmap of currently-executed pages in user VA range */
+    uint8_t *exec_bitmap = calloc(1, WOX_BITMAP_BYTES);
+    for (int e = 0; e < exec_count; e++) {
+        uint64_t va = exec_pages[e];
+        if (va >= WOX_USER_VA_START && va < WOX_USER_VA_END)
+            wox_bitmap_set(exec_bitmap, wox_va_to_idx((uint32_t)va));
+    }
+
+    /* Determine newly-executed pages (not in baseline from last round) */
+    uint8_t *new_exec = calloc(1, WOX_BITMAP_BYTES);
+    int new_exec_count = 0;
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+        new_exec[i] = exec_bitmap[i] & ~(wox_exec_baseline ? wox_exec_baseline[i] : 0);
+        uint8_t v = new_exec[i];
+        while (v) { new_exec_count++; v &= v - 1; }
+    }
+
+    /* Cross-check: pages both written (dirty) AND executed since round start */
+    int wox_count = 0;
+    int wox_addrs_cap = 4096;
+    uint32_t *wox_addrs = malloc(wox_addrs_cap * sizeof(uint32_t));
+
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+        uint8_t wox_byte = wox_dirty_cumulative[i] & new_exec[i];
+        if (!wox_byte) continue;
+        for (int bit = 0; bit < 8; bit++) {
+            if (wox_byte & (1 << bit)) {
+                int idx = i * 8 + bit;
+                uint32_t va = WOX_USER_VA_START + (uint32_t)idx * 0x1000;
+                if (wox_count < wox_addrs_cap)
+                    wox_addrs[wox_count] = va;
+                wox_count++;
+            }
+        }
+    }
+
+    nyx_printf("[WOX] Scan #%d: dirty=%d, exec=%d (new=%d), W+X=%d\n",
+               check_id, cumulative_count, exec_count, new_exec_count, wox_count);
+
+    free(new_exec);
+    free(exec_bitmap);
+
+    /* --- 4. W⊕X detected! Dump memory and reset round --- */
+    if (wox_count > 0) {
+        nyx_printf("\n");
+        nyx_printf("==================================================\n");
+        nyx_printf("[WOX] *** WRITE-THEN-EXECUTE DETECTED (round %d) ***\n", wox_round);
+        nyx_printf("[WOX] %d pages were written and then executed:\n", wox_count);
+
+        /* Save W⊕X detection report */
+        char *report_path = NULL;
+        assert(asprintf(&report_path, "%s/dump/wox_detect_round%d.txt",
+                        GET_GLOBAL_STATE()->workdir_path, wox_round) != -1);
+        FILE *rf = fopen(report_path, "w");
+        if (rf) {
+            fprintf(rf, "# W⊕X Detection Report — Round %d\n", wox_round);
+            fprintf(rf, "# Scan #%d\n", check_id);
+            fprintf(rf, "# Cumulative dirty pages: %d\n", cumulative_count);
+            fprintf(rf, "# Executed pages (PT): %d\n", exec_count);
+            fprintf(rf, "# W⊕X pages: %d\n\n", wox_count);
+            for (int w = 0; w < wox_count && w < wox_addrs_cap; w++) {
+                fprintf(rf, "0x%08x\n", wox_addrs[w]);
+                nyx_printf("[WOX]   0x%08x\n", wox_addrs[w]);
+            }
+            fclose(rf);
+            nyx_printf("[WOX] Report saved: %s\n", report_path);
+        }
+        free(report_path);
+
+        nyx_printf("[WOX] Triggering full process memory dump...\n");
+        nyx_printf("==================================================\n\n");
+
+        /* Dump full process memory */
+        char dump_label[64];
+        snprintf(dump_label, sizeof(dump_label), "wox_round%d", wox_round);
+        dump_full_process_memory(cpu, env, dump_label);
+
+        /* Reset for next round */
+        wox_round++;
+        wox_reset_round(cpu);
+
+        /* Exec baseline is saved inside wox_reset_round() so the
+         * next round only detects NEW write-then-execute pages. */
+    }
+
+    free(wox_addrs);
+    free(exec_pages);
 }
 
 /* Forward declaration */
@@ -1771,6 +1894,28 @@ void wox_reset_round(CPUState *cpu)
 {
     if (wox_dirty_cumulative)
         memset(wox_dirty_cumulative, 0, WOX_BITMAP_BYTES);
+
+    /* Snapshot current executed pages as baseline for next round.
+     * Pages executed before this point won't count as "new" in the
+     * next round's W⊕X cross-check. */
+    page_cache_t *pc = GET_GLOBAL_STATE()->page_cache;
+    if (pc) {
+        if (!wox_exec_baseline)
+            wox_exec_baseline = calloc(1, WOX_BITMAP_BYTES);
+        else
+            memset(wox_exec_baseline, 0, WOX_BITMAP_BYTES);
+
+        int max_exec = 65536;
+        uint64_t *exec_pages = malloc(max_exec * sizeof(uint64_t));
+        int exec_count = page_cache_get_executed_pages(pc, exec_pages, max_exec);
+        for (int e = 0; e < exec_count; e++) {
+            uint64_t va = exec_pages[e];
+            if (va >= WOX_USER_VA_START && va < WOX_USER_VA_END)
+                wox_bitmap_set(wox_exec_baseline, wox_va_to_idx((uint32_t)va));
+        }
+        free(exec_pages);
+        nyx_printf("[WOX] Execution baseline saved: %d pages\n", exec_count);
+    }
 
     wox_take_snapshot(cpu);
 
