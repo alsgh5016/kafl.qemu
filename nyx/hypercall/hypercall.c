@@ -1033,6 +1033,9 @@ static int      wox_check_counter  = 0;
 static uint8_t *wox_dirty_cumulative = NULL;  /* union of all observed dirty pages */
 static mod_info_t *wox_cached_modules = NULL;  /* cached module list from first successful PEB walk */
 static int         wox_cached_num_modules = 0;
+static uint8_t   **wox_page_content = NULL;   /* per-page content snapshot */
+static uint8_t    *wox_page_present = NULL;   /* bitmap: pages mapped at snapshot */
+static int         wox_content_snapshot_pages = 0;
 
 static inline int wox_va_to_idx(uint32_t va)
 {
@@ -1116,6 +1119,96 @@ static void wox_collect_dirty_bits(CPUX86State *env, uint8_t *bitmap)
 }
 
 /*
+ * Capture content of all mapped user-space pages (baseline for byte-level diff).
+ */
+static void wox_take_content_snapshot(CPUState *cpu, CPUX86State *env)
+{
+    if (!wox_page_content)
+        wox_page_content = calloc(WOX_PAGE_COUNT, sizeof(uint8_t *));
+    if (!wox_page_present)
+        wox_page_present = calloc(1, WOX_BITMAP_BYTES);
+
+    /* Free old content if re-snapshotting */
+    for (int i = 0; i < WOX_PAGE_COUNT; i++) {
+        if (wox_page_content[i]) {
+            free(wox_page_content[i]);
+            wox_page_content[i] = NULL;
+        }
+    }
+    memset(wox_page_present, 0, WOX_BITMAP_BYTES);
+    wox_content_snapshot_pages = 0;
+
+    uint64_t cr3 = env->cr[3];
+    uint64_t pml4_base = cr3 & 0x000FFFFFFFFFF000ULL;
+    uint64_t pml4_table[512];
+    cpu_physical_memory_read(pml4_base, pml4_table, 4096);
+
+    uint64_t pml4e = pml4_table[0];
+    if (!(pml4e & 1)) return;
+
+    uint64_t pdpt_base = pml4e & 0x000FFFFFFFFFF000ULL;
+    uint64_t pdpt_table[512];
+    cpu_physical_memory_read(pdpt_base, pdpt_table, 4096);
+
+    for (int pdpte_idx = 0; pdpte_idx < 2; pdpte_idx++) {
+        uint64_t pdpte = pdpt_table[pdpte_idx];
+        if (!(pdpte & 1)) continue;
+        if (pdpte & (1ULL << 7)) continue;
+
+        uint64_t pd_base = pdpte & 0x000FFFFFFFFFF000ULL;
+        uint64_t pd_table[512];
+        cpu_physical_memory_read(pd_base, pd_table, 4096);
+
+        for (int pde_idx = 0; pde_idx < 512; pde_idx++) {
+            uint64_t pde = pd_table[pde_idx];
+            if (!(pde & 1)) continue;
+
+            if (pde & (1ULL << 7)) {
+                uint64_t page_phys = pde & 0x000FFFFFFFE00000ULL;
+                uint32_t base_va = ((uint32_t)pdpte_idx << 30) |
+                                   ((uint32_t)pde_idx << 21);
+                for (int k = 0; k < 512; k++) {
+                    uint32_t va = base_va + ((uint32_t)k << 12);
+                    if (va < WOX_USER_VA_START || va >= WOX_USER_VA_END) continue;
+                    int idx = wox_va_to_idx(va);
+                    wox_page_content[idx] = malloc(0x1000);
+                    cpu_physical_memory_read(page_phys + ((uint64_t)k << 12),
+                                            wox_page_content[idx], 0x1000);
+                    wox_bitmap_set(wox_page_present, idx);
+                    wox_content_snapshot_pages++;
+                }
+                continue;
+            }
+
+            uint64_t pt_base = pde & 0x000FFFFFFFFFF000ULL;
+            uint64_t pt_table[512];
+            cpu_physical_memory_read(pt_base, pt_table, 4096);
+
+            for (int pte_idx = 0; pte_idx < 512; pte_idx++) {
+                uint64_t pte = pt_table[pte_idx];
+                if (!(pte & 1)) continue;
+
+                uint32_t va = ((uint32_t)pdpte_idx << 30) |
+                              ((uint32_t)pde_idx << 21) |
+                              ((uint32_t)pte_idx << 12);
+                if (va < WOX_USER_VA_START || va >= WOX_USER_VA_END) continue;
+
+                uint64_t phys = pte & 0x000FFFFFFFFFF000ULL;
+                int idx = wox_va_to_idx(va);
+                wox_page_content[idx] = malloc(0x1000);
+                cpu_physical_memory_read(phys, wox_page_content[idx], 0x1000);
+                wox_bitmap_set(wox_page_present, idx);
+                wox_content_snapshot_pages++;
+            }
+        }
+    }
+
+    nyx_printf("[WOX] Content snapshot: %d pages captured (%d MB)\n",
+               wox_content_snapshot_pages,
+               (wox_content_snapshot_pages * 4096) / (1024 * 1024));
+}
+
+/*
  * Take initial PTE dirty-bit snapshot (baseline before unpacking).
  */
 void wox_take_snapshot(CPUState *cpu)
@@ -1135,6 +1228,9 @@ void wox_take_snapshot(CPUState *cpu)
     }
     nyx_printf("[WOX] Dirty-bit snapshot taken: %d baseline dirty pages\n",
                baseline);
+
+    /* Also capture page content for byte-level diff */
+    wox_take_content_snapshot(cpu, env);
 }
 
 /*
@@ -1405,6 +1501,9 @@ void wox_periodic_dirty_scan(CPUState *cpu)
     free(current_dirty);
 }
 
+/* Forward declaration */
+static void wox_content_diff_report(CPUState *cpu, CPUX86State *env);
+
 /*
  * Final dirty-page report — called at program termination
  * (HYPERCALL_KAFL_RELEASE).  Prints all pages that were written
@@ -1443,6 +1542,239 @@ void wox_final_dirty_report(CPUState *cpu)
     static int final_counter = 0;
     wox_log_written_pages(cpu, env, wox_dirty_cumulative, cumulative_count,
                           final_counter++, "final");
+
+    /* Byte-level content diff report */
+    wox_content_diff_report(cpu, env);
+}
+
+/*
+ * Byte-level content diff report.
+ * Compares current page content against ACQUIRE-time snapshot for all
+ * cumulative-dirty pages.  Outputs exact byte ranges that were modified.
+ */
+static void wox_content_diff_report(CPUState *cpu, CPUX86State *env)
+{
+    if (!wox_page_content || !wox_page_present) {
+        nyx_printf("[WOX] Content diff: no content snapshot, skipping\n");
+        return;
+    }
+    if (!wox_dirty_cumulative) {
+        nyx_printf("[WOX] Content diff: no dirty data, skipping\n");
+        return;
+    }
+
+    /* --- Build current physical address map via PT walk --- */
+    uint64_t *cur_phys = calloc(WOX_PAGE_COUNT, sizeof(uint64_t));
+    uint8_t  *cur_mapped = calloc(1, WOX_BITMAP_BYTES);
+
+    uint64_t cr3 = env->cr[3];
+    uint64_t pml4_base = cr3 & 0x000FFFFFFFFFF000ULL;
+    uint64_t pml4_table[512];
+    cpu_physical_memory_read(pml4_base, pml4_table, 4096);
+
+    uint64_t pml4e = pml4_table[0];
+    if (pml4e & 1) {
+        uint64_t pdpt_base = pml4e & 0x000FFFFFFFFFF000ULL;
+        uint64_t pdpt_table[512];
+        cpu_physical_memory_read(pdpt_base, pdpt_table, 4096);
+
+        for (int pdpte_idx = 0; pdpte_idx < 2; pdpte_idx++) {
+            uint64_t pdpte = pdpt_table[pdpte_idx];
+            if (!(pdpte & 1)) continue;
+            if (pdpte & (1ULL << 7)) continue;
+
+            uint64_t pd_base = pdpte & 0x000FFFFFFFFFF000ULL;
+            uint64_t pd_table[512];
+            cpu_physical_memory_read(pd_base, pd_table, 4096);
+
+            for (int pde_idx = 0; pde_idx < 512; pde_idx++) {
+                uint64_t pde = pd_table[pde_idx];
+                if (!(pde & 1)) continue;
+
+                if (pde & (1ULL << 7)) {
+                    uint64_t page_phys = pde & 0x000FFFFFFFE00000ULL;
+                    uint32_t base_va = ((uint32_t)pdpte_idx << 30) |
+                                       ((uint32_t)pde_idx << 21);
+                    for (int k = 0; k < 512; k++) {
+                        uint32_t va = base_va + ((uint32_t)k << 12);
+                        if (va < WOX_USER_VA_START || va >= WOX_USER_VA_END) continue;
+                        int idx = wox_va_to_idx(va);
+                        cur_phys[idx] = page_phys + ((uint64_t)k << 12);
+                        wox_bitmap_set(cur_mapped, idx);
+                    }
+                    continue;
+                }
+
+                uint64_t pt_base = pde & 0x000FFFFFFFFFF000ULL;
+                uint64_t pt_table[512];
+                cpu_physical_memory_read(pt_base, pt_table, 4096);
+
+                for (int pte_idx = 0; pte_idx < 512; pte_idx++) {
+                    uint64_t pte = pt_table[pte_idx];
+                    if (!(pte & 1)) continue;
+
+                    uint32_t va = ((uint32_t)pdpte_idx << 30) |
+                                  ((uint32_t)pde_idx << 21) |
+                                  ((uint32_t)pte_idx << 12);
+                    if (va < WOX_USER_VA_START || va >= WOX_USER_VA_END) continue;
+
+                    int idx = wox_va_to_idx(va);
+                    cur_phys[idx] = pte & 0x000FFFFFFFFFF000ULL;
+                    wox_bitmap_set(cur_mapped, idx);
+                }
+            }
+        }
+    }
+
+    /* --- Create output file --- */
+    char *dump_base = NULL;
+    assert(asprintf(&dump_base, "%s/dump",
+                    GET_GLOBAL_STATE()->workdir_path) != -1);
+    mkdir(dump_base, 0755);
+    free(dump_base);
+
+    static int diff_seq = 0;
+    char *diff_path = NULL;
+    assert(asprintf(&diff_path, "%s/dump/content_diff_%03d.txt",
+                    GET_GLOBAL_STATE()->workdir_path, diff_seq++) != -1);
+    FILE *df = fopen(diff_path, "w");
+    if (!df) {
+        nyx_printf("[WOX] Content diff: failed to create %s\n", diff_path);
+        free(diff_path); free(cur_phys); free(cur_mapped);
+        return;
+    }
+
+    mod_info_t *modules = wox_cached_modules;
+    int num_modules = wox_cached_num_modules;
+
+    int total_dirty = 0;
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+        uint8_t v = wox_dirty_cumulative[i];
+        while (v) { total_dirty++; v &= v - 1; }
+    }
+
+    fprintf(df, "# Content Diff Report (Byte-level Write Tracking)\n");
+    fprintf(df, "# Snapshot pages at ACQUIRE: %d\n", wox_content_snapshot_pages);
+    fprintf(df, "# Cumulative dirty pages: %d\n", total_dirty);
+    fprintf(df, "# Modules cached: %d\n\n", num_modules);
+
+    /* --- Diff each dirty page --- */
+    int pages_changed = 0, pages_new = 0, pages_unmapped = 0;
+    uint64_t total_bytes_changed = 0;
+    uint8_t cur_page[0x1000];
+
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+        uint8_t byte_val = wox_dirty_cumulative[i];
+        if (!byte_val) continue;
+        for (int bit = 0; bit < 8; bit++) {
+            if (!(byte_val & (1 << bit))) continue;
+
+            int idx = i * 8 + bit;
+            if (idx >= WOX_PAGE_COUNT) break;
+            uint32_t va = WOX_USER_VA_START + (uint32_t)idx * 0x1000;
+
+            const char *mod_name = NULL;
+            for (int m = 0; m < num_modules; m++) {
+                if (va >= modules[m].base &&
+                    va < modules[m].base + modules[m].size) {
+                    mod_name = modules[m].name;
+                    break;
+                }
+            }
+
+            if (!wox_bitmap_test(cur_mapped, idx)) {
+                pages_unmapped++;
+                fprintf(df, "0x%08x  UNMAPPED  %s\n", va,
+                        mod_name ? mod_name : "");
+                continue;
+            }
+
+            cpu_physical_memory_read(cur_phys[idx], cur_page, 0x1000);
+
+            if (!wox_bitmap_test(wox_page_present, idx) ||
+                !wox_page_content[idx]) {
+                pages_new++;
+                total_bytes_changed += 0x1000;
+                fprintf(df, "0x%08x  NEW       4096/4096 bytes  %s\n", va,
+                        mod_name ? mod_name : "");
+                continue;
+            }
+
+            /* Byte-by-byte comparison -- collect changed ranges */
+            typedef struct { int start; int end; } brange_t;
+            brange_t ranges[512];
+            int range_count = 0;
+            int changed_bytes = 0;
+            int in_range = 0;
+            int range_start = 0;
+
+            for (int b = 0; b <= 0x1000; b++) {
+                bool differs = (b < 0x1000) &&
+                               (cur_page[b] != wox_page_content[idx][b]);
+                if (differs && !in_range) {
+                    range_start = b;
+                    in_range = 1;
+                } else if (!differs && in_range) {
+                    if (range_count < 512) {
+                        ranges[range_count].start = range_start;
+                        ranges[range_count].end = b;
+                        range_count++;
+                    }
+                    changed_bytes += (b - range_start);
+                    in_range = 0;
+                }
+            }
+
+            if (changed_bytes == 0) continue;
+
+            pages_changed++;
+            total_bytes_changed += changed_bytes;
+
+            if (changed_bytes == 0x1000) {
+                fprintf(df, "0x%08x  FULL      4096/4096 bytes  %s\n", va,
+                        mod_name ? mod_name : "");
+            } else {
+                fprintf(df, "0x%08x  PARTIAL   %4d/4096 bytes  %s\n", va,
+                        changed_bytes, mod_name ? mod_name : "");
+                for (int r = 0; r < range_count; r++) {
+                    fprintf(df, "  0x%03x - 0x%03x  (%d bytes)\n",
+                            ranges[r].start, ranges[r].end,
+                            ranges[r].end - ranges[r].start);
+                }
+            }
+        }
+    }
+
+    fprintf(df, "\n# Summary:\n");
+    fprintf(df, "# Pages with byte changes: %d\n", pages_changed);
+    fprintf(df, "# New pages (not in snapshot): %d\n", pages_new);
+    fprintf(df, "# Unmapped pages: %d\n", pages_unmapped);
+    fprintf(df, "# Total bytes changed: %lu\n", (unsigned long)total_bytes_changed);
+    fclose(df);
+
+    nyx_printf("[WOX] Content diff: %d changed, %d new, %d unmapped, "
+               "%lu bytes total -> %s\n",
+               pages_changed, pages_new, pages_unmapped,
+               (unsigned long)total_bytes_changed, diff_path);
+
+    free(diff_path);
+    free(cur_phys);
+    free(cur_mapped);
+}
+
+/*
+ * Reset W+X tracking for multi-round detection.
+ * Clears cumulative dirty bitmap and re-takes both dirty-bit and
+ * content snapshots from the current memory state.
+ */
+void wox_reset_round(CPUState *cpu)
+{
+    if (wox_dirty_cumulative)
+        memset(wox_dirty_cumulative, 0, WOX_BITMAP_BYTES);
+
+    wox_take_snapshot(cpu);
+
+    nyx_printf("[WOX] Round reset: tracking cleared, new baseline established\n");
 }
 
 /*

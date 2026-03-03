@@ -151,6 +151,8 @@ void wox_periodic_dirty_scan(CPUState *cpu);
 void wox_take_snapshot(CPUState *cpu);
 /* Final dirty-page report (called at HYPERCALL_KAFL_RELEASE) */
 void wox_final_dirty_report(CPUState *cpu);
+/* Reset W+X tracking for multi-round detection */
+void wox_reset_round(CPUState *cpu);
 void pt_enable_rqo(CPUState *cpu);
 void pt_disable_rqo(CPUState *cpu);
 void pt_enable_rqi(CPUState *cpu);
