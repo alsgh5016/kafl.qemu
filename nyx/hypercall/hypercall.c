@@ -346,6 +346,9 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
                 GET_GLOBAL_STATE()->starved = 0;
             }
 
+
+            /* Final dirty-page report before tracing stops */
+            wox_final_dirty_report(cpu);
             synchronization_disable_pt(cpu);
             release_print_once(cpu);
         }
@@ -1375,6 +1378,42 @@ void wox_periodic_dirty_scan(CPUState *cpu)
 }
 
 /*
+ * Final dirty-page report — called at program termination
+ * (HYPERCALL_KAFL_RELEASE).  Prints all pages that were written
+ * after the baseline snapshot, regardless of execution status.
+ */
+void wox_final_dirty_report(CPUState *cpu)
+{
+    if (!wox_snapshot_taken) {
+        nyx_printf("[DIRTY] Final report: no snapshot was taken, skipping\n");
+        return;
+    }
+
+    CPUX86State *env = &(X86_CPU(cpu)->env);
+
+    /* Collect current dirty bits */
+    uint8_t *current_dirty = calloc(1, WOX_BITMAP_BYTES);
+    wox_collect_dirty_bits(env, current_dirty);
+
+    /* Compute newly dirty pages since baseline */
+    uint8_t *newly_dirty = calloc(1, WOX_BITMAP_BYTES);
+    int newly_dirty_count = 0;
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+        newly_dirty[i] = current_dirty[i] & ~wox_dirty_snapshot[i];
+        uint8_t v = newly_dirty[i];
+        while (v) { newly_dirty_count++; v &= v - 1; }
+    }
+
+    /* Use the existing logging function with trigger="final" */
+    static int final_counter = 0;
+    wox_log_written_pages(cpu, env, newly_dirty, newly_dirty_count,
+                          final_counter++, "final");
+
+    free(newly_dirty);
+    free(current_dirty);
+}
+
+/*
  * Detect W⊕X (Write-then-Execute) pages.
  *
  * 1. Flush pending Intel PT data so page_cache is up to date.
@@ -1605,8 +1644,6 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
                            api_name, hit_addr, current_cr3);
                 
 
-                /* W⊕X detection: check for Write-then-Execute on every hook hit */
-                wox_detect(cpu, env, api_name);
                 /* GetProcAddress argument logging + memory dump (32-bit stdcall) */
                 if (strstr(api_name, "GetProcAddress") != NULL) {
                     uint32_t esp = env->regs[R_ESP] & 0xFFFFFFFF;
