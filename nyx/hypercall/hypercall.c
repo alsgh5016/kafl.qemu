@@ -226,11 +226,11 @@ void handle_hypercall_kafl_acquire(struct kvm_run *run,
                  * is required so libxdc_decode() can populate page_cache
                  * with executed-page addresses for W⊕X detection.
                  */
-                if (GET_GLOBAL_STATE()->nyx_pt &&
-                    GET_GLOBAL_STATE()->cap_compile_time_tracing == false) {
-                    pt_init_decoder(cpu);
-                    nyx_printf("[WOX] PT decoder initialized (single-shot mode)\n");
-                }
+// [TEST]                 if (GET_GLOBAL_STATE()->nyx_pt &&
+// [TEST]                     GET_GLOBAL_STATE()->cap_compile_time_tracing == false) {
+// [TEST]                     pt_init_decoder(cpu);
+// [TEST]                     nyx_printf("[WOX] PT decoder initialized (single-shot mode)\n");
+// [TEST]                 }
                 GET_GLOBAL_STATE()->in_fuzzing_mode = true;
                 setup_snapshot_once = true;
 
