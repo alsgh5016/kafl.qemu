@@ -1423,8 +1423,13 @@ void wox_take_snapshot(CPUState *cpu)
     nyx_printf("[WOX] Dirty-bit snapshot taken: %d baseline dirty pages\n",
                baseline);
 
-    /* Also capture page content for byte-level diff */
-    wox_take_content_snapshot(cpu, env);
+    /* Content snapshot only at initial ACQUIRE (harness CR3, small).
+     * Skip during round reset (target CR3, thousands of pages = too slow). */
+    static bool initial_snapshot_done = false;
+    if (!initial_snapshot_done) {
+        wox_take_content_snapshot(cpu, env);
+        initial_snapshot_done = true;
+    }
 }
 
 /*
