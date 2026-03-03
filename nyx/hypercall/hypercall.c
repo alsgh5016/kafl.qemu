@@ -235,7 +235,7 @@ void handle_hypercall_kafl_acquire(struct kvm_run *run,
                 setup_snapshot_once = true;
 
                 /* Take W⊕X dirty-bit baseline snapshot at tracing start */
-                wox_take_snapshot(cpu);
+                // [TEST] wox_take_snapshot(cpu);
                 dump_worker_init();
             }
             acquire_print_once(cpu);
