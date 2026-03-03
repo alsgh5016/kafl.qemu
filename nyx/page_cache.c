@@ -89,7 +89,8 @@ static bool append_page(page_cache_t *self, uint64_t page, uint64_t cr3)
         if (!dump_page_cr3_ht(page, self->page_data + (PAGE_SIZE * self->num_pages),
                               self->cpu, GET_GLOBAL_STATE()->parent_cr3))
         {
-            if (!dump_page_cr3_snapshot(page,
+            if (!fast_reload_root_created(get_fast_reload_snapshot()) ||
+                !dump_page_cr3_snapshot(page,
                                         self->page_data + (PAGE_SIZE * self->num_pages),
                                         self->cpu, GET_GLOBAL_STATE()->parent_cr3))
             {
@@ -153,11 +154,29 @@ static bool update_page_cache(page_cache_t *self, uint64_t page, khiter_t *k)
         int ret;
 
         uint64_t cr3 = GET_GLOBAL_STATE()->parent_cr3;
-        if (!is_addr_mapped_cr3_snapshot(page, self->cpu,
-                                         GET_GLOBAL_STATE()->parent_cr3) &&
-            !is_addr_mapped_cr3_snapshot(page, self->cpu,
-                                         GET_GLOBAL_STATE()->pt_c3_filter))
-        {
+        /*
+         * Check if the page is mapped.  When a root snapshot exists we
+         * can use the snapshot-based page-table walk (original kAFL
+         * behaviour).  In single-shot / non-snapshot mode the snapshot
+         * memory is uninitialised, so fall back to live memory reads.
+         */
+        bool snapshot_available =
+            fast_reload_root_created(get_fast_reload_snapshot());
+        bool page_mapped;
+        if (snapshot_available) {
+            page_mapped =
+                is_addr_mapped_cr3_snapshot(page, self->cpu,
+                                            GET_GLOBAL_STATE()->parent_cr3) ||
+                is_addr_mapped_cr3_snapshot(page, self->cpu,
+                                            GET_GLOBAL_STATE()->pt_c3_filter);
+        } else {
+            page_mapped =
+                is_addr_mapped_cr3(page, self->cpu,
+                                   GET_GLOBAL_STATE()->parent_cr3) ||
+                is_addr_mapped_cr3(page, self->cpu,
+                                   GET_GLOBAL_STATE()->pt_c3_filter);
+        }
+        if (!page_mapped) {
             /* TODO! */
         }
 
