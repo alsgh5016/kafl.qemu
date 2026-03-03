@@ -51,9 +51,12 @@ along with QEMU-PT.  If not, see <http://www.gnu.org/licenses/>.
 #include "nyx/redqueen.h"
 #include "nyx/state/state.h"
 #include "nyx/page_cache.h"
+#include "nyx/trace_dump.h"
 #include "nyx/synchronization.h"
 
 #include <pthread.h>
+#include <libxdc.h>
+#include <sys/stat.h>
 
 /* =====================================================================
  * Async dump worker - offloads disk I/O from VCPU thread
@@ -101,6 +104,7 @@ static void dump_worker_init(void);
 static void dump_worker_drain(void);
 static void dump_worker_enqueue(dump_job_t *job);
 static void wox_final_wox_check(CPUState *cpu);
+static void wox_offline_pt_decode(CPUState *cpu);
 
 bool hypercall_enabled = false;
 static bool init_state = true;
@@ -214,11 +218,25 @@ void handle_hypercall_kafl_acquire(struct kvm_run *run,
              * actually writes trace data.
              */
             if (!setup_snapshot_once) {
-                // [TEST] for (int i = 0; i < INTEL_PT_MAX_RANGES; i++) {
-                    // [TEST] if (GET_GLOBAL_STATE()->pt_ip_filter_configured[i]) {
-                        // [TEST] pt_enable_ip_filtering(cpu, i, true, false);
-                    // [TEST] }
-                // [TEST] }
+
+                /* Force-enable PT trace dump for offline decode.
+                 * If dump_pt_trace was not set in QEMU config, the trace
+                 * dump file is never created and pt_write_pt_dump_file()
+                 * silently drops data.  We need this data for offline
+                 * bulk decode at RELEASE time (Plan A: lazy decoder). */
+                {
+                    char *trace_path = NULL;
+                    assert(asprintf(&trace_path, "%s/pt_trace_dump_0",
+                                    GET_GLOBAL_STATE()->workdir_path) != -1);
+                    pt_trace_dump_init(trace_path);
+                    free(trace_path);
+                    nyx_printf("[WOX] PT trace dump force-enabled for offline decode\n");
+                }
+                for (int i = 0; i < INTEL_PT_MAX_RANGES; i++) {
+                    if (GET_GLOBAL_STATE()->pt_ip_filter_configured[i]) {
+                        pt_enable_ip_filtering(cpu, i, true, false);
+                    }
+                }
 
                 /* Initialize PT decoder for real-time trace decoding.
                  * In normal kAFL mode this happens in NEXT_PAYLOAD, but
@@ -226,16 +244,16 @@ void handle_hypercall_kafl_acquire(struct kvm_run *run,
                  * is required so libxdc_decode() can populate page_cache
                  * with executed-page addresses for W⊕X detection.
                  */
-                if (GET_GLOBAL_STATE()->nyx_pt &&
-                    GET_GLOBAL_STATE()->cap_compile_time_tracing == false) {
-                    pt_init_decoder(cpu);
-                    nyx_printf("[WOX] PT decoder initialized (single-shot mode)\n");
-                }
+                // [LAZY] if (GET_GLOBAL_STATE()->nyx_pt &&
+                //     GET_GLOBAL_STATE()->cap_compile_time_tracing == false) {
+                //     pt_init_decoder(cpu);
+                //     nyx_printf("[WOX] PT decoder initialized (single-shot mode)\n");
+                // }
                 GET_GLOBAL_STATE()->in_fuzzing_mode = true;
                 setup_snapshot_once = true;
 
                 /* Take W⊕X dirty-bit baseline snapshot at tracing start */
-                // [TEST] wox_take_snapshot(cpu);
+                wox_take_snapshot(cpu);
                 dump_worker_init();
             }
             acquire_print_once(cpu);
@@ -412,16 +430,23 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
             }
 
 
-            /* Final dirty-page report before tracing stops */
 
-            /* Final W+X cross-check at program termination */
-            // [TEST] wox_final_wox_check(cpu);
 
-            // [TEST] wox_final_dirty_report(cpu);
-
-            /* Wait for all pending async dumps to complete */
-            // [TEST] dump_worker_drain();
+            /* 1. Stop PT tracing and flush last raw data to dump file */
             synchronization_disable_pt(cpu);
+
+            /* 2. Offline bulk decode: init decoder + read dump file + decode */
+            wox_offline_pt_decode(cpu);
+
+            /* 3. Final W+X cross-check (uses page_cache from offline decode) */
+            wox_final_wox_check(cpu);
+
+            /* 4. Final dirty-page report + content diff */
+            wox_final_dirty_report(cpu);
+
+            /* 5. Wait for all pending async dumps to complete */
+            dump_worker_drain();
+
             release_print_once(cpu);
         }
     }
@@ -1820,6 +1845,109 @@ static void wox_content_diff_report(CPUState *cpu, CPUX86State *env);
  */
 
 /*
+ * wox_offline_pt_decode - Deferred PT trace decoding at RELEASE time.
+ *
+ * Instead of decoding PT traces in real-time (which adds per-KVM-exit
+ * overhead and kills VMP-packed GUI apps), we:
+ *   1. Let PT hardware collect raw traces during execution (decoder==NULL)
+ *   2. After synchronization_disable_pt() flushes the last traces,
+ *      initialize the decoder here and bulk-decode the entire dump file.
+ *   3. This populates page_cache with executed-page addresses so
+ *      wox_final_wox_check() can perform the W+X cross-check.
+ */
+static void wox_offline_pt_decode(CPUState *cpu)
+{
+    if (GET_GLOBAL_STATE()->decoder) {
+        nyx_printf("[WOX] Decoder already initialized, skipping offline decode\n");
+        return;
+    }
+
+    /* Initialize decoder (same as pt_init_decoder but called at RELEASE) */
+    if (GET_GLOBAL_STATE()->nyx_pt &&
+        GET_GLOBAL_STATE()->cap_compile_time_tracing == false) {
+        pt_init_decoder(cpu);
+        nyx_printf("[WOX] PT decoder initialized (offline/deferred mode)\n");
+    }
+
+    if (!GET_GLOBAL_STATE()->decoder) {
+        nyx_printf("[WOX] No decoder available, skipping offline decode\n");
+        return;
+    }
+
+    /* Build PT dump file path: {workdir}/pt_trace_dump_0 */
+    char *dump_path = NULL;
+    assert(asprintf(&dump_path, "%s/pt_trace_dump_0",
+                    GET_GLOBAL_STATE()->workdir_path) != -1);
+
+    /* Read the entire raw PT dump file */
+    int fd = open(dump_path, O_RDONLY);
+    if (fd < 0) {
+        nyx_printf("[WOX] Cannot open PT dump file %s: %s\n",
+                   dump_path, strerror(errno));
+        free(dump_path);
+        return;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size == 0) {
+        nyx_printf("[WOX] PT dump file empty or stat failed\n");
+        close(fd);
+        free(dump_path);
+        return;
+    }
+
+    uint8_t *buf = malloc(st.st_size);
+    if (!buf) {
+        nyx_printf("[WOX] Failed to allocate %ld bytes for PT decode\n",
+                   (long)st.st_size);
+        close(fd);
+        free(dump_path);
+        return;
+    }
+
+    ssize_t nread = read(fd, buf, st.st_size);
+    close(fd);
+
+    if (nread != st.st_size) {
+        nyx_printf("[WOX] Short read: %ld / %ld bytes\n",
+                   (long)nread, (long)st.st_size);
+        free(buf);
+        free(dump_path);
+        return;
+    }
+
+    nyx_printf("[WOX] Offline PT decode: %ld bytes from %s\n",
+               (long)st.st_size, dump_path);
+
+    /* Bulk decode — feed entire trace at once */
+    decoder_result_t result =
+        libxdc_decode(GET_GLOBAL_STATE()->decoder, buf, (size_t)st.st_size);
+
+    switch (result) {
+    case decoder_success:
+        nyx_printf("[WOX] Offline decode: success\n");
+        break;
+    case decoder_success_pt_overflow:
+        nyx_printf("[WOX] Offline decode: success (PT overflow detected)\n");
+        break;
+    case decoder_page_fault:
+        nyx_printf("[WOX] Offline decode: page fault at 0x%lx\n",
+                   libxdc_get_page_fault_addr(GET_GLOBAL_STATE()->decoder));
+        break;
+    case decoder_unkown_packet:
+        nyx_printf("[WOX] Offline decode: unknown packet\n");
+        break;
+    case decoder_error:
+        nyx_printf("[WOX] Offline decode: decoder error\n");
+        break;
+    }
+
+    free(buf);
+    free(dump_path);
+    nyx_printf("[WOX] Offline PT decode complete\n");
+}
+
+/*
  * wox_final_wox_check - Final W+X cross-check at RELEASE time.
  *
  * Performs one last dirty & exec intersection check before the program
@@ -1832,11 +1960,12 @@ static void wox_final_wox_check(CPUState *cpu)
 
     CPUX86State *env = &(X86_CPU(cpu)->env);
 
-    /* Flush pending PT data */
-    if (cpu->pt_fd) {
-        pt_handle_overflow(cpu);
-    }
 
+    /* NOTE: pt_handle_overflow() is NOT called here because:
+     * 1. synchronization_disable_pt() already flushed final PT data
+     * 2. wox_offline_pt_decode() already bulk-decoded the entire trace
+     * 3. PT hardware is disabled at this point (ioctl would be no-op)
+     */
     /* Collect final dirty bits */
     uint8_t *current_dirty = calloc(1, WOX_BITMAP_BYTES);
     wox_collect_dirty_bits(env, current_dirty);
