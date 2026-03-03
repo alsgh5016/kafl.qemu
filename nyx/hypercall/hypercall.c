@@ -53,6 +53,55 @@ along with QEMU-PT.  If not, see <http://www.gnu.org/licenses/>.
 #include "nyx/page_cache.h"
 #include "nyx/synchronization.h"
 
+#include <pthread.h>
+
+/* =====================================================================
+ * Async dump worker - offloads disk I/O from VCPU thread
+ * ===================================================================== */
+
+typedef struct {
+    uint32_t va_start;
+    uint32_t size;
+    uint8_t  perm;
+    uint8_t *data;
+    int      num_pages;
+} captured_region_t;
+
+typedef struct { uint32_t base; uint32_t size; char name[128]; } mod_info_t;
+typedef struct { uint32_t va; uint64_t phys; uint8_t perm; } mapped_page_t;
+#define MAX_MODS 256
+
+typedef struct dump_job {
+    int                seq;
+    char               label[128];
+    mod_info_t         modules[MAX_MODS];
+    int                num_modules;
+    captured_region_t *regions;
+    int                num_regions;
+    uint64_t           total_bytes;
+    char              *dump_dir;
+    char              *map_content;
+    struct dump_job   *next;
+} dump_job_t;
+
+static pthread_t       dump_worker_thread;
+static pthread_mutex_t dump_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  dump_queue_cond  = PTHREAD_COND_INITIALIZER;
+static dump_job_t     *dump_queue_head  = NULL;
+static dump_job_t     *dump_queue_tail  = NULL;
+static int             dump_queue_len   = 0;
+static bool            dump_worker_running = false;
+static bool            dump_worker_stop    = false;
+#define DUMP_QUEUE_MAX  3
+
+static int dump_seq_counter = 0;
+
+/* Forward declarations */
+static void dump_worker_init(void);
+static void dump_worker_drain(void);
+static void dump_worker_enqueue(dump_job_t *job);
+static void wox_final_wox_check(CPUState *cpu);
+
 bool hypercall_enabled = false;
 static bool init_state = true;
 
@@ -187,6 +236,7 @@ void handle_hypercall_kafl_acquire(struct kvm_run *run,
 
                 /* Take W⊕X dirty-bit baseline snapshot at tracing start */
                 wox_take_snapshot(cpu);
+                dump_worker_init();
             }
             acquire_print_once(cpu);
             synchronization_enter_fuzzing_loop(cpu);
@@ -363,7 +413,14 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
 
 
             /* Final dirty-page report before tracing stops */
+
+            /* Final W+X cross-check at program termination */
+            wox_final_wox_check(cpu);
+
             wox_final_dirty_report(cpu);
+
+            /* Wait for all pending async dumps to complete */
+            dump_worker_drain();
             synchronization_disable_pt(cpu);
             release_print_once(cpu);
         }
@@ -714,28 +771,160 @@ static void handle_hypercall_kafl_user_submit_mode(struct kvm_run *run,
         break;
     }
 }
-/* ===== Full process memory dump (reusable, optimized) =====
- * Uses bulk page table walk (Strategy 1) + direct physical read (Strategy 3)
- * to avoid per-page VA→PA translation overhead.
- *
- * Old approach: 520K × is_addr_mapped_cr3() = ~2M physical reads
- * New approach: ~4 table loads + N physical reads (N = mapped page count)
- *
- * Parameters:
- *   cpu   - CPU state
- *   env   - x86 CPU environment (must have fresh registers)
- *   label - human-readable label for this dump (e.g. API name, hook name)
+/* =====================================================================
+ * Async dump worker functions
+ * ===================================================================== */
+
+static void dump_job_free(dump_job_t *job)
+{
+    if (!job) return;
+    for (int r = 0; r < job->num_regions; r++) {
+        free(job->regions[r].data);
+    }
+    free(job->regions);
+    free(job->dump_dir);
+    free(job->map_content);
+    free(job);
+}
+
+static void *dump_worker_func(void *arg)
+{
+    (void)arg;
+    nyx_printf("[DUMP-WORKER] Thread started\n");
+
+    while (1) {
+        pthread_mutex_lock(&dump_queue_mutex);
+        while (!dump_queue_head && !dump_worker_stop) {
+            pthread_cond_wait(&dump_queue_cond, &dump_queue_mutex);
+        }
+        if (dump_worker_stop && !dump_queue_head) {
+            pthread_mutex_unlock(&dump_queue_mutex);
+            break;
+        }
+        dump_job_t *job = dump_queue_head;
+        dump_queue_head = job->next;
+        if (!dump_queue_head) dump_queue_tail = NULL;
+        dump_queue_len--;
+        pthread_mutex_unlock(&dump_queue_mutex);
+
+        /* --- Emit phase: write captured data to disk --- */
+        nyx_printf("[DUMP-WORKER] Writing job #%03d (%s): %d regions, %lu bytes\n",
+                   job->seq, job->label, job->num_regions,
+                   (unsigned long)job->total_bytes);
+
+        mkdir(job->dump_dir, 0755);
+
+        /* Write memory_map.txt */
+        char *map_path = NULL;
+        assert(asprintf(&map_path, "%s/memory_map.txt", job->dump_dir) != -1);
+        FILE *map_f = fopen(map_path, "w");
+        if (map_f) {
+            fputs(job->map_content, map_f);
+            fclose(map_f);
+        }
+        free(map_path);
+
+        /* Write region files */
+        for (int r = 0; r < job->num_regions; r++) {
+            captured_region_t *reg = &job->regions[r];
+            char perm_str[4];
+            perm_str[0] = 'r';
+            perm_str[1] = (reg->perm & 0x02) ? 'w' : '-';
+            perm_str[2] = (reg->perm & 0x04) ? 'x' : '-';
+            perm_str[3] = '\0';
+
+            char *reg_path = NULL;
+            assert(asprintf(&reg_path, "%s/region_%08x_%x_%s.bin",
+                            job->dump_dir, reg->va_start,
+                            reg->size, perm_str) != -1);
+            FILE *rf = fopen(reg_path, "w");
+            if (rf) {
+                fwrite(reg->data, 1, reg->size, rf);
+                fclose(rf);
+            }
+            free(reg_path);
+        }
+
+        nyx_printf("[DUMP-WORKER] Job #%03d done -> %s/\n",
+                   job->seq, job->dump_dir);
+        dump_job_free(job);
+    }
+
+    nyx_printf("[DUMP-WORKER] Thread exiting\n");
+    return NULL;
+}
+
+static void dump_worker_init(void)
+{
+    if (dump_worker_running) return;
+    dump_worker_stop = false;
+    dump_queue_head = NULL;
+    dump_queue_tail = NULL;
+    dump_queue_len = 0;
+    pthread_create(&dump_worker_thread, NULL, dump_worker_func, NULL);
+    dump_worker_running = true;
+    nyx_printf("[DUMP-WORKER] Initialized\n");
+}
+
+static void dump_worker_drain(void)
+{
+    if (!dump_worker_running) return;
+
+    nyx_printf("[DUMP-WORKER] Draining %d pending jobs...\n", dump_queue_len);
+
+    pthread_mutex_lock(&dump_queue_mutex);
+    dump_worker_stop = true;
+    pthread_cond_signal(&dump_queue_cond);
+    pthread_mutex_unlock(&dump_queue_mutex);
+
+    pthread_join(dump_worker_thread, NULL);
+    dump_worker_running = false;
+    nyx_printf("[DUMP-WORKER] All jobs drained, thread joined\n");
+}
+
+static void dump_worker_enqueue(dump_job_t *job)
+{
+    pthread_mutex_lock(&dump_queue_mutex);
+
+    /* Backpressure: if queue is full, drop oldest job */
+    while (dump_queue_len >= DUMP_QUEUE_MAX && dump_queue_head) {
+        dump_job_t *old = dump_queue_head;
+        dump_queue_head = old->next;
+        if (!dump_queue_head) dump_queue_tail = NULL;
+        dump_queue_len--;
+        nyx_printf("[DUMP-WORKER] Queue full, dropping job #%03d (%s)\n",
+                   old->seq, old->label);
+        dump_job_free(old);
+    }
+
+    job->next = NULL;
+    if (dump_queue_tail) {
+        dump_queue_tail->next = job;
+    } else {
+        dump_queue_head = job;
+    }
+    dump_queue_tail = job;
+    dump_queue_len++;
+
+    pthread_cond_signal(&dump_queue_cond);
+    pthread_mutex_unlock(&dump_queue_mutex);
+
+    nyx_printf("[DUMP-WORKER] Enqueued job #%03d (%s), queue_len=%d\n",
+               job->seq, job->label, dump_queue_len);
+}
+
+/* ===== Full process memory dump (capture + async emit) =====
+ * Uses bulk page table walk + direct physical read.
+ * Capture phase runs on VCPU thread (cpu_physical_memory_read).
+ * Emit phase is enqueued to worker thread for async disk I/O.
  */
-typedef struct { uint32_t base; uint32_t size; char name[128]; } mod_info_t;
-typedef struct { uint32_t va; uint64_t phys; uint8_t perm; } mapped_page_t;
-#define MAX_MODS 256
-
-static int dump_seq_counter = 0;
-
 static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                                      const char *label)
 {
     int seq = dump_seq_counter++;
+
+    /* Ensure worker is running */
+    dump_worker_init();
 
     /* --- 1. Read TEB/PEB for module enumeration (32-bit WOW64) --- */
     uint32_t fs_base = (uint32_t)(env->segs[R_FS].base);
@@ -748,8 +937,9 @@ static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
     }
 
     /* --- 2. Enumerate loaded modules via PEB->Ldr --- */
-    mod_info_t *modules = calloc(MAX_MODS, sizeof(mod_info_t));
-    int num_modules = 0;
+    dump_job_t *job = calloc(1, sizeof(dump_job_t));
+    job->seq = seq;
+    snprintf(job->label, sizeof(job->label), "%s", label);
 
     uint32_t ldr_ptr = 0;
     if (read_virtual_memory((uint64_t)(peb_ptr + 0x0C),
@@ -759,7 +949,7 @@ static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
         read_virtual_memory((uint64_t)list_head, (uint8_t*)&flink, 4, cpu);
 
         uint32_t cur = flink;
-        while (cur != 0 && cur != list_head && num_modules < MAX_MODS) {
+        while (cur != 0 && cur != list_head && job->num_modules < MAX_MODS) {
             uint32_t dll_base = 0, dll_size = 0;
             read_virtual_memory((uint64_t)(cur + 0x10), (uint8_t*)&dll_base, 4, cpu);
             read_virtual_memory((uint64_t)(cur + 0x18), (uint8_t*)&dll_size, 4, cpu);
@@ -769,20 +959,22 @@ static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
             read_virtual_memory((uint64_t)(cur + 0x24), (uint8_t*)&name_len, 2, cpu);
             read_virtual_memory((uint64_t)(cur + 0x24 + 4), (uint8_t*)&name_buf, 4, cpu);
 
-            modules[num_modules].base = dll_base;
-            modules[num_modules].size = dll_size;
-            memset(modules[num_modules].name, 0, 128);
+            job->modules[job->num_modules].base = dll_base;
+            job->modules[job->num_modules].size = dll_size;
+            memset(job->modules[job->num_modules].name, 0, 128);
 
             if (name_len > 0 && name_buf != 0) {
                 uint16_t wbuf[128];
                 memset(wbuf, 0, sizeof(wbuf));
                 int nchars = (name_len / 2 < 127) ? name_len / 2 : 127;
-                read_virtual_memory((uint64_t)name_buf, (uint8_t*)wbuf, nchars * 2, cpu);
+                read_virtual_memory((uint64_t)name_buf, (uint8_t*)wbuf,
+                                    nchars * 2, cpu);
                 for (int c = 0; c < nchars; c++)
-                    modules[num_modules].name[c] = (char)(wbuf[c] & 0xFF);
+                    job->modules[job->num_modules].name[c] =
+                        (char)(wbuf[c] & 0xFF);
             }
 
-            num_modules++;
+            job->num_modules++;
 
             uint32_t next = 0;
             if (!read_virtual_memory((uint64_t)cur, (uint8_t*)&next, 4, cpu))
@@ -793,52 +985,13 @@ static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
     }
 
     nyx_printf("    [FULLDUMP] #%03d (%s): PEB=0x%x, %d modules loaded\n",
-               seq, label, peb_ptr, num_modules);
-    for (int m = 0; m < num_modules; m++) {
-        nyx_printf("    [FULLDUMP]   %-30s @ 0x%08x  size=0x%x\n",
-                   modules[m].name, modules[m].base, modules[m].size);
-    }
+               seq, label, peb_ptr, job->num_modules);
 
-    /* --- 3. Create dump directory --- */
-    char *dump_dir = NULL;
-    assert(asprintf(&dump_dir, "%s/dump/fulldump_%03d_%s",
-                    GET_GLOBAL_STATE()->workdir_path,
-                    seq, label) != -1);
-    mkdir(dump_dir, 0755);
+    /* --- 3. Create dump directory path --- */
+    assert(asprintf(&job->dump_dir, "%s/dump/fulldump_%03d_%s",
+                    GET_GLOBAL_STATE()->workdir_path, seq, label) != -1);
 
-    /* --- 4. Open memory map file --- */
-    char *map_path = NULL;
-    assert(asprintf(&map_path, "%s/memory_map.txt", dump_dir) != -1);
-    FILE *map_f = fopen(map_path, "w");
-    if (!map_f) {
-        nyx_printf("    [FULLDUMP] Failed to create %s\n", map_path);
-        free(map_path); free(dump_dir); free(modules);
-        return;
-    }
-    fprintf(map_f, "# Full process memory dump #%03d\n", seq);
-    fprintf(map_f, "# Trigger: %s\n", label);
-    fprintf(map_f, "# Modules: %d\n\n", num_modules);
-    fprintf(map_f, "# %-10s  %-10s  %-10s  %-5s  %-40s  %s\n",
-            "START", "END", "SIZE", "PERM", "FILE", "MODULE");
-
-    for (int m = 0; m < num_modules; m++) {
-        fprintf(map_f, "# MODULE: %-30s  base=0x%08x  size=0x%08x\n",
-                modules[m].name, modules[m].base, modules[m].size);
-    }
-    fprintf(map_f, "\n");
-
-    /* --- 5. Bulk page table walk to collect mapped user-space pages --- */
-    /*
-     * Instead of probing 520K VAs one-by-one (each = 4-level PT walk),
-     * we load entire page tables in bulk:
-     *   PML4 (1 read) → PDPT (1 read) → PD (~2 reads) → PT (per valid PDE)
-     * Total reads: ~tens to hundreds, vs ~2 million before.
-     *
-     * Permission bits extracted from PT entries:
-     *   bit 1  (R/W): 0=read-only, 1=read-write
-     *   bit 63 (NX):  0=executable, 1=no-execute
-     *   Effective = AND of all levels (PML4, PDPT, PD, PT)
-     */
+    /* --- 4. Bulk page table walk to collect mapped user-space pages --- */
     int pg_capacity = 65536;
     int pg_count = 0;
     mapped_page_t *pages = malloc(pg_capacity * sizeof(mapped_page_t));
@@ -848,7 +1001,6 @@ static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
     uint64_t pml4_table[512];
     cpu_physical_memory_read(pml4_base, pml4_table, 4096);
 
-    /* PML4[0] covers user-space VA 0x000000000000 - 0x007FFFFFFFFFFF */
     uint64_t pml4e = pml4_table[0];
     if (pml4e & 1) {
         bool pml4_w = !!(pml4e & (1ULL << 1));
@@ -858,11 +1010,10 @@ static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
         uint64_t pdpt_table[512];
         cpu_physical_memory_read(pdpt_base, pdpt_table, 4096);
 
-        /* PDPT[0..1] covers VA 0x00000000 - 0x7FFFFFFF (32-bit user space) */
         for (int pdpte_idx = 0; pdpte_idx < 2; pdpte_idx++) {
             uint64_t pdpte = pdpt_table[pdpte_idx];
             if (!(pdpte & 1)) continue;
-            if (pdpte & (1ULL << 7)) continue; /* 1GB huge page - skip */
+            if (pdpte & (1ULL << 7)) continue;
 
             bool pdpt_w = pml4_w && !!(pdpte & (1ULL << 1));
             bool pdpt_x = pml4_x && !(pdpte & (1ULL << 63));
@@ -879,15 +1030,12 @@ static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                 bool pd_x = pdpt_x && !(pde & (1ULL << 63));
 
                 if (pde & (1ULL << 7)) {
-                    /* 2MB huge page: physical base uses bits 21-51 */
                     uint64_t page_phys = pde & 0x000FFFFFFFE00000ULL;
                     uint32_t base_va = ((uint32_t)pdpte_idx << 30) |
                                        ((uint32_t)pde_idx << 21);
-
                     for (int k = 0; k < 512; k++) {
                         uint32_t va = base_va + ((uint32_t)k << 12);
                         if (va < 0x10000 || va >= 0x7FFF0000) continue;
-
                         if (pg_count >= pg_capacity) {
                             pg_capacity *= 2;
                             pages = realloc(pages,
@@ -903,7 +1051,6 @@ static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                     continue;
                 }
 
-                /* 4KB pages: load the page table */
                 uint64_t pt_base = pde & 0x000FFFFFFFFFF000ULL;
                 uint64_t pt_table[512];
                 cpu_physical_memory_read(pt_base, pt_table, 4096);
@@ -937,89 +1084,123 @@ static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
         }
     }
 
-    nyx_printf("    [FULLDUMP] PT walk done: %d mapped pages in user space\n",
-               pg_count);
+    nyx_printf("    [FULLDUMP] PT walk done: %d mapped pages\n", pg_count);
 
-    /* --- 6. Merge contiguous pages into regions & dump via phys read --- */
-    /*
-     * Pages are already in VA order (PT walk is ordered).
-     * Merge adjacent pages with same permissions into regions.
-     * Read each page directly by physical address (no VA→PA re-translation).
-     */
-    uint8_t *page_buf = malloc(0x1000);
-    int region_count = 0;
+    /* --- 5. Capture: read physical memory into buffers (VCPU thread) --- */
+    int reg_capacity = 1024;
+    int reg_count = 0;
+    captured_region_t *regions = malloc(reg_capacity * sizeof(captured_region_t));
     uint64_t total_bytes = 0;
-    int i = 0;
 
-    while (i < pg_count) {
-        uint32_t region_start = pages[i].va;
-        uint8_t  region_perm  = pages[i].perm;
-        int      region_first = i;
+    /* Build memory_map.txt content in a buffer */
+    size_t map_buf_size = 65536;
+    size_t map_buf_used = 0;
+    char *map_buf = malloc(map_buf_size);
 
-        /* Extend region while VA is contiguous and permissions match */
-        while (i + 1 < pg_count &&
-               pages[i + 1].va == pages[i].va + 0x1000 &&
-               pages[i + 1].perm == region_perm) {
-            i++;
+    map_buf_used += snprintf(map_buf + map_buf_used, map_buf_size - map_buf_used,
+                             "# Full process memory dump #%03d\n"
+                             "# Trigger: %s\n"
+                             "# Modules: %d\n\n"
+                             "# %-10s  %-10s  %-10s  %-5s  %-40s  %s\n",
+                             seq, label, job->num_modules,
+                             "START", "END", "SIZE", "PERM", "FILE", "MODULE");
+
+    for (int m = 0; m < job->num_modules; m++) {
+        map_buf_used += snprintf(map_buf + map_buf_used, map_buf_size - map_buf_used,
+                                 "# MODULE: %-30s  base=0x%08x  size=0x%08x\n",
+                                 job->modules[m].name,
+                                 job->modules[m].base,
+                                 job->modules[m].size);
+    }
+    map_buf_used += snprintf(map_buf + map_buf_used, map_buf_size - map_buf_used, "\n");
+
+    int pi = 0;
+    while (pi < pg_count) {
+        uint32_t region_start = pages[pi].va;
+        uint8_t  region_perm  = pages[pi].perm;
+        int      region_first = pi;
+
+        while (pi + 1 < pg_count &&
+               pages[pi + 1].va == pages[pi].va + 0x1000 &&
+               pages[pi + 1].perm == region_perm) {
+            pi++;
         }
-        int region_last = i;
-        i++;
+        int region_last = pi;
+        pi++;
 
-        uint32_t region_size = (uint32_t)(region_last - region_first + 1) * 0x1000;
+        int n_pages = region_last - region_first + 1;
+        uint32_t region_size = (uint32_t)n_pages * 0x1000;
 
-        /* Build permission string: r--/rw-/r-x/rwx */
+        /* Capture: read all pages into a contiguous buffer */
+        uint8_t *data = malloc(region_size);
+        for (int p = 0; p < n_pages; p++) {
+            cpu_physical_memory_read(pages[region_first + p].phys,
+                                     data + p * 0x1000, 0x1000);
+        }
+
+        if (reg_count >= reg_capacity) {
+            reg_capacity *= 2;
+            regions = realloc(regions, reg_capacity * sizeof(captured_region_t));
+        }
+        regions[reg_count].va_start  = region_start;
+        regions[reg_count].size      = region_size;
+        regions[reg_count].perm      = region_perm;
+        regions[reg_count].data      = data;
+        regions[reg_count].num_pages = n_pages;
+        reg_count++;
+        total_bytes += region_size;
+
+        /* Append to map content */
         char perm_str[4];
         perm_str[0] = 'r';
         perm_str[1] = (region_perm & 0x02) ? 'w' : '-';
         perm_str[2] = (region_perm & 0x04) ? 'x' : '-';
         perm_str[3] = '\0';
 
-        /* Identify module for this region */
         const char *mod_name = NULL;
-        for (int m = 0; m < num_modules; m++) {
-            if (region_start >= modules[m].base &&
-                region_start < modules[m].base + modules[m].size) {
-                mod_name = modules[m].name;
+        for (int m = 0; m < job->num_modules; m++) {
+            if (region_start >= job->modules[m].base &&
+                region_start < job->modules[m].base + job->modules[m].size) {
+                mod_name = job->modules[m].name;
                 break;
             }
         }
 
-        /* Write region file: read each page by physical address directly */
-        char *reg_path = NULL;
-        assert(asprintf(&reg_path, "%s/region_%08x_%x_%s.bin",
-                        dump_dir, region_start, region_size, perm_str) != -1);
-        FILE *rf = fopen(reg_path, "w");
-        if (rf) {
-            for (int p = region_first; p <= region_last; p++) {
-                cpu_physical_memory_read(pages[p].phys, page_buf, 0x1000);
-                fwrite(page_buf, 1, 0x1000, rf);
-            }
-            fclose(rf);
+        if (map_buf_used + 256 > map_buf_size) {
+            map_buf_size *= 2;
+            map_buf = realloc(map_buf, map_buf_size);
         }
-
-        fprintf(map_f, "  0x%08x  0x%08x  0x%08x  %-5s  region_%08x_%x_%s.bin  %s\n",
-                region_start, region_start + region_size, region_size,
-                perm_str, region_start, region_size, perm_str,
-                mod_name ? mod_name : "");
-
-        region_count++;
-        total_bytes += region_size;
-        free(reg_path);
+        map_buf_used += snprintf(map_buf + map_buf_used, map_buf_size - map_buf_used,
+                                 "  0x%08x  0x%08x  0x%08x  %-5s  "
+                                 "region_%08x_%x_%s.bin  %s\n",
+                                 region_start, region_start + region_size,
+                                 region_size, perm_str,
+                                 region_start, region_size, perm_str,
+                                 mod_name ? mod_name : "");
     }
 
-    free(page_buf);
+    if (map_buf_used + 128 > map_buf_size) {
+        map_buf_size += 256;
+        map_buf = realloc(map_buf, map_buf_size);
+    }
+    map_buf_used += snprintf(map_buf + map_buf_used, map_buf_size - map_buf_used,
+                             "\n# Total: %d regions, %lu bytes (%d pages)\n",
+                             reg_count, (unsigned long)total_bytes, pg_count);
+
     free(pages);
-    fprintf(map_f, "\n# Total: %d regions, %lu bytes (%d pages)\n",
-            region_count, (unsigned long)total_bytes, pg_count);
-    fclose(map_f);
 
-    nyx_printf("    [FULLDUMP] Saved %d regions (%lu bytes, %d pages) -> %s/\n",
-               region_count, (unsigned long)total_bytes, pg_count, dump_dir);
+    /* --- 6. Enqueue job for async disk write --- */
+    job->regions     = regions;
+    job->num_regions = reg_count;
+    job->total_bytes = total_bytes;
+    job->map_content = map_buf;
 
-    free(modules);
-    free(map_path);
-    free(dump_dir);
+    nyx_printf("    [FULLDUMP] Captured %d regions (%lu bytes) - enqueueing\n",
+               reg_count, (unsigned long)total_bytes);
+
+    dump_worker_enqueue(job);
 }
+
 
 /* =====================================================================
  * W⊕X (Write-then-Execute) Detection
@@ -1632,6 +1813,123 @@ static void wox_content_diff_report(CPUState *cpu, CPUX86State *env);
  * (HYPERCALL_KAFL_RELEASE).  Prints all pages that were written
  * after the baseline snapshot, regardless of execution status.
  */
+
+/*
+ * wox_final_wox_check - Final W+X cross-check at RELEASE time.
+ *
+ * Performs one last dirty & exec intersection check before the program
+ * terminates.  This catches unpacked code that was written earlier
+ * and executed just before RELEASE (e.g., the actual unpacked OEP).
+ */
+static void wox_final_wox_check(CPUState *cpu)
+{
+    if (!wox_snapshot_taken) return;
+
+    CPUX86State *env = &(X86_CPU(cpu)->env);
+
+    /* Flush pending PT data */
+    if (cpu->pt_fd) {
+        pt_handle_overflow(cpu);
+    }
+
+    /* Collect final dirty bits */
+    uint8_t *current_dirty = calloc(1, WOX_BITMAP_BYTES);
+    wox_collect_dirty_bits(env, current_dirty);
+
+    if (!wox_dirty_cumulative)
+        wox_dirty_cumulative = calloc(1, WOX_BITMAP_BYTES);
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+        uint8_t nd = current_dirty[i] & ~wox_dirty_snapshot[i];
+        wox_dirty_cumulative[i] |= nd;
+    }
+    free(current_dirty);
+
+    /* Get executed pages */
+    page_cache_t *pc = GET_GLOBAL_STATE()->page_cache;
+    if (!pc || !GET_GLOBAL_STATE()->decoder) {
+        nyx_printf("[WOX] Final check: decoder not ready, skipping\n");
+        return;
+    }
+
+    int max_exec = 65536;
+    uint64_t *exec_pages = malloc(max_exec * sizeof(uint64_t));
+    int exec_count = page_cache_get_executed_pages(pc, exec_pages, max_exec);
+
+    uint8_t *exec_bitmap = calloc(1, WOX_BITMAP_BYTES);
+    for (int e = 0; e < exec_count; e++) {
+        uint64_t va = exec_pages[e];
+        if (va >= WOX_USER_VA_START && va < WOX_USER_VA_END)
+            wox_bitmap_set(exec_bitmap, wox_va_to_idx((uint32_t)va));
+    }
+
+    /* New exec = exec not in baseline */
+    uint8_t *new_exec = calloc(1, WOX_BITMAP_BYTES);
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+        new_exec[i] = exec_bitmap[i] & ~(wox_exec_baseline ? wox_exec_baseline[i] : 0);
+    }
+
+    /* Cross-check: dirty & new_exec */
+    int wox_count = 0;
+    int wox_addrs_cap = 4096;
+    uint32_t *wox_addrs = malloc(wox_addrs_cap * sizeof(uint32_t));
+
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+        uint8_t wox_byte = wox_dirty_cumulative[i] & new_exec[i];
+        if (!wox_byte) continue;
+        for (int bit = 0; bit < 8; bit++) {
+            if (wox_byte & (1 << bit)) {
+                int idx = i * 8 + bit;
+                uint32_t va = WOX_USER_VA_START + (uint32_t)idx * 0x1000;
+                if (wox_count < wox_addrs_cap)
+                    wox_addrs[wox_count] = va;
+                wox_count++;
+            }
+        }
+    }
+
+    nyx_printf("[WOX] Final check: exec=%d, W+X=%d\n",
+               exec_count, wox_count);
+
+    if (wox_count > 0) {
+        static int final_round = 9000;
+        nyx_printf("\n");
+        nyx_printf("==================================================\n");
+        nyx_printf("[WOX] *** FINAL W+X DETECTED ***\n");
+        nyx_printf("[WOX] %d pages written-then-executed at termination:\n",
+                   wox_count);
+
+        char *report_path = NULL;
+        assert(asprintf(&report_path, "%s/dump/wox_detect_final_%d.txt",
+                        GET_GLOBAL_STATE()->workdir_path, final_round) != -1);
+        FILE *rf = fopen(report_path, "w");
+        if (rf) {
+            fprintf(rf, "# W+X Final Detection Report\n");
+            fprintf(rf, "# W+X pages: %d\n\n", wox_count);
+            for (int w = 0; w < wox_count && w < wox_addrs_cap; w++) {
+                fprintf(rf, "0x%08x\n", wox_addrs[w]);
+                nyx_printf("[WOX]   0x%08x\n", wox_addrs[w]);
+            }
+            fclose(rf);
+            nyx_printf("[WOX] Final report saved: %s\n", report_path);
+        }
+        free(report_path);
+
+        nyx_printf("[WOX] Triggering final memory dump...\n");
+        nyx_printf("==================================================\n\n");
+
+        char dump_label[64];
+        snprintf(dump_label, sizeof(dump_label), "wox_final_%d", final_round);
+        dump_full_process_memory(cpu, env, dump_label);
+
+        final_round++;
+    }
+
+    free(wox_addrs);
+    free(new_exec);
+    free(exec_bitmap);
+    free(exec_pages);
+}
+
 void wox_final_dirty_report(CPUState *cpu)
 {
     if (!wox_snapshot_taken) {
