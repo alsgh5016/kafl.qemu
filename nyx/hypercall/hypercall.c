@@ -1030,6 +1030,7 @@ static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
 static uint8_t *wox_dirty_snapshot = NULL;
 static bool     wox_snapshot_taken = false;
 static int      wox_check_counter  = 0;
+static uint8_t *wox_dirty_cumulative = NULL;  /* union of all observed dirty pages */
 
 static inline int wox_va_to_idx(uint32_t va)
 {
@@ -1373,6 +1374,12 @@ void wox_periodic_dirty_scan(CPUState *cpu)
         while (v) { newly_dirty_count++; v &= v - 1; }
     }
 
+    /* --- Accumulate into cumulative bitmap --- */
+    if (!wox_dirty_cumulative)
+        wox_dirty_cumulative = calloc(1, WOX_BITMAP_BYTES);
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++)
+        wox_dirty_cumulative[i] |= newly_dirty[i];
+
     /* --- 3. Log written pages (trigger = "periodic") --- */
     wox_log_written_pages(cpu, env, newly_dirty, newly_dirty_count,
                           check_id, "periodic");
@@ -1395,26 +1402,30 @@ void wox_final_dirty_report(CPUState *cpu)
 
     CPUX86State *env = &(X86_CPU(cpu)->env);
 
-    /* Collect current dirty bits */
+    /* Merge current dirty bits into cumulative bitmap one last time */
     uint8_t *current_dirty = calloc(1, WOX_BITMAP_BYTES);
     wox_collect_dirty_bits(env, current_dirty);
 
-    /* Compute newly dirty pages since baseline */
-    uint8_t *newly_dirty = calloc(1, WOX_BITMAP_BYTES);
-    int newly_dirty_count = 0;
+    if (!wox_dirty_cumulative)
+        wox_dirty_cumulative = calloc(1, WOX_BITMAP_BYTES);
+
     for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
-        newly_dirty[i] = current_dirty[i] & ~wox_dirty_snapshot[i];
-        uint8_t v = newly_dirty[i];
-        while (v) { newly_dirty_count++; v &= v - 1; }
+        uint8_t nd = current_dirty[i] & ~wox_dirty_snapshot[i];
+        wox_dirty_cumulative[i] |= nd;
+    }
+    free(current_dirty);
+
+    /* Count total cumulative dirty pages */
+    int cumulative_count = 0;
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+        uint8_t v = wox_dirty_cumulative[i];
+        while (v) { cumulative_count++; v &= v - 1; }
     }
 
-    /* Use the existing logging function with trigger="final" */
+    /* Log using cumulative bitmap */
     static int final_counter = 0;
-    wox_log_written_pages(cpu, env, newly_dirty, newly_dirty_count,
+    wox_log_written_pages(cpu, env, wox_dirty_cumulative, cumulative_count,
                           final_counter++, "final");
-
-    free(newly_dirty);
-    free(current_dirty);
 }
 
 /*
