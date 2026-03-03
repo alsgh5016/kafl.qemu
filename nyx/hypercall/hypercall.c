@@ -226,17 +226,17 @@ void handle_hypercall_kafl_acquire(struct kvm_run *run,
                  * is required so libxdc_decode() can populate page_cache
                  * with executed-page addresses for W⊕X detection.
                  */
-                if (GET_GLOBAL_STATE()->nyx_pt &&
-                    GET_GLOBAL_STATE()->cap_compile_time_tracing == false) {
-                    pt_init_decoder(cpu);
-                    nyx_printf("[WOX] PT decoder initialized (single-shot mode)\n");
-                }
+// [TEST]                 if (GET_GLOBAL_STATE()->nyx_pt &&
+// [TEST]                     GET_GLOBAL_STATE()->cap_compile_time_tracing == false) {
+// [TEST]                     pt_init_decoder(cpu);
+// [TEST]                     nyx_printf("[WOX] PT decoder initialized (single-shot mode)\n");
+// [TEST]                 }
                 GET_GLOBAL_STATE()->in_fuzzing_mode = true;
                 setup_snapshot_once = true;
 
                 /* Take W⊕X dirty-bit baseline snapshot at tracing start */
-                wox_take_snapshot(cpu);
-                dump_worker_init();
+                // [TEST] wox_take_snapshot(cpu);
+                // [TEST] dump_worker_init();
             }
             acquire_print_once(cpu);
             synchronization_enter_fuzzing_loop(cpu);
@@ -415,12 +415,12 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
             /* Final dirty-page report before tracing stops */
 
             /* Final W+X cross-check at program termination */
-            wox_final_wox_check(cpu);
+            // [TEST] wox_final_wox_check(cpu);
 
-            wox_final_dirty_report(cpu);
+            // [TEST] wox_final_dirty_report(cpu);
 
             /* Wait for all pending async dumps to complete */
-            dump_worker_drain();
+            // [TEST] dump_worker_drain();
             synchronization_disable_pt(cpu);
             release_print_once(cpu);
         }
