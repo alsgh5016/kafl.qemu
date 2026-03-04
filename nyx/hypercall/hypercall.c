@@ -1262,6 +1262,8 @@ static int         wox_cached_num_modules = 0;
 static uint8_t   **wox_page_content = NULL;   /* per-page content snapshot */
 static uint8_t    *wox_page_present = NULL;   /* bitmap: pages mapped at snapshot */
 static int         wox_content_snapshot_pages = 0;
+static uint8_t *wox_exec_this_round = NULL;   /* executed pages bitmap (this KVM exit round) */
+static uint8_t *wox_exec_cumulative = NULL;   /* executed pages bitmap (entire run) */
 
 static inline int wox_va_to_idx(uint32_t va)
 {
@@ -2543,8 +2545,6 @@ static void wox_content_diff_report(CPUState *cpu, CPUX86State *env)
  * Real-Time W+X In-Memory PT Decoding
  * ========================================================================= */
 
-static uint8_t *wox_exec_this_round = NULL;
-static uint8_t *wox_exec_cumulative = NULL;
 
 void wox_bb_callback(void *opaque, int mode, uint64_t rip, uint64_t tsc)
 {
