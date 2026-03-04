@@ -1021,7 +1021,12 @@ static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
     int pg_count = 0;
     mapped_page_t *pages = malloc(pg_capacity * sizeof(mapped_page_t));
 
-    uint64_t cr3 = env->cr[3];
+    /* Use target process CR3 (parent_cr3) if available, else fall back to
+     * current vCPU CR3.  parent_cr3 is set by the harness via CR3 hypercall
+     * and points to the child (packed) process's address space. */
+    uint64_t cr3 = GET_GLOBAL_STATE()->parent_cr3
+                     ? GET_GLOBAL_STATE()->parent_cr3
+                     : (env->cr[3] & 0x000FFFFFFFFFF000ULL);
     uint64_t pml4_base = cr3 & 0x000FFFFFFFFFF000ULL;
     uint64_t pml4_table[512];
     cpu_physical_memory_read(pml4_base, pml4_table, 4096);
@@ -1279,7 +1284,12 @@ static void wox_collect_dirty_bits(CPUX86State *env, uint8_t *bitmap)
 {
     memset(bitmap, 0, WOX_BITMAP_BYTES);
 
-    uint64_t cr3 = env->cr[3];
+    /* Use target process CR3 (parent_cr3) if available, else fall back to
+     * current vCPU CR3.  parent_cr3 is set by the harness via CR3 hypercall
+     * and points to the child (packed) process's address space. */
+    uint64_t cr3 = GET_GLOBAL_STATE()->parent_cr3
+                     ? GET_GLOBAL_STATE()->parent_cr3
+                     : (env->cr[3] & 0x000FFFFFFFFFF000ULL);
     uint64_t pml4_base = cr3 & 0x000FFFFFFFFFF000ULL;
     uint64_t pml4_table[512];
     cpu_physical_memory_read(pml4_base, pml4_table, 4096);
@@ -1357,7 +1367,12 @@ static void wox_take_content_snapshot(CPUState *cpu, CPUX86State *env)
     memset(wox_page_present, 0, WOX_BITMAP_BYTES);
     wox_content_snapshot_pages = 0;
 
-    uint64_t cr3 = env->cr[3];
+    /* Use target process CR3 (parent_cr3) if available, else fall back to
+     * current vCPU CR3.  parent_cr3 is set by the harness via CR3 hypercall
+     * and points to the child (packed) process's address space. */
+    uint64_t cr3 = GET_GLOBAL_STATE()->parent_cr3
+                     ? GET_GLOBAL_STATE()->parent_cr3
+                     : (env->cr[3] & 0x000FFFFFFFFFF000ULL);
     uint64_t pml4_base = cr3 & 0x000FFFFFFFFFF000ULL;
     uint64_t pml4_table[512];
     cpu_physical_memory_read(pml4_base, pml4_table, 4096);
@@ -2126,7 +2141,12 @@ static void wox_content_diff_report(CPUState *cpu, CPUX86State *env)
     uint64_t *cur_phys = calloc(WOX_PAGE_COUNT, sizeof(uint64_t));
     uint8_t  *cur_mapped = calloc(1, WOX_BITMAP_BYTES);
 
-    uint64_t cr3 = env->cr[3];
+    /* Use target process CR3 (parent_cr3) if available, else fall back to
+     * current vCPU CR3.  parent_cr3 is set by the harness via CR3 hypercall
+     * and points to the child (packed) process's address space. */
+    uint64_t cr3 = GET_GLOBAL_STATE()->parent_cr3
+                     ? GET_GLOBAL_STATE()->parent_cr3
+                     : (env->cr[3] & 0x000FFFFFFFFFF000ULL);
     uint64_t pml4_base = cr3 & 0x000FFFFFFFFFF000ULL;
     uint64_t pml4_table[512];
     cpu_physical_memory_read(pml4_base, pml4_table, 4096);
@@ -2445,7 +2465,10 @@ static void wox_detect(CPUState *cpu, CPUX86State *env, const char *trigger)
                    pc ? "page_cache empty (decoder inactive)" : "unavailable");
 
         /* Walk guest page tables to check NX bit for newly-dirty pages */
-        uint64_t cr3 = env->cr[3];
+        /* Use target CR3 if available */
+        uint64_t cr3 = GET_GLOBAL_STATE()->parent_cr3
+                         ? GET_GLOBAL_STATE()->parent_cr3
+                         : (env->cr[3] & 0x000FFFFFFFFFF000ULL);
         uint64_t pml4_base = cr3 & 0x000FFFFFFFFFF000ULL;
         uint64_t pml4_table[512];
         cpu_physical_memory_read(pml4_base, pml4_table, 4096);
