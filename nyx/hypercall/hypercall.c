@@ -1896,7 +1896,8 @@ static void wox_offline_pt_decode(CPUState *cpu)
         return;
     }
 
-    uint8_t *buf = malloc(st.st_size);
+    /* +1 for libxdc sentinel byte (0x55) required at data[len] */
+    uint8_t *buf = malloc(st.st_size + 1);
     if (!buf) {
         nyx_printf("[WOX] Failed to allocate %ld bytes for PT decode\n",
                    (long)st.st_size);
@@ -1915,6 +1916,9 @@ static void wox_offline_pt_decode(CPUState *cpu)
         free(dump_path);
         return;
     }
+
+    /* libxdc_decode asserts data[len] == 0x55 as sentinel */
+    buf[st.st_size] = 0x55;
 
     nyx_printf("[WOX] Offline PT decode: %ld bytes from %s\n",
                (long)st.st_size, dump_path);
