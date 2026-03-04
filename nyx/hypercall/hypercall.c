@@ -1989,13 +1989,15 @@ static void wox_final_wox_check(CPUState *cpu)
     uint8_t *current_dirty = calloc(1, WOX_BITMAP_BYTES);
     wox_collect_dirty_bits(env, current_dirty);
 
+    /* Also update cumulative newly-dirty for the dirty report */
     if (!wox_dirty_cumulative)
         wox_dirty_cumulative = calloc(1, WOX_BITMAP_BYTES);
     for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
         uint8_t nd = current_dirty[i] & ~wox_dirty_snapshot[i];
         wox_dirty_cumulative[i] |= nd;
     }
-    free(current_dirty);
+    /* NOTE: current_dirty is kept alive for W+X cross-check below
+     * (we need ALL dirty pages, not just newly-dirty). */
 
     /* Get executed pages */
     page_cache_t *pc = GET_GLOBAL_STATE()->page_cache;
@@ -2015,19 +2017,24 @@ static void wox_final_wox_check(CPUState *cpu)
             wox_bitmap_set(exec_bitmap, wox_va_to_idx((uint32_t)va));
     }
 
-    /* New exec = exec not in baseline */
-    uint8_t *new_exec = calloc(1, WOX_BITMAP_BYTES);
-    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
-        new_exec[i] = exec_bitmap[i] & ~(wox_exec_baseline ? wox_exec_baseline[i] : 0);
-    }
-
-    /* Cross-check: dirty & new_exec */
+    /* W+X cross-check: ALL dirty pages (including baseline) vs exec from PT.
+     *
+     * Why include baseline dirty pages:
+     *   The harness resumes the target briefly for DLL loading before ACQUIRE.
+     *   During this brief resume, VMP may already start unpacking and write to
+     *   .text — setting PTE dirty bits that end up in the baseline snapshot.
+     *   Since PT only runs after ACQUIRE, exec pages are inherently "new".
+     *   Using only "newly dirty" would miss pages written before ACQUIRE but
+     *   executed after ACQUIRE (the classic VMP unpacking pattern).
+     *
+     * Formula:  W+X = current_dirty ∩ exec_from_PT
+     */
     int wox_count = 0;
     int wox_addrs_cap = 4096;
     uint32_t *wox_addrs = malloc(wox_addrs_cap * sizeof(uint32_t));
 
     for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
-        uint8_t wox_byte = wox_dirty_cumulative[i] & new_exec[i];
+        uint8_t wox_byte = current_dirty[i] & exec_bitmap[i];
         if (!wox_byte) continue;
         for (int bit = 0; bit < 8; bit++) {
             if (wox_byte & (1 << bit)) {
@@ -2078,7 +2085,7 @@ static void wox_final_wox_check(CPUState *cpu)
     }
 
     free(wox_addrs);
-    free(new_exec);
+    free(current_dirty);
     free(exec_bitmap);
     free(exec_pages);
 }
