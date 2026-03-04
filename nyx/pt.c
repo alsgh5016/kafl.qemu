@@ -544,6 +544,13 @@ void pt_post_kvm_run(CPUState *cpu)
     {
         pt_handle_overflow(cpu);
     }
+    else if (GET_GLOBAL_STATE()->in_fuzzing_mode && cpu->pt_fd)
+    {
+        /* W⊕X mode: PT hardware is active but pt_trace_mode may be unset.
+         * We still need to drain the ToPA buffer so libxdc_decode() runs
+         * and wox_bb_callback() records executed pages in real-time. */
+        pt_handle_overflow(cpu);
+    }
 
     /* Periodic dirty-page scan (rate-limited, CR3-filtered) */
     wox_periodic_dirty_scan(cpu);

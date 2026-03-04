@@ -1796,8 +1796,7 @@ void wox_periodic_dirty_scan(CPUState *cpu)
     free(current_dirty);
 
     /* --- 3. Real-time W⊕X cross-check: dirty ∩ executed --- */
-    page_cache_t *pc = GET_GLOBAL_STATE()->page_cache;
-    if (!pc || !GET_GLOBAL_STATE()->decoder) {
+    if (!GET_GLOBAL_STATE()->decoder) {
         /* Decoder not yet initialized — skip execute-side check.
          * Still accumulate dirty pages above for when decoder is ready. */
         nyx_printf("[WOX] Scan #%d: %d cumulative dirty pages (decoder not ready)\n",
@@ -1805,30 +1804,31 @@ void wox_periodic_dirty_scan(CPUState *cpu)
         return;
     }
 
-    /* Force-flush PT buffer so libxdc_decode runs and page_cache is
-     * fully up to date — even when the ToPA buffer hasn't overflowed. */
+    /* Force-flush PT buffer so libxdc_decode runs and wox_bb_callback
+     * populates wox_exec_cumulative — even when ToPA hasn't overflowed. */
     pt_flush_buffer(cpu);
 
-    /* Get executed pages from page_cache (populated by libxdc_decode) */
-    int max_exec = 65536;
-    uint64_t *exec_pages = malloc(max_exec * sizeof(uint64_t));
-    int exec_count = page_cache_get_executed_pages(pc, exec_pages, max_exec);
-
-    /* Build bitmap of currently-executed pages in user VA range */
-    uint8_t *exec_bitmap = calloc(1, WOX_BITMAP_BYTES);
-    for (int e = 0; e < exec_count; e++) {
-        uint64_t va = exec_pages[e];
-        if (va >= WOX_USER_VA_START && va < WOX_USER_VA_END)
-            wox_bitmap_set(exec_bitmap, wox_va_to_idx((uint32_t)va));
+    /* Use wox_exec_cumulative bitmap (populated by wox_bb_callback during
+     * libxdc_decode) instead of page_cache_get_executed_pages() which reads
+     * from the wrong cache (page_cache khash is never populated by
+     * wox_live_page_fetch). */
+    int exec_count = 0;
+    if (wox_exec_cumulative) {
+        for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+            uint8_t v = wox_exec_cumulative[i];
+            while (v) { exec_count++; v &= v - 1; }
+        }
     }
 
     /* Determine newly-executed pages (not in baseline from last round) */
     uint8_t *new_exec = calloc(1, WOX_BITMAP_BYTES);
     int new_exec_count = 0;
-    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
-        new_exec[i] = exec_bitmap[i] & ~(wox_exec_baseline ? wox_exec_baseline[i] : 0);
-        uint8_t v = new_exec[i];
-        while (v) { new_exec_count++; v &= v - 1; }
+    if (wox_exec_cumulative) {
+        for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+            new_exec[i] = wox_exec_cumulative[i] & ~(wox_exec_baseline ? wox_exec_baseline[i] : 0);
+            uint8_t v = new_exec[i];
+            while (v) { new_exec_count++; v &= v - 1; }
+        }
     }
 
     /* Cross-check: pages both written (dirty) AND executed since round start */
@@ -1854,7 +1854,6 @@ void wox_periodic_dirty_scan(CPUState *cpu)
                check_id, cumulative_count, exec_count, new_exec_count, wox_count);
 
     free(new_exec);
-    free(exec_bitmap);
 
     /* --- 4. W⊕X detected! Dump memory and reset round --- */
     if (wox_count > 0) {
@@ -2788,24 +2787,25 @@ void wox_reset_round(CPUState *cpu)
     /* Snapshot current executed pages as baseline for next round.
      * Pages executed before this point won't count as "new" in the
      * next round's W⊕X cross-check. */
-    page_cache_t *pc = GET_GLOBAL_STATE()->page_cache;
-    if (pc) {
-        if (!wox_exec_baseline)
-            wox_exec_baseline = calloc(1, WOX_BITMAP_BYTES);
-        else
-            memset(wox_exec_baseline, 0, WOX_BITMAP_BYTES);
+    /* Snapshot current executed pages as baseline for next round.
+     * Use wox_exec_cumulative bitmap (populated by wox_bb_callback)
+     * instead of page_cache_get_executed_pages() which reads from
+     * the wrong cache. */
+    if (!wox_exec_baseline)
+        wox_exec_baseline = calloc(1, WOX_BITMAP_BYTES);
+    else
+        memset(wox_exec_baseline, 0, WOX_BITMAP_BYTES);
 
-        int max_exec = 65536;
-        uint64_t *exec_pages = malloc(max_exec * sizeof(uint64_t));
-        int exec_count = page_cache_get_executed_pages(pc, exec_pages, max_exec);
-        for (int e = 0; e < exec_count; e++) {
-            uint64_t va = exec_pages[e];
-            if (va >= WOX_USER_VA_START && va < WOX_USER_VA_END)
-                wox_bitmap_set(wox_exec_baseline, wox_va_to_idx((uint32_t)va));
+    int exec_count = 0;
+    if (wox_exec_cumulative) {
+        memcpy(wox_exec_baseline, wox_exec_cumulative, WOX_BITMAP_BYTES);
+        for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+            uint8_t v = wox_exec_cumulative[i];
+            while (v) { exec_count++; v &= v - 1; }
         }
-        
-        nyx_printf("[WOX] Execution baseline saved: %d pages\n", exec_count);
     }
+
+    nyx_printf("[WOX] Execution baseline saved: %d pages\n", exec_count);
 
     wox_take_snapshot(cpu);
 
@@ -2815,10 +2815,10 @@ void wox_reset_round(CPUState *cpu)
 /*
  * Detect W⊕X (Write-then-Execute) pages.
  *
- * 1. Flush pending Intel PT data so page_cache is up to date.
+ * 1. Flush pending Intel PT data so wox_exec_cumulative is up to date.
  * 2. Collect current PTE dirty bits.
  * 3. Newly written = current_dirty & ~snapshot_dirty
- * 4. Executed pages = page_cache hash keys (populated by Intel PT decode)
+ * 4. Executed pages = wox_exec_cumulative bitmap (populated by wox_bb_callback)
  * 5. W⊕X = newly_written ∩ executed
  */
 static void wox_detect(CPUState *cpu, CPUX86State *env, const char *trigger)
@@ -2850,7 +2850,6 @@ static void wox_detect(CPUState *cpu, CPUX86State *env, const char *trigger)
 
 
     /* 4. Detect W⊕X pages */
-    page_cache_t *pc = GET_GLOBAL_STATE()->page_cache;
     int exec_count = 0;
     int wox_count = 0;
     const char *detect_method = "unknown";
@@ -2859,45 +2858,48 @@ static void wox_detect(CPUState *cpu, CPUX86State *env, const char *trigger)
     int wox_addrs_cap = 4096;
     uint32_t *wox_addrs = malloc(wox_addrs_cap * sizeof(uint32_t));
 
-    /* Try Intel PT page_cache first */
+    /* Use wox_exec_cumulative bitmap (populated by wox_bb_callback)
+     * instead of page_cache_get_executed_pages() which reads from the
+     * wrong cache (page_cache khash is never populated by
+     * wox_live_page_fetch). */
     bool use_pt = false;
-    if (pc) {
-        int max_exec = 65536;
-        uint64_t *exec_pages = malloc(max_exec * sizeof(uint64_t));
-        exec_count = page_cache_get_executed_pages(pc, exec_pages, max_exec);
+    if (wox_exec_cumulative) {
+        for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+            uint8_t v = wox_exec_cumulative[i];
+            while (v) { exec_count++; v &= v - 1; }
+        }
 
         if (exec_count > 0) {
             use_pt = true;
-            detect_method = "Intel PT page_cache";
+            detect_method = "Intel PT wox_exec_cumulative";
             nyx_printf("[WOX] Check #%d (%s): newly_dirty=%d pages, "
                        "executed(PT)=%d pages\n",
                        check_id, trigger, newly_dirty_count, exec_count);
 
             /* Intersection: W ∩ X */
-            for (int e = 0; e < exec_count; e++) {
-                uint32_t va = (uint32_t)(exec_pages[e] & 0xFFFFFFFF);
-                if (va < WOX_USER_VA_START || va >= WOX_USER_VA_END) continue;
-
-                int idx = wox_va_to_idx(va);
-                if (wox_bitmap_test(newly_dirty, idx)) {
-                    nyx_printf("[WOX]   *** W+X page: VA=0x%08x ***\n", va);
-                    if (wox_count < wox_addrs_cap)
-                        wox_addrs[wox_count] = va;
-                    wox_count++;
+            for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+                uint8_t wox_byte = newly_dirty[i] & wox_exec_cumulative[i];
+                if (!wox_byte) continue;
+                for (int bit = 0; bit < 8; bit++) {
+                    if (wox_byte & (1 << bit)) {
+                        int idx = i * 8 + bit;
+                        uint32_t va = WOX_USER_VA_START + (uint32_t)idx * 0x1000;
+                        nyx_printf("[WOX]   *** W+X page: VA=0x%08x ***\n", va);
+                        if (wox_count < wox_addrs_cap)
+                            wox_addrs[wox_count] = va;
+                        wox_count++;
+                    }
                 }
             }
         }
-        
     }
 
-    /* NX-bit fallback: PT decoder inactive or page_cache empty */
+    /* NX-bit fallback: PT decoder inactive or exec bitmap empty */
     if (!use_pt) {
         detect_method = "NX-bit fallback";
         nyx_printf("[WOX] Check #%d (%s): newly_dirty=%d pages, "
-                   "PT %s — using NX-bit fallback\n",
-                   check_id, trigger, newly_dirty_count,
-                   pc ? "page_cache empty (decoder inactive)" : "unavailable");
-
+                   "PT exec bitmap empty — using NX-bit fallback\n",
+                   check_id, trigger, newly_dirty_count);
         /* Walk guest page tables to check NX bit for newly-dirty pages */
         /* Use target CR3 if available */
         uint64_t cr3 = GET_GLOBAL_STATE()->parent_cr3
