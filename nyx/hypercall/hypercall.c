@@ -2017,6 +2017,58 @@ static void wox_final_wox_check(CPUState *cpu)
             wox_bitmap_set(exec_bitmap, wox_va_to_idx((uint32_t)va));
     }
 
+    /* ===== DIAGNOSTIC: .text page presence check ===== */
+    {
+        int text_in_dirty = 0, text_in_exec = 0, text_in_baseline = 0;
+        for (uint32_t va = 0x401000; va < 0x408000; va += 0x1000) {
+            int idx = wox_va_to_idx(va);
+            int d = wox_bitmap_test(current_dirty, idx);
+            int e = wox_bitmap_test(exec_bitmap, idx);
+            int b = wox_dirty_snapshot ? wox_bitmap_test(wox_dirty_snapshot, idx) : 0;
+            if (d) text_in_dirty++;
+            if (e) text_in_exec++;
+            if (b) text_in_baseline++;
+            nyx_printf("[WOX-DIAG] .text page 0x%08x: dirty=%d exec=%d baseline=%d\n",
+                       va, d, e, b);
+        }
+        nyx_printf("[WOX-DIAG] .text summary: dirty=%d/7, exec=%d/7, baseline=%d/7\n",
+                   text_in_dirty, text_in_exec, text_in_baseline);
+
+        /* Exec pages: show VA range and count in target image range */
+        uint64_t min_exec = UINT64_MAX, max_exec = 0;
+        int exec_in_image = 0;
+        for (int e = 0; e < exec_count; e++) {
+            if (exec_pages[e] < min_exec) min_exec = exec_pages[e];
+            if (exec_pages[e] > max_exec) max_exec = exec_pages[e];
+            if (exec_pages[e] >= 0x400000 && exec_pages[e] < 0xB4A000)
+                exec_in_image++;
+        }
+        nyx_printf("[WOX-DIAG] exec VA range: 0x%lx - 0x%lx (total=%d, in_image=%d)\n",
+                   (unsigned long)min_exec, (unsigned long)max_exec,
+                   exec_count, exec_in_image);
+
+        /* Show first 20 exec pages sorted for inspection */
+        nyx_printf("[WOX-DIAG] First 20 exec pages:\n");
+        for (int e = 0; e < exec_count && e < 20; e++) {
+            nyx_printf("[WOX-DIAG]   [%d] 0x%lx\n", e, (unsigned long)exec_pages[e]);
+        }
+
+        /* Dirty pages in image range (0x400000-0xB4A000) */
+        int dirty_in_image = 0;
+        nyx_printf("[WOX-DIAG] Dirty pages in image range (0x400000-0xB4A000):\n");
+        for (uint32_t va = 0x400000; va < 0xB4A000; va += 0x1000) {
+            int idx = wox_va_to_idx(va);
+            if (wox_bitmap_test(current_dirty, idx)) {
+                dirty_in_image++;
+                if (dirty_in_image <= 30)
+                    nyx_printf("[WOX-DIAG]   dirty: 0x%08x\n", va);
+            }
+        }
+        nyx_printf("[WOX-DIAG] Total dirty in image range: %d\n", dirty_in_image);
+    }
+    /* ===== END DIAGNOSTIC ===== */
+
+
     /* W+X cross-check: ALL dirty pages (including baseline) vs exec from PT.
      *
      * Why include baseline dirty pages:
