@@ -1265,6 +1265,8 @@ static uint8_t    *wox_page_present = NULL;   /* bitmap: pages mapped at snapsho
 static int         wox_content_snapshot_pages = 0;
 static uint8_t *wox_exec_this_round = NULL;   /* executed pages bitmap (this KVM exit round) */
 static uint8_t *wox_exec_cumulative = NULL;   /* executed pages bitmap (entire run) */
+static uint64_t   *wox_first_exec_rip = NULL; /* first executed RIP per page (for precise logging) */
+static uint8_t    *wox_wox_detected = NULL;   /* bitmap: pages already reported as W+X this round */
 
 static inline int wox_va_to_idx(uint32_t va)
 {
@@ -2559,9 +2561,44 @@ void wox_bb_callback(void *opaque, int mode, uint64_t rip, uint64_t tsc)
         int idx = wox_va_to_idx((uint32_t)rip);
         if (!wox_exec_this_round) wox_exec_this_round = calloc(1, WOX_BITMAP_BYTES);
         if (!wox_exec_cumulative) wox_exec_cumulative = calloc(1, WOX_BITMAP_BYTES);
+        if (!wox_first_exec_rip) wox_first_exec_rip = calloc(WOX_PAGE_COUNT, sizeof(uint64_t));
+        if (!wox_wox_detected) wox_wox_detected = calloc(1, WOX_BITMAP_BYTES);
+        
+        /* Store first execution RIP for this page (for precise logging) */
+        if (!wox_bitmap_test(wox_exec_this_round, idx)) {
+            wox_first_exec_rip[idx] = rip;
+        }
         
         wox_bitmap_set(wox_exec_this_round, idx);
         wox_bitmap_set(wox_exec_cumulative, idx);
+        
+        /* Immediate W+X check: if page was modified since snapshot, report now */
+        if (wox_page_content && !wox_bitmap_test(wox_wox_detected, idx)) {
+            uint32_t page_va = WOX_USER_VA_START + (uint32_t)idx * 0x1000;
+            bool is_wox = false;
+            
+            if (!wox_page_content[idx]) {
+                /* Page didn't exist at snapshot time - new page executed = W+X */
+                is_wox = true;
+            } else {
+                /* Compare current page content with snapshot */
+                uint8_t cur_page[4096];
+                uint64_t cr3 = GET_GLOBAL_STATE()->parent_cr3;
+                if (!cr3) cr3 = (&(X86_CPU(qemu_get_cpu(0))->env))->cr[3] & 0x000FFFFFFFFFF000ULL;
+                
+                if (dump_page_cr3_ht(page_va, cur_page, qemu_get_cpu(0), cr3)) {
+                    if (memcmp(cur_page, wox_page_content[idx], 4096) != 0) {
+                        is_wox = true;
+                    }
+                }
+            }
+            
+            if (is_wox) {
+                wox_bitmap_set(wox_wox_detected, idx);
+                nyx_printf("[WOX-PRECISE] W+X at RIP=0x%08lx (page 0x%08x)\n",
+                           (unsigned long)rip, page_va);
+            }
+        }
     }
 }
 
@@ -2622,10 +2659,16 @@ void wox_realtime_wox_check(CPUState *cpu)
 
                 if (is_wx) {
                     if (wox_count == 0) {
-                        nyx_printf("\n==================================================\n");
-                        nyx_printf("[WOX-REALTIME] *** W+X DETECTED IN REAL-TIME ***\n");
+                        nyx_printf("\n==================================================");
+                        nyx_printf("\n[WOX-REALTIME] *** W+X DETECTED IN REAL-TIME ***\n");
                     }
-                    nyx_printf("[WOX-REALTIME] W+X detected at 0x%08x\n", va);
+                    /* Log precise RIP if available */
+                    if (wox_first_exec_rip && wox_first_exec_rip[idx]) {
+                        nyx_printf("[WOX-REALTIME] W+X at RIP=0x%08lx (page 0x%08x)\n",
+                                   (unsigned long)wox_first_exec_rip[idx], va);
+                    } else {
+                        nyx_printf("[WOX-REALTIME] W+X detected at page 0x%08x\n", va);
+                    }
                     wox_count++;
                 }
             }
@@ -2655,6 +2698,12 @@ void wox_reset_round(CPUState *cpu)
 {
     if (wox_dirty_cumulative)
         memset(wox_dirty_cumulative, 0, WOX_BITMAP_BYTES);
+
+    /* Clear precise RIP tracking for next round */
+    if (wox_first_exec_rip)
+        memset(wox_first_exec_rip, 0, WOX_PAGE_COUNT * sizeof(uint64_t));
+    if (wox_wox_detected)
+        memset(wox_wox_detected, 0, WOX_BITMAP_BYTES);
 
     /* Snapshot current executed pages as baseline for next round.
      * Pages executed before this point won't count as "new" in the
