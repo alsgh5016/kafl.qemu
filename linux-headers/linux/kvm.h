@@ -304,6 +304,8 @@ struct kvm_hyperv_exit {
 
 #define KVM_EXIT_KAFL_HOOK_API 140
 
+#define KVM_EXIT_KAFL_WOX_SNAPSHOT 141
+
 
 #define KVM_CAP_NYX_PT 512
 #define KVM_CAP_NYX_FDL 513

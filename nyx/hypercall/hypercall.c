@@ -1254,6 +1254,7 @@ static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
 
 static uint8_t *wox_dirty_snapshot = NULL;
 static bool     wox_snapshot_taken = false;
+static bool     wox_early_snapshot_taken = false;  /* early baseline from WOX_SNAPSHOT hypercall */
 static int      wox_check_counter  = 0;
 static uint8_t *wox_dirty_cumulative = NULL;  /* union of all observed dirty pages */
 static uint8_t *wox_exec_baseline = NULL;     /* executed pages bitmap at round start */
@@ -1467,8 +1468,14 @@ void wox_take_snapshot(CPUState *cpu)
     nyx_printf("[WOX] Dirty-bit snapshot taken: %d baseline dirty pages\n",
                baseline);
 
-    /* Always update content snapshot so we can diff the next layer */
-    wox_take_content_snapshot(cpu, env);
+    /* Take content snapshot only if not already taken (early snapshot) */
+    if (!wox_page_content || !wox_early_snapshot_taken) {
+        wox_take_content_snapshot(cpu, env);
+    } else {
+        nyx_printf("[WOX] Early baseline snapshot exists, skipping re-snapshot\n");
+        wox_early_snapshot_taken = false;  /* Allow next round to take fresh snapshot */
+    }
+    return;
 }
 
 /*
@@ -3141,6 +3148,22 @@ static void handle_hypercall_kafl_persist_page_past_snapshot(struct kvm_run *run
 }
 
 /*
+/*
+ * W+X Snapshot handler - takes early baseline content snapshot
+ * before any process execution. Called right after CreateProcess.
+ */
+static void handle_hypercall_kafl_wox_snapshot(struct kvm_run *run,
+                                               CPUState       *cpu,
+                                               uint64_t        hypercall_arg)
+{
+    nyx_printf("[WOX] Early baseline snapshot requested\n");
+    CPUX86State *env = &(X86_CPU(cpu))->env;
+    wox_take_content_snapshot(cpu, env);
+    nyx_printf("[WOX] Early baseline snapshot complete\n");
+    wox_early_snapshot_taken = true;
+}
+
+/*
  * API Hook handler - receives API addresses from harness,
  * installs INT3 breakpoints for Windows API call detection.
  */
@@ -3346,6 +3369,10 @@ int handle_kafl_hypercall(struct kvm_run *run,
         break;
     case KVM_EXIT_KAFL_PERSIST_PAGE_PAST_SNAPSHOT:
         handle_hypercall_kafl_persist_page_past_snapshot(run, cpu, arg);
+        ret = 0;
+        break;
+    case KVM_EXIT_KAFL_WOX_SNAPSHOT:
+        handle_hypercall_kafl_wox_snapshot(run, cpu, arg);
         ret = 0;
         break;
     case KVM_EXIT_KAFL_HOOK_API:
