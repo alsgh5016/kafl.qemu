@@ -1711,10 +1711,6 @@ void wox_accumulate_dirty_bits(CPUState *cpu)
         return;
 
     CPUX86State *env = &(X86_CPU(cpu)->env);
-    uint64_t current_cr3 = env->cr[3] & 0xFFFFFFFFFFFFF000ULL;
-    if (current_cr3 != target_cr3)
-        return;
-
     /* Rate-limit: 100 ms between scans (more frequent than periodic scan
      * to catch dirty bits before VirtualProtect clears them) */
     static struct timespec last_accum = {0, 0};
@@ -1756,10 +1752,6 @@ void wox_periodic_dirty_scan(CPUState *cpu)
         return;
 
     CPUX86State *env = &(X86_CPU(cpu)->env);
-    uint64_t current_cr3 = env->cr[3] & 0xFFFFFFFFFFFFF000ULL;
-    if (current_cr3 != target_cr3)
-        return;                       /* not in target process context */
-
     /* --- 1. Rate-limit: 500 ms between scans --- */
     static struct timespec last_scan = {0, 0};
     struct timespec now;
