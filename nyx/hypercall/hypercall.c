@@ -2252,10 +2252,8 @@ static void wox_content_diff_report(CPUState *cpu, CPUX86State *env)
         nyx_printf("[WOX] Content diff: no content snapshot, skipping\n");
         return;
     }
-    if (!wox_dirty_cumulative) {
-        nyx_printf("[WOX] Content diff: no dirty data, skipping\n");
-        return;
-    }
+    /* Note: dirty_cumulative may be empty -- we now diff ALL snapshotted pages
+     * regardless of PTE dirty bit, because VirtualProtect can clear dirty bits. */
 
     /* --- Build current physical address map via PT walk --- */
     uint64_t *cur_phys = calloc(WOX_PAGE_COUNT, sizeof(uint64_t));
@@ -2347,23 +2345,32 @@ static void wox_content_diff_report(CPUState *cpu, CPUX86State *env)
     int num_modules = wox_cached_num_modules;
 
     int total_dirty = 0;
-    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
-        uint8_t v = wox_dirty_cumulative[i];
-        while (v) { total_dirty++; v &= v - 1; }
+    if (wox_dirty_cumulative) {
+        for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+            uint8_t v = wox_dirty_cumulative[i];
+            while (v) { total_dirty++; v &= v - 1; }
+        }
     }
 
-    fprintf(df, "# Content Diff Report (Byte-level Write Tracking)\n");
+    int total_present = 0;
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+        uint8_t v = wox_page_present[i];
+        while (v) { total_present++; v &= v - 1; }
+    }
+
+    fprintf(df, "# Content Diff Report (Full Page Comparison - bypass PTE dirty bit)\n");
     fprintf(df, "# Snapshot pages at ACQUIRE: %d\n", wox_content_snapshot_pages);
-    fprintf(df, "# Cumulative dirty pages: %d\n", total_dirty);
+    fprintf(df, "# Pages being compared: %d\n", total_present);
+    fprintf(df, "# Cumulative dirty pages (PTE-based): %d\n", total_dirty);
     fprintf(df, "# Modules cached: %d\n\n", num_modules);
 
-    /* --- Diff each dirty page --- */
+    /* --- Diff ALL snapshotted pages (bypass PTE dirty bit limitation) --- */
     int pages_changed = 0, pages_new = 0, pages_unmapped = 0;
     uint64_t total_bytes_changed = 0;
     uint8_t cur_page[0x1000];
 
     for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
-        uint8_t byte_val = wox_dirty_cumulative[i];
+        uint8_t byte_val = wox_page_present[i];
         if (!byte_val) continue;
         for (int bit = 0; bit < 8; bit++) {
             if (!(byte_val & (1 << bit))) continue;
@@ -2381,21 +2388,25 @@ static void wox_content_diff_report(CPUState *cpu, CPUX86State *env)
                 }
             }
 
+            /* Check if PTE dirty bit was also set for this page */
+            int pte_dirty = (wox_dirty_cumulative &&
+                             wox_bitmap_test(wox_dirty_cumulative, idx));
+            const char *dirty_tag = pte_dirty ? "D" : " ";
+
             if (!wox_bitmap_test(cur_mapped, idx)) {
                 pages_unmapped++;
-                fprintf(df, "0x%08x  UNMAPPED  %s\n", va,
-                        mod_name ? mod_name : "");
+                fprintf(df, "0x%08x  UNMAPPED  [%s]  %s\n", va,
+                        dirty_tag, mod_name ? mod_name : "");
                 continue;
             }
 
             cpu_physical_memory_read(cur_phys[idx], cur_page, 0x1000);
 
-            if (!wox_bitmap_test(wox_page_present, idx) ||
-                !wox_page_content[idx]) {
+            if (!wox_page_content[idx]) {
                 pages_new++;
                 total_bytes_changed += 0x1000;
-                fprintf(df, "0x%08x  NEW       4096/4096 bytes  %s\n", va,
-                        mod_name ? mod_name : "");
+                fprintf(df, "0x%08x  NEW       4096/4096 bytes  [%s]  %s\n", va,
+                        dirty_tag, mod_name ? mod_name : "");
                 continue;
             }
 
@@ -2430,11 +2441,11 @@ static void wox_content_diff_report(CPUState *cpu, CPUX86State *env)
             total_bytes_changed += changed_bytes;
 
             if (changed_bytes == 0x1000) {
-                fprintf(df, "0x%08x  FULL      4096/4096 bytes  %s\n", va,
-                        mod_name ? mod_name : "");
+                fprintf(df, "0x%08x  FULL      4096/4096 bytes  [%s]  %s\n", va,
+                        dirty_tag, mod_name ? mod_name : "");
             } else {
-                fprintf(df, "0x%08x  PARTIAL   %4d/4096 bytes  %s\n", va,
-                        changed_bytes, mod_name ? mod_name : "");
+                fprintf(df, "0x%08x  PARTIAL   %4d/4096 bytes  [%s]  %s\n", va,
+                        changed_bytes, dirty_tag, mod_name ? mod_name : "");
                 for (int r = 0; r < range_count; r++) {
                     fprintf(df, "  0x%03x - 0x%03x  (%d bytes)\n",
                             ranges[r].start, ranges[r].end,

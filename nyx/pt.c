@@ -440,6 +440,6 @@ void pt_post_kvm_run(CPUState *cpu)
     }
 
     /* Periodic dirty-page scan (rate-limited, CR3-filtered) */
-    // [TEST] wox_periodic_dirty_scan(cpu);
+    wox_periodic_dirty_scan(cpu);
     wox_accumulate_dirty_bits(cpu);
 }
