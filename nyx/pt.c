@@ -478,6 +478,66 @@ void pt_handle_overflow(CPUState *cpu)
     pthread_mutex_unlock(&pt_dump_mutex);
 }
 
+/*
+ * pt_flush_buffer - Force-flush the PT trace buffer for real-time decode.
+ *
+ * The normal pt_handle_overflow() path only decodes when the ToPA buffer
+ * overflows.  For narrow IP-filter ranges (e.g. 288 KB), the trace data
+ * may never fill the multi-MB ToPA buffer, so libxdc_decode() / the
+ * wox_bb_callback never fires  →  W+X detection silently misses events.
+ *
+ * This function unconditionally drains the buffer:
+ *   1. Check for a normal ToPA overflow first (cheap).
+ *   2. If no overflow AND PT is still enabled, disable PT (returns the
+ *      number of remaining bytes in the buffer), decode those bytes,
+ *      then immediately re-enable PT so tracing continues.
+ *
+ * The VCPU is guaranteed to be stopped when this runs (called from
+ * pt_post_kvm_run context), so the disable→decode→enable window does
+ * not lose any trace packets.
+ *
+ * Rate-limit externally (wox_periodic_dirty_scan already gates at 500 ms).
+ */
+void pt_flush_buffer(CPUState *cpu)
+{
+    pthread_mutex_lock(&pt_dump_mutex);
+
+    /* 1. Drain any pending ToPA overflow first (same as pt_handle_overflow) */
+    int overflow = ioctl(cpu->pt_fd, KVM_VMX_PT_CHECK_TOPA_OVERFLOW, (unsigned long)0);
+    if (overflow > 0) {
+        pt_dump(cpu, overflow);
+    }
+
+    /* 2. Force-flush: disable PT → decode remaining → re-enable PT */
+    if (overflow <= 0 && cpu->pt_enabled) {
+        int bytes = ioctl(cpu->pt_fd, KVM_VMX_PT_DISABLE, 0);
+        cpu->pt_enabled = false;
+
+        static int flush_count = 0;
+        flush_count++;
+        nyx_debug_p(PT_PREFIX, "[WOX-PT-FLUSH] Force flush #%d: %d bytes drained\n",
+                    flush_count, bytes);
+
+        if (bytes > 0) {
+            pt_dump(cpu, bytes);
+        }
+
+        /* Re-enable PT so tracing continues for the next KVM-run cycle */
+        if (!ioctl(cpu->pt_fd, KVM_VMX_PT_ENABLE, 0)) {
+            cpu->pt_enabled = true;
+        } else {
+            nyx_warn("[WOX-PT-FLUSH] Failed to re-enable PT after flush!\n");
+        }
+    }
+
+    /* Clear decoder page-fault flag (same as pt_handle_overflow) */
+    if (GET_GLOBAL_STATE()->decoder_page_fault) {
+        GET_GLOBAL_STATE()->decoder_page_fault = false;
+    }
+
+    pthread_mutex_unlock(&pt_dump_mutex);
+}
+
 void pt_post_kvm_run(CPUState *cpu)
 {
     if (GET_GLOBAL_STATE()->pt_trace_mode || GET_GLOBAL_STATE()->pt_trace_mode_force)

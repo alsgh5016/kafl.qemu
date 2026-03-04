@@ -1813,8 +1813,9 @@ void wox_periodic_dirty_scan(CPUState *cpu)
         return;
     }
 
-    /* Flush pending PT data so page_cache is fully up to date */
-    pt_handle_overflow(cpu);
+    /* Force-flush PT buffer so libxdc_decode runs and page_cache is
+     * fully up to date — even when the ToPA buffer hasn't overflowed. */
+    pt_flush_buffer(cpu);
 
     /* Get executed pages from page_cache (populated by libxdc_decode) */
     int max_exec = 65536;

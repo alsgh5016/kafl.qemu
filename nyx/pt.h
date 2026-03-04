@@ -36,5 +36,6 @@ void pt_post_kvm_run(CPUState *cpu);
 
 void pt_handle_overflow(CPUState *cpu);
 void pt_dump(CPUState *cpu, int bytes);
+void pt_flush_buffer(CPUState *cpu);
 
 #endif
