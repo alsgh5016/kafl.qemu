@@ -1680,6 +1680,56 @@ static void wox_log_written_pages(CPUState *cpu, CPUX86State *env,
 }
 
 /*
+ * Lightweight dirty-bit accumulator — runs from pt_post_kvm_run() on
+ * every VM exit, rate-limited to once per 100 ms.
+ *
+ * PURPOSE: VirtualProtect() clears PTE dirty bits when changing page
+ * protection (e.g., VMP restores .text to RX after unpacking).
+ * By accumulating dirty bits during execution, we capture writes
+ * BEFORE VirtualProtect clears them.
+ *
+ * This function does NO W⊕X checking — it only OR-accumulates
+ * dirty bits into wox_dirty_cumulative.
+ */
+void wox_accumulate_dirty_bits(CPUState *cpu)
+{
+    if (!wox_snapshot_taken)
+        return;
+
+    uint64_t target_cr3 = GET_GLOBAL_STATE()->parent_cr3;
+    if (target_cr3 == 0)
+        return;
+
+    CPUX86State *env = &(X86_CPU(cpu)->env);
+    uint64_t current_cr3 = env->cr[3] & 0xFFFFFFFFFFFFF000ULL;
+    if (current_cr3 != target_cr3)
+        return;
+
+    /* Rate-limit: 100 ms between scans (more frequent than periodic scan
+     * to catch dirty bits before VirtualProtect clears them) */
+    static struct timespec last_accum = {0, 0};
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsed_ms = (now.tv_sec  - last_accum.tv_sec)  * 1000
+                    + (now.tv_nsec - last_accum.tv_nsec) / 1000000;
+    if (elapsed_ms < 100)
+        return;
+    last_accum = now;
+
+    /* Collect and OR-accumulate */
+    uint8_t *current_dirty = calloc(1, WOX_BITMAP_BYTES);
+    wox_collect_dirty_bits(env, current_dirty);
+
+    if (!wox_dirty_cumulative)
+        wox_dirty_cumulative = calloc(1, WOX_BITMAP_BYTES);
+
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++)
+        wox_dirty_cumulative[i] |= current_dirty[i];
+
+    free(current_dirty);
+}
+
+/*
  * Periodic dirty-page scanner — runs from pt_post_kvm_run() on every
  * VM exit, rate-limited to once per 500 ms.  Completely independent
  * of the API-hook path so that background packer writes are captured
@@ -1985,19 +2035,22 @@ static void wox_final_wox_check(CPUState *cpu)
      * 2. wox_offline_pt_decode() already bulk-decoded the entire trace
      * 3. PT hardware is disabled at this point (ioctl would be no-op)
      */
-    /* Collect final dirty bits */
+    /* Collect final dirty bits and merge into cumulative */
     uint8_t *current_dirty = calloc(1, WOX_BITMAP_BYTES);
     wox_collect_dirty_bits(env, current_dirty);
 
-    /* Also update cumulative newly-dirty for the dirty report */
     if (!wox_dirty_cumulative)
         wox_dirty_cumulative = calloc(1, WOX_BITMAP_BYTES);
-    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
-        uint8_t nd = current_dirty[i] & ~wox_dirty_snapshot[i];
-        wox_dirty_cumulative[i] |= nd;
-    }
-    /* NOTE: current_dirty is kept alive for W+X cross-check below
-     * (we need ALL dirty pages, not just newly-dirty). */
+
+    /* Merge final snapshot into cumulative (captures any remaining dirty bits) */
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++)
+        wox_dirty_cumulative[i] |= current_dirty[i];
+
+    /* Use cumulative bitmap for W+X cross-check.
+     * This captures dirty bits that were set during execution but cleared
+     * by VirtualProtect() before RELEASE (e.g., VMP restoring .text to RX).
+     * wox_accumulate_dirty_bits() collected them periodically during execution. */
+    uint8_t *all_dirty = wox_dirty_cumulative;
 
     /* Get executed pages */
     page_cache_t *pc = GET_GLOBAL_STATE()->page_cache;
@@ -2028,11 +2081,19 @@ static void wox_final_wox_check(CPUState *cpu)
             if (d) text_in_dirty++;
             if (e) text_in_exec++;
             if (b) text_in_baseline++;
-            nyx_printf("[WOX-DIAG] .text page 0x%08x: dirty=%d exec=%d baseline=%d\n",
-                       va, d, e, b);
+            int c = wox_dirty_cumulative ? wox_bitmap_test(wox_dirty_cumulative, idx) : 0;
+            nyx_printf("[WOX-DIAG] .text page 0x%08x: dirty=%d exec=%d baseline=%d cumulative=%d\n",
+                       va, d, e, b, c);
         }
-        nyx_printf("[WOX-DIAG] .text summary: dirty=%d/7, exec=%d/7, baseline=%d/7\n",
-                   text_in_dirty, text_in_exec, text_in_baseline);
+        int text_in_cumulative = 0;
+        if (wox_dirty_cumulative) {
+            for (uint32_t va2 = 0x401000; va2 < 0x408000; va2 += 0x1000) {
+                if (wox_bitmap_test(wox_dirty_cumulative, wox_va_to_idx(va2)))
+                    text_in_cumulative++;
+            }
+        }
+        nyx_printf("[WOX-DIAG] .text summary: dirty=%d/7, exec=%d/7, baseline=%d/7, cumulative=%d/7\n",
+                   text_in_dirty, text_in_exec, text_in_baseline, text_in_cumulative);
 
         /* Exec pages: show VA range and count in target image range */
         uint64_t min_exec = UINT64_MAX, max_exec = 0;
@@ -2079,14 +2140,14 @@ static void wox_final_wox_check(CPUState *cpu)
      *   Using only "newly dirty" would miss pages written before ACQUIRE but
      *   executed after ACQUIRE (the classic VMP unpacking pattern).
      *
-     * Formula:  W+X = current_dirty ∩ exec_from_PT
+     * Formula:  W+X = cumulative_dirty ∩ exec_from_PT
      */
     int wox_count = 0;
     int wox_addrs_cap = 4096;
     uint32_t *wox_addrs = malloc(wox_addrs_cap * sizeof(uint32_t));
 
     for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
-        uint8_t wox_byte = current_dirty[i] & exec_bitmap[i];
+        uint8_t wox_byte = all_dirty[i] & exec_bitmap[i];
         if (!wox_byte) continue;
         for (int bit = 0; bit < 8; bit++) {
             if (wox_byte & (1 << bit)) {
