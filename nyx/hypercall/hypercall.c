@@ -1267,6 +1267,7 @@ static uint8_t *wox_exec_this_round = NULL;   /* executed pages bitmap (this KVM
 static uint8_t *wox_exec_cumulative = NULL;   /* executed pages bitmap (entire run) */
 static uint64_t   *wox_first_exec_rip = NULL; /* first executed RIP per page (for precise logging) */
 static uint8_t    *wox_wox_detected = NULL;   /* bitmap: pages already reported as W+X this round */
+int wox_debug_reset_flag = 0;                 /* Debug: set by wox_reset_round, read by wox_bb_callback */
 
 static inline int wox_va_to_idx(uint32_t va)
 {
@@ -1444,9 +1445,10 @@ static void wox_take_content_snapshot(CPUState *cpu, CPUX86State *env)
         }
     }
 
-    nyx_printf("[WOX] Content snapshot: %d pages captured (%d MB)\n",
+    nyx_printf("[WOX] Content snapshot: %d pages captured (%d MB), CR3=0x%lx\n",
                wox_content_snapshot_pages,
-               (wox_content_snapshot_pages * 4096) / (1024 * 1024));
+               (wox_content_snapshot_pages * 4096) / (1024 * 1024),
+               (unsigned long)cr3);
 }
 
 /*
@@ -2069,8 +2071,17 @@ static void wox_final_wox_check(CPUState *cpu)
             exec_bitmap[i] = v;
             while (v) { exec_count++; v &= v - 1; }
         }
-    } else {
+    }
+    
+    if (exec_count == 0) {
         nyx_printf("[WOX] Final check: no execution data recorded.\n");
+        nyx_printf("[WOX-DEBUG] Possible causes:\n");
+        nyx_printf("[WOX-DEBUG]   1. PT not enabled or not decoding (check pt_enable logs)\n");
+        nyx_printf("[WOX-DEBUG]   2. wox_bb_callback never called (decoder issue)\n");
+        nyx_printf("[WOX-DEBUG]   3. All execution was outside user VA range (0x%x-0x%x)\n",
+                   WOX_USER_VA_START, WOX_USER_VA_END);
+        nyx_printf("[WOX-DEBUG]   4. IP filter range mismatch (execution outside filter)\n");
+        nyx_printf("[WOX-DEBUG] wox_exec_cumulative=%p\n", (void*)wox_exec_cumulative);
     }
 
     /* ===== DIAGNOSTIC: .text page presence check ===== */
@@ -2557,6 +2568,32 @@ static void wox_content_diff_report(CPUState *cpu, CPUX86State *env)
 
 void wox_bb_callback(void *opaque, int mode, uint64_t rip, uint64_t tsc)
 {
+    /* WOX-DEBUG: Log callback invocation count */
+    static uint64_t bb_callback_count = 0;
+    static int wox_detect_count = 0;  /* Track how many W+X detected in callback */
+    static int wox_round = 0;         /* Track reset rounds */
+    static uint64_t last_reset_count = 0;  /* Callback count at last reset */
+    static int post_reset_log_budget = 0;  /* Log budget after reset */
+    
+    bb_callback_count++;
+    
+    /* Log every 10000 callbacks */
+    if (bb_callback_count == 1 || bb_callback_count % 10000 == 0) {
+        nyx_debug_p(HYPERCALL_PREFIX, "[WOX-PT-DEBUG] wox_bb_callback #%lu: rip=0x%lx, mode=%d, round=%d\n",
+                    bb_callback_count, rip, mode, wox_round);
+    }
+    
+    /* Check if we just had a reset (detected by external flag) */
+    extern int wox_debug_reset_flag;  /* Set by wox_reset_round */
+    if (wox_debug_reset_flag) {
+        wox_round++;
+        last_reset_count = bb_callback_count;
+        post_reset_log_budget = 20;  /* Log first 20 callbacks after reset */
+        wox_debug_reset_flag = 0;
+        nyx_printf("[WOX-DEBUG] === RESET DETECTED === round=%d, callback_count=%lu\n",
+                   wox_round, bb_callback_count);
+    }
+    
     if (rip >= WOX_USER_VA_START && rip < WOX_USER_VA_END) {
         int idx = wox_va_to_idx((uint32_t)rip);
         if (!wox_exec_this_round) wox_exec_this_round = calloc(1, WOX_BITMAP_BYTES);
@@ -2576,10 +2613,20 @@ void wox_bb_callback(void *opaque, int mode, uint64_t rip, uint64_t tsc)
         if (wox_page_content && !wox_bitmap_test(wox_wox_detected, idx)) {
             uint32_t page_va = WOX_USER_VA_START + (uint32_t)idx * 0x1000;
             bool is_wox = false;
+            const char *wox_reason = NULL;
+            
+            /* DEBUG: Log post-reset callback details */
+            bool should_log = (post_reset_log_budget > 0);
+            if (should_log) {
+                post_reset_log_budget--;
+                nyx_printf("[WOX-POST-RESET] round=%d, rip=0x%08lx, page=0x%08x, ", wox_round, rip, page_va);
+                nyx_printf("page_content[idx]=%s\n", wox_page_content[idx] ? "EXISTS" : "NULL");
+            }
             
             if (!wox_page_content[idx]) {
                 /* Page didn't exist at snapshot time - new page executed = W+X */
                 is_wox = true;
+                wox_reason = "new_page";
             } else {
                 /* Compare current page content with snapshot */
                 uint8_t cur_page[4096];
@@ -2587,16 +2634,52 @@ void wox_bb_callback(void *opaque, int mode, uint64_t rip, uint64_t tsc)
                 if (!cr3) cr3 = (&(X86_CPU(qemu_get_cpu(0))->env))->cr[3] & 0x000FFFFFFFFFF000ULL;
                 
                 if (dump_page_cr3_ht(page_va, cur_page, qemu_get_cpu(0), cr3)) {
-                    if (memcmp(cur_page, wox_page_content[idx], 4096) != 0) {
+                    int cmp_result = memcmp(cur_page, wox_page_content[idx], 4096);
+                    
+                    /* DEBUG: Log comparison result for post-reset callbacks */
+                    if (should_log) {
+                        int diff_count = 0;
+                        for (int b = 0; b < 4096; b++) {
+                            if (cur_page[b] != wox_page_content[idx][b]) diff_count++;
+                        }
+                        nyx_printf("[WOX-POST-RESET] memcmp=%d, diff_bytes=%d\n", cmp_result, diff_count);
+                    }
+                    
+                    if (cmp_result != 0) {
                         is_wox = true;
+                        wox_reason = "content_changed";
+                        
+                        /* Debug: Log first few differing bytes for first few detections */
+                        if (wox_detect_count < 5) {
+                            int diff_count = 0;
+                            int first_diff = -1;
+                            for (int b = 0; b < 4096 && diff_count < 5; b++) {
+                                if (cur_page[b] != wox_page_content[idx][b]) {
+                                    if (first_diff < 0) first_diff = b;
+                                    diff_count++;
+                                }
+                            }
+                            nyx_debug_p(HYPERCALL_PREFIX, 
+                                "[WOX-DIFF] page 0x%08x: first_diff_offset=0x%x, diff_count>=%d, CR3=0x%lx\n",
+                                page_va, first_diff, diff_count, (unsigned long)cr3);
+                        }
+                    }
+                } else {
+                    /* Failed to read page - log this */
+                    if (wox_detect_count < 5 || should_log) {
+                        nyx_debug_p(HYPERCALL_PREFIX,
+                            "[WOX-DEBUG] dump_page_cr3_ht failed for page 0x%08x, CR3=0x%lx\n",
+                            page_va, (unsigned long)cr3);
                     }
                 }
             }
             
             if (is_wox) {
                 wox_bitmap_set(wox_wox_detected, idx);
-                nyx_printf("[WOX-PRECISE] W+X at RIP=0x%08lx (page 0x%08x)\n",
-                           (unsigned long)rip, page_va);
+                wox_detect_count++;
+                nyx_printf("[WOX-PRECISE] W+X #%d at RIP=0x%08lx (page 0x%08x) reason=%s round=%d\n",
+                           wox_detect_count, (unsigned long)rip, page_va, 
+                           wox_reason ? wox_reason : "unknown", wox_round);
             }
         }
     }
@@ -2696,6 +2779,10 @@ void wox_realtime_wox_check(CPUState *cpu)
  */
 void wox_reset_round(CPUState *cpu)
 {
+    /* DEBUG: Signal reset to wox_bb_callback for post-reset logging */
+    extern int wox_debug_reset_flag;
+    wox_debug_reset_flag = 1;
+
     if (wox_dirty_cumulative)
         memset(wox_dirty_cumulative, 0, WOX_BITMAP_BYTES);
 

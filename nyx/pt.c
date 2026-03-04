@@ -92,6 +92,14 @@ static inline int pt_ioctl(int fd, unsigned long request, unsigned long arg)
 
 void pt_dump(CPUState *cpu, int bytes)
 {
+    /* WOX-DEBUG: Log every pt_dump call */
+    static int pt_dump_call_count = 0;
+    pt_dump_call_count++;
+    nyx_debug_p(PT_PREFIX, "[WOX-PT-DEBUG] pt_dump called #%d: bytes=%d, in_fuzzing_mode=%d, decoder=%p, decoder_page_fault=%d\n",
+                pt_dump_call_count, bytes,
+                GET_GLOBAL_STATE()->in_fuzzing_mode,
+                (void*)GET_GLOBAL_STATE()->decoder,
+                GET_GLOBAL_STATE()->decoder_page_fault);
     if (!(GET_GLOBAL_STATE()->redqueen_state &&
           GET_GLOBAL_STATE()->redqueen_state->intercept_mode))
     {
@@ -135,6 +143,9 @@ void pt_dump(CPUState *cpu, int bytes)
 
 int pt_enable(CPUState *cpu, bool hmp_mode)
 {
+    nyx_debug_p(PT_PREFIX, "[WOX-PT-DEBUG] pt_enable called: pt_enabled=%d, hmp_mode=%d\n",
+                cpu->pt_enabled, hmp_mode);
+    
     if (!fast_reload_set_bitmap(get_fast_reload_snapshot())) {
         coverage_bitmap_reset();
     }
@@ -143,12 +154,16 @@ int pt_enable(CPUState *cpu, bool hmp_mode)
         alt_bitmap_reset();
     }
     pt_truncate_pt_dump_file();
-    return pt_cmd(cpu, KVM_VMX_PT_ENABLE, hmp_mode);
+    int result = pt_cmd(cpu, KVM_VMX_PT_ENABLE, hmp_mode);
+    nyx_debug_p(PT_PREFIX, "[WOX-PT-DEBUG] pt_enable result=%d (0=success)\n", result);
+    return result;
 }
 
 int pt_disable(CPUState *cpu, bool hmp_mode)
 {
+    nyx_debug_p(PT_PREFIX, "[WOX-PT-DEBUG] pt_disable called: pt_enabled=%d\n", cpu->pt_enabled);
     int r = pt_cmd(cpu, KVM_VMX_PT_DISABLE, hmp_mode);
+    nyx_debug_p(PT_PREFIX, "[WOX-PT-DEBUG] pt_disable result=%d\n", r);
     return r;
 }
 
@@ -218,6 +233,8 @@ int pt_enable_ip_filtering(CPUState *cpu, uint8_t addrn, bool redqueen, bool hmp
 
 void pt_init_decoder(CPUState *cpu)
 {
+    nyx_debug_p(PT_PREFIX, "[WOX-PT-DEBUG] pt_init_decoder called\n");
+    
     uint64_t filters[4][2] = { 0 };
 
     /* TODO time to clean up this code -.- */
@@ -229,6 +246,14 @@ void pt_init_decoder(CPUState *cpu)
     filters[2][1] = GET_GLOBAL_STATE()->pt_ip_filter_b[2];
     filters[3][0] = GET_GLOBAL_STATE()->pt_ip_filter_a[3];
     filters[3][1] = GET_GLOBAL_STATE()->pt_ip_filter_b[3];
+
+    nyx_debug_p(PT_PREFIX, "[WOX-PT-DEBUG] IP filters: [0] 0x%lx-0x%lx, [1] 0x%lx-0x%lx\n",
+                filters[0][0], filters[0][1], filters[1][0], filters[1][1]);
+    nyx_debug_p(PT_PREFIX, "[WOX-PT-DEBUG] IP filter configured: [0]=%d [1]=%d [2]=%d [3]=%d\n",
+                GET_GLOBAL_STATE()->pt_ip_filter_configured[0],
+                GET_GLOBAL_STATE()->pt_ip_filter_configured[1],
+                GET_GLOBAL_STATE()->pt_ip_filter_configured[2],
+                GET_GLOBAL_STATE()->pt_ip_filter_configured[3]);
 
     assert(GET_GLOBAL_STATE()->decoder == NULL);
     assert(GET_GLOBAL_STATE()->shared_bitmap_ptr != NULL);
@@ -252,10 +277,14 @@ void pt_init_decoder(CPUState *cpu)
         nyx_abort("libxdc_init() has failed ...\n");
     }
 
+    nyx_debug_p(PT_PREFIX, "[WOX-PT-DEBUG] decoder initialized: %p\n", (void*)GET_GLOBAL_STATE()->decoder);
+
     libxdc_register_bb_callback(GET_GLOBAL_STATE()->decoder,
                                 (void (*)(void *, disassembler_mode_t, uint64_t,
                                           uint64_t))wox_bb_callback,
                                 NULL);
+
+    nyx_debug_p(PT_PREFIX, "[WOX-PT-DEBUG] wox_bb_callback registered\n");
 
     alt_bitmap_init(GET_GLOBAL_STATE()->shared_bitmap_ptr,
                     GET_GLOBAL_STATE()->shared_bitmap_size);
@@ -426,6 +455,15 @@ void pt_handle_overflow(CPUState *cpu)
 {
     pthread_mutex_lock(&pt_dump_mutex);
     int overflow = ioctl(cpu->pt_fd, KVM_VMX_PT_CHECK_TOPA_OVERFLOW, (unsigned long)0);
+    
+    /* WOX-DEBUG: Log overflow check */
+    static int overflow_check_count = 0;
+    overflow_check_count++;
+    if (overflow_check_count % 1000 == 1 || overflow > 0) {
+        nyx_debug_p(PT_PREFIX, "[WOX-PT-DEBUG] pt_handle_overflow #%d: overflow=%d bytes, pt_fd=%d, pt_enabled=%d\n",
+                    overflow_check_count, overflow, cpu->pt_fd, cpu->pt_enabled);
+    }
+    
     if (overflow > 0) {
         pt_dump(cpu, overflow);
     }
