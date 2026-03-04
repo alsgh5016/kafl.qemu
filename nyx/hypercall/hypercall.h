@@ -155,6 +155,11 @@ void wox_take_snapshot(CPUState *cpu);
 void wox_final_dirty_report(CPUState *cpu);
 /* Reset W+X tracking for multi-round detection */
 void wox_reset_round(CPUState *cpu);
+/* Real-time W⊕X via PT */
+void *wox_live_page_fetch(void *opaque, uint64_t page, bool *success);
+void wox_bb_callback(void *opaque, int mode, uint64_t rip, uint64_t tsc);
+void wox_realtime_wox_check(CPUState *cpu);
+
 void pt_enable_rqo(CPUState *cpu);
 void pt_disable_rqo(CPUState *cpu);
 void pt_enable_rqi(CPUState *cpu);

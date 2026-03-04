@@ -243,8 +243,8 @@ void pt_init_decoder(CPUState *cpu)
     }
 
     GET_GLOBAL_STATE()->decoder =
-        libxdc_init(filters, (void *(*)(void *, uint64_t, bool *))page_cache_fetch2,
-                    GET_GLOBAL_STATE()->page_cache,
+        libxdc_init(filters, (void *(*)(void *, uint64_t, bool *))wox_live_page_fetch,
+                    NULL, /* We don't need opaque page_cache for live fetch */
                     GET_GLOBAL_STATE()->shared_bitmap_ptr,
                     GET_GLOBAL_STATE()->shared_bitmap_size);
 
@@ -254,8 +254,8 @@ void pt_init_decoder(CPUState *cpu)
 
     libxdc_register_bb_callback(GET_GLOBAL_STATE()->decoder,
                                 (void (*)(void *, disassembler_mode_t, uint64_t,
-                                          uint64_t))redqueen_callback,
-                                GET_GLOBAL_STATE()->redqueen_state);
+                                          uint64_t))wox_bb_callback,
+                                NULL);
 
     alt_bitmap_init(GET_GLOBAL_STATE()->shared_bitmap_ptr,
                     GET_GLOBAL_STATE()->shared_bitmap_size);
@@ -429,6 +429,14 @@ void pt_handle_overflow(CPUState *cpu)
     if (overflow > 0) {
         pt_dump(cpu, overflow);
     }
+    
+    /* Prevent libxdc page faults from aborting the guest execution loop.
+     * We are reading live memory, so unmapped pages might temporarily occur.
+     * Just let the decoder resync on the next PSB packet. */
+    if (GET_GLOBAL_STATE()->decoder_page_fault) {
+        GET_GLOBAL_STATE()->decoder_page_fault = false;
+    }
+    
     pthread_mutex_unlock(&pt_dump_mutex);
 }
 
@@ -442,4 +450,6 @@ void pt_post_kvm_run(CPUState *cpu)
     /* Periodic dirty-page scan (rate-limited, CR3-filtered) */
     wox_periodic_dirty_scan(cpu);
     wox_accumulate_dirty_bits(cpu);
+
+    wox_realtime_wox_check(cpu);
 }

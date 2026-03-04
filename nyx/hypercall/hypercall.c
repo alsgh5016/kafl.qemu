@@ -103,6 +103,8 @@ static int dump_seq_counter = 0;
 static void dump_worker_init(void);
 static void dump_worker_drain(void);
 static void dump_worker_enqueue(dump_job_t *job);
+
+
 static void wox_final_wox_check(CPUState *cpu);
 static void wox_offline_pt_decode(CPUState *cpu);
 
@@ -244,11 +246,11 @@ void handle_hypercall_kafl_acquire(struct kvm_run *run,
                  * is required so libxdc_decode() can populate page_cache
                  * with executed-page addresses for W⊕X detection.
                  */
-                // [LAZY] if (GET_GLOBAL_STATE()->nyx_pt &&
-                //     GET_GLOBAL_STATE()->cap_compile_time_tracing == false) {
-                //     pt_init_decoder(cpu);
-                //     nyx_printf("[WOX] PT decoder initialized (single-shot mode)\n");
-                // }
+                if (GET_GLOBAL_STATE()->nyx_pt &&
+                    GET_GLOBAL_STATE()->cap_compile_time_tracing == false) {
+                    pt_init_decoder(cpu);
+                    nyx_printf("[WOX] PT decoder initialized (real-time in-memory mode)\n");
+                }
                 GET_GLOBAL_STATE()->in_fuzzing_mode = true;
                 setup_snapshot_once = true;
 
@@ -1463,13 +1465,8 @@ void wox_take_snapshot(CPUState *cpu)
     nyx_printf("[WOX] Dirty-bit snapshot taken: %d baseline dirty pages\n",
                baseline);
 
-    /* Content snapshot only at initial ACQUIRE (harness CR3, small).
-     * Skip during round reset (target CR3, thousands of pages = too slow). */
-    static bool initial_snapshot_done = false;
-    if (!initial_snapshot_done) {
-        wox_take_content_snapshot(cpu, env);
-        initial_snapshot_done = true;
-    }
+    /* Always update content snapshot so we can diff the next layer */
+    wox_take_content_snapshot(cpu, env);
 }
 
 /*
@@ -1897,7 +1894,7 @@ void wox_periodic_dirty_scan(CPUState *cpu)
     }
 
     free(wox_addrs);
-    free(exec_pages);
+    
 }
 
 /* Forward declaration */
@@ -2050,24 +2047,19 @@ static void wox_final_wox_check(CPUState *cpu)
      * This captures dirty bits that were set during execution but cleared
      * by VirtualProtect() before RELEASE (e.g., VMP restoring .text to RX).
      * wox_accumulate_dirty_bits() collected them periodically during execution. */
-    uint8_t *all_dirty = wox_dirty_cumulative;
 
-    /* Get executed pages */
-    page_cache_t *pc = GET_GLOBAL_STATE()->page_cache;
-    if (!pc || !GET_GLOBAL_STATE()->decoder) {
-        nyx_printf("[WOX] Final check: decoder not ready, skipping\n");
-        return;
-    }
-
-    int max_exec = 65536;
-    uint64_t *exec_pages = malloc(max_exec * sizeof(uint64_t));
-    int exec_count = page_cache_get_executed_pages(pc, exec_pages, max_exec);
-
+    /* Get executed pages from our cumulative real-time tracker */
+    int exec_count = 0;
     uint8_t *exec_bitmap = calloc(1, WOX_BITMAP_BYTES);
-    for (int e = 0; e < exec_count; e++) {
-        uint64_t va = exec_pages[e];
-        if (va >= WOX_USER_VA_START && va < WOX_USER_VA_END)
-            wox_bitmap_set(exec_bitmap, wox_va_to_idx((uint32_t)va));
+    
+    if (wox_exec_cumulative) {
+        for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+            uint8_t v = wox_exec_cumulative[i];
+            exec_bitmap[i] = v;
+            while (v) { exec_count++; v &= v - 1; }
+        }
+    } else {
+        nyx_printf("[WOX] Final check: no execution data recorded.\n");
     }
 
     /* ===== DIAGNOSTIC: .text page presence check ===== */
@@ -2098,21 +2090,26 @@ static void wox_final_wox_check(CPUState *cpu)
         /* Exec pages: show VA range and count in target image range */
         uint64_t min_exec = UINT64_MAX, max_exec = 0;
         int exec_in_image = 0;
-        for (int e = 0; e < exec_count; e++) {
-            if (exec_pages[e] < min_exec) min_exec = exec_pages[e];
-            if (exec_pages[e] > max_exec) max_exec = exec_pages[e];
-            if (exec_pages[e] >= 0x400000 && exec_pages[e] < 0xB4A000)
-                exec_in_image++;
+        int printed_execs = 0;
+        nyx_printf("[WOX-DIAG] First 20 exec pages:\n");
+        for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+            if (!exec_bitmap[i]) continue;
+            for (int bit = 0; bit < 8; bit++) {
+                if (exec_bitmap[i] & (1 << bit)) {
+                    uint32_t va = WOX_USER_VA_START + (i * 8 + bit) * 0x1000;
+                    if (va < min_exec) min_exec = va;
+                    if (va > max_exec) max_exec = va;
+                    if (va >= 0x400000 && va < 0xB4A000) exec_in_image++;
+                    if (printed_execs < 20) {
+                        nyx_printf("[WOX-DIAG]   [%d] 0x%08x\n", printed_execs, va);
+                        printed_execs++;
+                    }
+                }
+            }
         }
         nyx_printf("[WOX-DIAG] exec VA range: 0x%lx - 0x%lx (total=%d, in_image=%d)\n",
                    (unsigned long)min_exec, (unsigned long)max_exec,
                    exec_count, exec_in_image);
-
-        /* Show first 20 exec pages sorted for inspection */
-        nyx_printf("[WOX-DIAG] First 20 exec pages:\n");
-        for (int e = 0; e < exec_count && e < 20; e++) {
-            nyx_printf("[WOX-DIAG]   [%d] 0x%lx\n", e, (unsigned long)exec_pages[e]);
-        }
 
         /* Dirty pages in image range (0x400000-0xB4A000) */
         int dirty_in_image = 0;
@@ -2269,7 +2266,7 @@ static void wox_final_wox_check(CPUState *cpu)
     free(wox_addrs);
     free(current_dirty);
     free(exec_bitmap);
-    free(exec_pages);
+    
 }
 
 void wox_final_dirty_report(CPUState *cpu)
@@ -2541,6 +2538,107 @@ static void wox_content_diff_report(CPUState *cpu, CPUX86State *env)
     free(cur_mapped);
 }
 
+
+/* =========================================================================
+ * Real-Time W+X In-Memory PT Decoding
+ * ========================================================================= */
+
+static uint8_t *wox_exec_this_round = NULL;
+static uint8_t *wox_exec_cumulative = NULL;
+
+void wox_bb_callback(void *opaque, int mode, uint64_t rip, uint64_t tsc)
+{
+    if (rip >= WOX_USER_VA_START && rip < WOX_USER_VA_END) {
+        int idx = wox_va_to_idx((uint32_t)rip);
+        if (!wox_exec_this_round) wox_exec_this_round = calloc(1, WOX_BITMAP_BYTES);
+        if (!wox_exec_cumulative) wox_exec_cumulative = calloc(1, WOX_BITMAP_BYTES);
+        
+        wox_bitmap_set(wox_exec_this_round, idx);
+        wox_bitmap_set(wox_exec_cumulative, idx);
+    }
+}
+
+static uint8_t *wox_live_page_cache[WOX_PAGE_COUNT] = {0};
+
+void *wox_live_page_fetch(void *opaque, uint64_t page, bool *success)
+{
+    if (page >= WOX_USER_VA_START && page < WOX_USER_VA_END) {
+        int idx = wox_va_to_idx((uint32_t)page);
+        if (!wox_live_page_cache[idx]) {
+            wox_live_page_cache[idx] = malloc(4096);
+        }
+        
+        uint64_t cr3 = GET_GLOBAL_STATE()->parent_cr3;
+        if (!cr3) cr3 = (&(X86_CPU(qemu_get_cpu(0))->env))->cr[3] & 0x000FFFFFFFFFF000ULL;
+        
+        bool ok = dump_page_cr3_ht(page, wox_live_page_cache[idx], qemu_get_cpu(0), cr3);
+        if (!ok) {
+            ok = dump_page_cr3_ht(page, wox_live_page_cache[idx], qemu_get_cpu(0), GET_GLOBAL_STATE()->pt_c3_filter);
+        }
+        
+        *success = ok;
+        if (ok) return wox_live_page_cache[idx];
+    }
+    
+    *success = false;
+    return NULL;
+}
+
+void wox_realtime_wox_check(CPUState *cpu)
+{
+    if (!wox_exec_this_round || !wox_page_content) return;
+
+    CPUX86State *env = &(X86_CPU(cpu)->env);
+    uint64_t cr3 = GET_GLOBAL_STATE()->parent_cr3 ? GET_GLOBAL_STATE()->parent_cr3 : (env->cr[3] & 0x000FFFFFFFFFF000ULL);
+
+    int wox_count = 0;
+    uint8_t cur_page[4096];
+
+    for (int i = 0; i < WOX_BITMAP_BYTES; i++) {
+        uint8_t exec_byte = wox_exec_this_round[i];
+        if (!exec_byte) continue;
+        for (int bit = 0; bit < 8; bit++) {
+            if (exec_byte & (1 << bit)) {
+                int idx = i * 8 + bit;
+                uint32_t va = WOX_USER_VA_START + (uint32_t)idx * 0x1000;
+                
+                /* Was it modified compared to our content snapshot? */
+                bool ok = dump_page_cr3_ht(va, cur_page, cpu, cr3);
+                if (!ok) continue;
+
+                int is_wx = 0;
+                if (!wox_page_content[idx]) {
+                    is_wx = 1;
+                } else if (memcmp(cur_page, wox_page_content[idx], 4096) != 0) {
+                    is_wx = 1;
+                }
+
+                if (is_wx) {
+                    if (wox_count == 0) {
+                        nyx_printf("\n==================================================\n");
+                        nyx_printf("[WOX-REALTIME] *** W+X DETECTED IN REAL-TIME ***\n");
+                    }
+                    nyx_printf("[WOX-REALTIME] W+X detected at 0x%08x\n", va);
+                    wox_count++;
+                }
+            }
+        }
+    }
+
+    if (wox_count > 0) {
+        static int real_round = 0;
+        char dump_label[64];
+        snprintf(dump_label, sizeof(dump_label), "wox_realtime_%d", real_round++);
+        nyx_printf("[WOX-REALTIME] Triggering memory dump for %d W+X pages...\n", wox_count);
+        nyx_printf("==================================================\n\n");
+        
+        dump_full_process_memory(cpu, env, dump_label);
+        wox_reset_round(cpu);
+    }
+
+    memset(wox_exec_this_round, 0, WOX_BITMAP_BYTES);
+}
+
 /*
  * Reset W+X tracking for multi-round detection.
  * Clears cumulative dirty bitmap and re-takes both dirty-bit and
@@ -2569,7 +2667,7 @@ void wox_reset_round(CPUState *cpu)
             if (va >= WOX_USER_VA_START && va < WOX_USER_VA_END)
                 wox_bitmap_set(wox_exec_baseline, wox_va_to_idx((uint32_t)va));
         }
-        free(exec_pages);
+        
         nyx_printf("[WOX] Execution baseline saved: %d pages\n", exec_count);
     }
 
@@ -2653,7 +2751,7 @@ static void wox_detect(CPUState *cpu, CPUX86State *env, const char *trigger)
                 }
             }
         }
-        free(exec_pages);
+        
     }
 
     /* NX-bit fallback: PT decoder inactive or page_cache empty */
