@@ -297,8 +297,8 @@ void wte_scan_dirty_ring(void)
     if (new_pages > 0 || updated_pages > 0) {
         nyx_printf("[WtE] Scanned ring: %d new, %d updated dirty pages ",
                    new_pages, updated_pages);
-        nyx_printf("(total tracked: %u, diff_at_scan: %d)\n",
-                   kh_size(wte_state.dirty_map), diff_at_scan);
+        nyx_printf("(total tracked: %lu, diff_at_scan: %d)\n",
+                   (unsigned long)kh_size(wte_state.dirty_map), diff_at_scan);
     }
 }
 
@@ -402,7 +402,7 @@ void wte_print_debug_summary(void)
 {
     nyx_printf("[WtE][DBG] === BB_CALLBACK SUMMARY === "
                "total=%lu tfail=%lu miss=%lu dirty_hit=%lu diff0=%lu "
-               "exec_dup=%lu wte=%lu dirty_map_size=%u\n",
+               "exec_dup=%lu wte=%lu dirty_map_size=%lu\n",
                (unsigned long)dbg_bb_total_calls,
                (unsigned long)dbg_bb_translate_fail,
                (unsigned long)dbg_bb_dirty_miss,
@@ -410,7 +410,7 @@ void wte_print_debug_summary(void)
                (unsigned long)dbg_bb_diff_zero,
                (unsigned long)dbg_bb_exec_already,
                (unsigned long)dbg_bb_wte_hit,
-               kh_size(wte_state.dirty_map));
+               (unsigned long)kh_size(wte_state.dirty_map));
 }
 
 /*
