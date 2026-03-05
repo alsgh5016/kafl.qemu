@@ -2569,10 +2569,11 @@ void wox_bb_callback(void *opaque, int mode, uint64_t rip, uint64_t tsc)
     
     bb_callback_count++;
     
-    /* Log every 10000 callbacks */
-    if (bb_callback_count == 1 || bb_callback_count % 10000 == 0) {
-        nyx_debug_p(HYPERCALL_PREFIX, "[WOX-PT-DEBUG] wox_bb_callback #%lu: rip=0x%lx, mode=%d, round=%d\n",
-                    bb_callback_count, rip, mode, wox_round);
+    /* DIAG: Log first callback + periodic */
+    if (bb_callback_count == 1) {
+        nyx_printf("[WOX-DIAG] wox_bb_callback FIRST CALL: rip=0x%lx, mode=%d\n", rip, mode);
+    } else if (bb_callback_count % 10000 == 0) {
+        nyx_printf("[WOX-DIAG] wox_bb_callback #%lu: rip=0x%lx\n", bb_callback_count, rip);
     }
     
     /* Check if we just had a reset (detected by external flag) */
