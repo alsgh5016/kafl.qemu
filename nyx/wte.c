@@ -35,6 +35,15 @@ extern uint32_t              kvm_dirty_gfns_index_mask;
 
 static wte_state_t wte_state;
 
+/* ── Debug Counters (bb_callback stats) ────────────────────────────── */
+
+static uint64_t dbg_bb_total_calls   = 0;
+static uint64_t dbg_bb_translate_fail = 0;
+static uint64_t dbg_bb_dirty_miss     = 0;
+static uint64_t dbg_bb_exec_already   = 0;
+static uint64_t dbg_bb_diff_zero      = 0;
+static uint64_t dbg_bb_wte_hit        = 0;
+
 /* ── Helpers ───────────────────────────────────────────────────── */
 
 /*
@@ -208,11 +217,12 @@ void wte_scan_dirty_ring(void)
 
     uint32_t scan_idx = wte_state.last_scanned_ring_index;
     int      new_pages = 0;
+    int      updated_pages = 0;
+    int      diff_at_scan = 0;  /* pages with diff_count > 0 at scan time */
 
     while (true) {
         uint32_t ring_idx = scan_idx & kvm_dirty_gfns_index_mask;
         struct kvm_dirty_gfn *entry = &kvm_dirty_gfns[ring_idx];
-
 
         if ((entry->flags & 0x1) == 0) {
             break;
@@ -221,11 +231,9 @@ void wte_scan_dirty_ring(void)
         uint64_t gfn = entry->offset;
         uint64_t gpa = gfn << 12;
 
-
         khiter_t k = kh_get(WTE_DIRTY, wte_state.dirty_map, gfn);
 
         if (k == kh_end(wte_state.dirty_map)) {
-
             wte_page_info_t *info = malloc(sizeof(wte_page_info_t));
             memset(info, 0, sizeof(wte_page_info_t));
             info->gpa = gpa;
@@ -237,9 +245,16 @@ void wte_scan_dirty_ring(void)
             /* Read current content (post-write) */
             cpu_physical_memory_read(gpa, info->current, WTE_PAGE_SIZE);
 
-
             wte_compute_diff(info);
 
+            /* DEBUG: log first 10 new dirty pages */
+            if (new_pages < 10) {
+                nyx_printf("[WtE][DBG] new dirty GFN=0x%lx GPA=0x%lx diff_count=%d\n",
+                           (unsigned long)gfn, (unsigned long)gpa, info->diff_count);
+            }
+            if (info->diff_count > 0) {
+                diff_at_scan++;
+            }
 
             int ret;
             k = kh_put(WTE_DIRTY, wte_state.dirty_map, gfn, &ret);
@@ -247,10 +262,13 @@ void wte_scan_dirty_ring(void)
 
             new_pages++;
         } else {
-
             wte_page_info_t *info = kh_value(wte_state.dirty_map, k);
             cpu_physical_memory_read(gpa, info->current, WTE_PAGE_SIZE);
             wte_compute_diff(info);
+            updated_pages++;
+            if (info->diff_count > 0) {
+                diff_at_scan++;
+            }
         }
 
         scan_idx++;
@@ -258,9 +276,11 @@ void wte_scan_dirty_ring(void)
 
     wte_state.last_scanned_ring_index = scan_idx;
 
-    if (new_pages > 0) {
-        nyx_printf("[WtE] Scanned ring: %d new dirty pages (total tracked: %u)\n",
-                   new_pages, kh_size(wte_state.dirty_map));
+    if (new_pages > 0 || updated_pages > 0) {
+        nyx_printf("[WtE] Scanned ring: %d new, %d updated dirty pages ",
+                   new_pages, updated_pages);
+        nyx_printf("(total tracked: %u, diff_at_scan: %d)\n",
+                   kh_size(wte_state.dirty_map), diff_at_scan);
     }
 }
 
@@ -273,8 +293,17 @@ void wte_scan_dirty_ring(void)
 void wte_bb_callback(void *opaque, disassembler_mode_t mode,
                      uint64_t ip, uint64_t tsc)
 {
+
     if (!wte_state.active) {
         return;
+    }
+
+    dbg_bb_total_calls++;
+
+    /* Log first 5 bb_callback invocations */
+    if (dbg_bb_total_calls <= 5) {
+        nyx_printf("[WtE][DBG] bb_callback #%lu: ip=0x%lx mode=%d\n",
+                   (unsigned long)dbg_bb_total_calls, (unsigned long)ip, mode);
     }
 
     /*
@@ -285,20 +314,33 @@ void wte_bb_callback(void *opaque, disassembler_mode_t mode,
     uint64_t phys_addr = get_paging_phys_addr(cpu, wte_state.target_cr3, ip);
 
     if (phys_addr == (uint64_t)-1) {
-        /* Translation failed — page not mapped, ignore */
+        dbg_bb_translate_fail++;
+        if (dbg_bb_translate_fail <= 5) {
+            nyx_printf("[WtE][DBG] translate FAIL: ip=0x%lx cr3=0x%lx\n",
+                       (unsigned long)ip, (unsigned long)wte_state.target_cr3);
+        }
         return;
     }
 
     uint64_t gfn = phys_addr >> 12;
 
-
     khiter_t k = kh_get(WTE_DIRTY, wte_state.dirty_map, gfn);
     if (k == kh_end(wte_state.dirty_map)) {
+        dbg_bb_dirty_miss++;
+        if (dbg_bb_dirty_miss <= 5) {
+            nyx_printf("[WtE][DBG] dirty_map MISS: ip=0x%lx gfn=0x%lx phys=0x%lx\n",
+                       (unsigned long)ip, (unsigned long)gfn, (unsigned long)phys_addr);
+        }
         return;
     }
 
+    /* HIT: ip lands on a dirty page */
+    nyx_printf("[WtE][DBG] dirty_map HIT: ip=0x%lx gfn=0x%lx\n",
+               (unsigned long)ip, (unsigned long)gfn);
+
     khiter_t ek = kh_get(WTE_EXEC, wte_state.exec_map, gfn);
     if (ek != kh_end(wte_state.exec_map)) {
+        dbg_bb_exec_already++;
         return;
     }
     wte_page_info_t *info = kh_value(wte_state.dirty_map, k);
@@ -311,27 +353,46 @@ void wte_bb_callback(void *opaque, disassembler_mode_t mode,
     cpu_physical_memory_read(info->gpa, info->current, WTE_PAGE_SIZE);
     wte_compute_diff(info);
 
+    nyx_printf("[WtE][DBG] dirty HIT detail: gfn=0x%lx gpa=0x%lx diff_count=%d\n",
+               (unsigned long)gfn, (unsigned long)info->gpa, info->diff_count);
 
     if (info->diff_count == 0) {
+        dbg_bb_diff_zero++;
         return;
     }
 
-
-
+    /* Confirmed WtE */
     int ret;
     ek = kh_put(WTE_EXEC, wte_state.exec_map, gfn, &ret);
     kh_value(wte_state.exec_map, ek) = ip;
 
     wte_state.wte_count++;
     wte_state.total_wte_count++;
+    dbg_bb_wte_hit++;
 
     nyx_printf("[WtE] *** WRITTEN-THEN-EXECUTED ***  round=%d  RIP=0x%lx  "
                "GFN=0x%lx  GPA=0x%lx  diffs=%d\n",
                wte_state.round, (unsigned long)ip, (unsigned long)gfn,
                (unsigned long)info->gpa, info->diff_count);
 
-
     wte_dump_detection(ip, gfn, info, cpu);
+}
+
+/* ── Debug summary — call after pt_dump completes to see bb_callback stats ─── */
+
+void wte_print_debug_summary(void)
+{
+    nyx_printf("[WtE][DBG] === BB_CALLBACK SUMMARY === "
+               "total=%lu tfail=%lu miss=%lu dirty_hit=%lu diff0=%lu "
+               "exec_dup=%lu wte=%lu dirty_map_size=%u\n",
+               (unsigned long)dbg_bb_total_calls,
+               (unsigned long)dbg_bb_translate_fail,
+               (unsigned long)dbg_bb_dirty_miss,
+               (unsigned long)(dbg_bb_diff_zero + dbg_bb_wte_hit),
+               (unsigned long)dbg_bb_diff_zero,
+               (unsigned long)dbg_bb_exec_already,
+               (unsigned long)dbg_bb_wte_hit,
+               kh_size(wte_state.dirty_map));
 }
 
 /*

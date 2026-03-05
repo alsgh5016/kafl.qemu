@@ -361,6 +361,12 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
             }
 
             synchronization_disable_pt(cpu);
+
+            /* WtE: print debug summary after pt_dump (bb_callbacks done) */
+            if (wte_is_active()) {
+                wte_print_debug_summary();
+            }
+
             release_print_once(cpu);
         }
     }

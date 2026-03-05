@@ -87,4 +87,7 @@ void wte_reset_round(void);
 bool        wte_is_active(void);
 wte_state_t *wte_get_state(void);
 
+/* Debug */
+void wte_print_debug_summary(void);
+
 
