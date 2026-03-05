@@ -2694,11 +2694,22 @@ void *wox_live_page_fetch(void *opaque, uint64_t page, bool *success)
         if (!ok) {
             ok = dump_page_cr3_ht(page, wox_live_page_cache[idx], qemu_get_cpu(0), GET_GLOBAL_STATE()->pt_c3_filter);
         }
-        
-        *success = ok;
-        if (ok) return wox_live_page_cache[idx];
+
+        if (ok) {
+            *success = true;
+            return wox_live_page_cache[idx];
+        }
+
+        /* Fallback: use content snapshot when live page fetch fails.
+         * This prevents decoder_page_fault from discarding the entire
+         * remaining PT buffer when pages are transiently unmapped
+         * during packer execution. */
+        if (wox_page_content && wox_page_content[idx]) {
+            memcpy(wox_live_page_cache[idx], wox_page_content[idx], 4096);
+            *success = true;
+            return wox_live_page_cache[idx];
+        }
     }
-    
     *success = false;
     return NULL;
 }
