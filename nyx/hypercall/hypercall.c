@@ -357,17 +357,23 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
                 GET_GLOBAL_STATE()->starved = 0;
             }
 
-            /* WtE: scan dirty ring BEFORE pt_disable so dirty_map
-             * is populated when bb_callback fires during pt_dump. */
             if (wte_is_active()) {
+                /* WtE: scan dirty ring BEFORE pt_disable so dirty_map
+                 * is populated when bb_callback fires during pt_dump. */
                 wte_scan_dirty_ring();
-            }
 
-            synchronization_disable_pt(cpu);
+                /* Temporarily disable reload mode to prevent perform_reload()
+                 * from restoring the WOX_SNAPSHOT. This allows the harness
+                 * do-while loop to continue for multi-round WtE detection. */
+                bool saved_reload_mode = GET_GLOBAL_STATE()->in_reload_mode;
+                GET_GLOBAL_STATE()->in_reload_mode = false;
 
-            /* WtE: check deferred BBs that missed dirty_map during overflow,
-             * then print debug summary. */
-            if (wte_is_active()) {
+                synchronization_disable_pt(cpu);
+
+                GET_GLOBAL_STATE()->in_reload_mode = saved_reload_mode;
+
+                /* Check deferred BBs that missed dirty_map during overflow,
+                 * then print debug summary. */
                 wte_check_deferred_bbs();
                 wte_print_debug_summary();
                 int wte_count = wte_get_state()->wte_count;
@@ -377,9 +383,12 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
                 if (wte_count > 0) {
                     wte_reset_round();
                 }
+            } else {
+                synchronization_disable_pt(cpu);
             }
 
             release_print_once(cpu);
+
         }
     }
 }
