@@ -45,6 +45,16 @@ static uint64_t dbg_bb_exec_already   = 0;
 static uint64_t dbg_bb_diff_zero      = 0;
 static uint64_t dbg_bb_wte_hit        = 0;
 
+static void wte_reset_debug_counters(void)
+{
+    dbg_bb_total_calls    = 0;
+    dbg_bb_translate_fail = 0;
+    dbg_bb_dirty_miss     = 0;
+    dbg_bb_exec_already   = 0;
+    dbg_bb_diff_zero      = 0;
+    dbg_bb_wte_hit        = 0;
+}
+
 /* ── Helpers ───────────────────────────────────────────────────── */
 
 /*
@@ -270,8 +280,8 @@ void wte_scan_dirty_ring(void)
             cpu_physical_memory_read(gpa, info->current, WTE_PAGE_SIZE);
 
             wte_compute_diff(info);
-            /* DEBUG: log first 10 new dirty pages */
-            if (new_pages < 10) {
+            /* DEBUG: log first 3 new dirty pages */
+            if (new_pages < 3) {
                 nyx_printf("[WtE][DBG] new dirty GFN=0x%lx GPA=0x%lx diff_count=%d\n",
                            (unsigned long)gfn, (unsigned long)gpa, info->diff_count);
             }
@@ -323,12 +333,6 @@ void wte_bb_callback(void *opaque, disassembler_mode_t mode,
 
     dbg_bb_total_calls++;
 
-    /* Log first 5 bb_callback invocations */
-    if (dbg_bb_total_calls <= 5) {
-        nyx_printf("[WtE][DBG] bb_callback #%lu: ip=0x%lx mode=%d\n",
-                   (unsigned long)dbg_bb_total_calls, (unsigned long)ip, mode);
-    }
-
     /*
      * Convert virtual IP → physical GFN.
      * Use the target process CR3 for translation.
@@ -338,7 +342,7 @@ void wte_bb_callback(void *opaque, disassembler_mode_t mode,
 
     if (phys_addr == (uint64_t)-1) {
         dbg_bb_translate_fail++;
-        if (dbg_bb_translate_fail <= 5) {
+        if (dbg_bb_translate_fail <= 3) {
             nyx_printf("[WtE][DBG] translate FAIL: ip=0x%lx cr3=0x%lx\n",
                        (unsigned long)ip, (unsigned long)wte_state.target_cr3);
         }
@@ -350,19 +354,11 @@ void wte_bb_callback(void *opaque, disassembler_mode_t mode,
     khiter_t k = kh_get(WTE_DIRTY, wte_state.dirty_map, gfn);
     if (k == kh_end(wte_state.dirty_map)) {
         dbg_bb_dirty_miss++;
-        if (dbg_bb_dirty_miss <= 5) {
-            nyx_printf("[WtE][DBG] dirty_map MISS: ip=0x%lx gfn=0x%lx phys=0x%lx\n",
-                       (unsigned long)ip, (unsigned long)gfn, (unsigned long)phys_addr);
-        }
         /* Defer this IP for later re-check when dirty_map is complete */
         int defer_ret;
         kh_put(WTE_BB_DEFER, wte_state.bb_deferred, ip, &defer_ret);
         return;
     }
-
-    /* HIT: ip lands on a dirty page */
-    nyx_printf("[WtE][DBG] dirty_map HIT: ip=0x%lx gfn=0x%lx\n",
-               (unsigned long)ip, (unsigned long)gfn);
 
     khiter_t ek = kh_get(WTE_EXEC, wte_state.exec_map, gfn);
     if (ek != kh_end(wte_state.exec_map)) {
@@ -378,9 +374,6 @@ void wte_bb_callback(void *opaque, disassembler_mode_t mode,
      */
     cpu_physical_memory_read(info->gpa, info->current, WTE_PAGE_SIZE);
     wte_compute_diff(info);
-
-    nyx_printf("[WtE][DBG] dirty HIT detail: gfn=0x%lx gpa=0x%lx diff_count=%d\n",
-               (unsigned long)gfn, (unsigned long)info->gpa, info->diff_count);
 
     if (info->diff_count == 0) {
         dbg_bb_diff_zero++;
@@ -456,8 +449,11 @@ void wte_reset_round(void)
 
     wte_state.round++;
     wte_state.wte_count = 0;
+    wte_state.overflow_count = 0;
 
+    wte_reset_debug_counters();
 
+    /* Sync to current dirty ring index so we only scan new entries */
     wte_state.last_scanned_ring_index = kvm_dirty_gfns_index;
 
     nyx_printf("[WtE] Round %d started. Tracking from clean state.\n",

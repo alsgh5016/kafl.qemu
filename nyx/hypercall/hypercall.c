@@ -370,6 +370,9 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
             if (wte_is_active()) {
                 wte_check_deferred_bbs();
                 wte_print_debug_summary();
+                if (wte_get_state()->wte_count > 0) {
+                    wte_reset_round();
+                }
             }
 
             release_print_once(cpu);
@@ -1531,7 +1534,9 @@ int handle_kafl_hypercall(struct kvm_run *run,
             wte_activate(guest_cr3, false);
             nyx_printf("[WtE] WtE tracking activated (baseline snapshot)\n");
         } else {
-            nyx_printf("[WtE] WtE already active, skipping re-init\n");
+            wte_reset_round();
+            nyx_printf("[WtE] WtE already active — forced round reset (round %d)\n",
+                       wte_get_state()->round);
         }
         ret = 0;
         break;

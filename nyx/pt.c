@@ -93,9 +93,6 @@ static inline int pt_ioctl(int fd, unsigned long request, unsigned long arg)
 
 void pt_dump(CPUState *cpu, int bytes)
 {
-    static int pt_dump_call_count = 0;
-    pt_dump_call_count++;
-
     if (!(GET_GLOBAL_STATE()->redqueen_state &&
           GET_GLOBAL_STATE()->redqueen_state->intercept_mode))
     {
@@ -106,14 +103,6 @@ void pt_dump(CPUState *cpu, int bytes)
             GET_GLOBAL_STATE()->pt_trace_size += bytes;
             pt_write_pt_dump_file(cpu->pt_mmap, bytes);
 
-            if (pt_dump_call_count <= 5) {
-                nyx_warn("[WtE][DBG] pt_dump #%d: bytes=%d in_fuzzing=%d decoder=%p decoder_page_fault=%d dump_page=%d\n",
-                    pt_dump_call_count, bytes,
-                    GET_GLOBAL_STATE()->in_fuzzing_mode,
-                    (void *)GET_GLOBAL_STATE()->decoder,
-                    GET_GLOBAL_STATE()->decoder_page_fault,
-                    GET_GLOBAL_STATE()->dump_page);
-            }
             /* Only decode if decoder was initialized (requires snapshot).
              * In single-shot mode without NEXT_PAYLOAD, decoder is NULL
              * and we just write raw PT data for offline analysis. */
@@ -139,18 +128,7 @@ void pt_dump(CPUState *cpu, int bytes)
                     nyx_warn("libxdc_decode returned decoder_error\n");
                     break;
                 }
-            } else {
-                if (pt_dump_call_count <= 5) {
-                    nyx_warn("[WtE][DBG] pt_dump #%d: decoder is NULL — libxdc_decode SKIPPED (bytes=%d)\n",
-                        pt_dump_call_count, bytes);
-                }
             }
-        } else if (pt_dump_call_count <= 5) {
-            nyx_warn("[WtE][DBG] pt_dump #%d: SKIPPED decode (in_fuzzing=%d decoder_page_fault=%d dump_page=%d bytes=%d)\n",
-                pt_dump_call_count,
-                GET_GLOBAL_STATE()->in_fuzzing_mode,
-                GET_GLOBAL_STATE()->decoder_page_fault,
-                GET_GLOBAL_STATE()->dump_page, bytes);
         }
     }
 }
