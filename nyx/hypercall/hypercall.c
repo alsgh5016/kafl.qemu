@@ -370,7 +370,11 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
             if (wte_is_active()) {
                 wte_check_deferred_bbs();
                 wte_print_debug_summary();
-                if (wte_get_state()->wte_count > 0) {
+                int wte_count = wte_get_state()->wte_count;
+                /* Return WtE count to guest via EAX so harness can decide
+                 * whether to start another round. */
+                set_return_value(cpu, (uint64_t)wte_count);
+                if (wte_count > 0) {
                     wte_reset_round();
                 }
             }
