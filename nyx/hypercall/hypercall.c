@@ -1484,6 +1484,23 @@ int handle_kafl_hypercall(struct kvm_run *run,
         handle_hypercall_kafl_hook_api(run, cpu, arg);
         ret = 0;
         break;
+    case KVM_EXIT_KAFL_WOX_SNAPSHOT:
+    {
+        kvm_arch_get_registers(cpu);
+        CPUX86State *env = &(X86_CPU(cpu)->env);
+        uint64_t guest_cr3 = env->cr[3] & 0xFFFFFFFFFFFFF000ULL;
+        nyx_printf("[WtE] WOX_SNAPSHOT hypercall: guest CR3=0x%lx\n", guest_cr3);
+
+        if (!wte_is_active()) {
+            wte_init();
+            wte_activate(guest_cr3, false);
+            nyx_printf("[WtE] WtE tracking activated (baseline snapshot)\n");
+        } else {
+            nyx_printf("[WtE] WtE already active, skipping re-init\n");
+        }
+        ret = 0;
+        break;
+    }
     }
     return ret;
 }
