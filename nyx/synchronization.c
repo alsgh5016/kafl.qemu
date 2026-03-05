@@ -433,19 +433,11 @@ void synchronization_disable_pt(CPUState *cpu)
 
 void synchronization_enter_fuzzing_loop(CPUState *cpu)
 {
-    nyx_printf("[WOX-DIAG] enter_fuzzing_loop: BEFORE pt_enable — pt_fd=%d, pt_enabled=%d, pt_trace_mode=%d\n",
-              cpu->pt_fd, cpu->pt_enabled, GET_GLOBAL_STATE()->pt_trace_mode);
-
     int pt_en_result = pt_enable(cpu, false);
-    nyx_printf("[WOX-DIAG] enter_fuzzing_loop: pt_enable returned %d (0=success)\n", pt_en_result);
-
     if (pt_en_result == 0) {
         cpu->pt_enabled = true;
     }
     in_fuzzing_loop = true;
-
-    nyx_printf("[WOX-DIAG] enter_fuzzing_loop: AFTER — pt_fd=%d, pt_enabled=%d, in_fuzzing_loop=1\n",
-              cpu->pt_fd, cpu->pt_enabled);
 
     reset_timeout_detector(&(GET_GLOBAL_STATE()->timeout_detector));
 }

@@ -92,15 +92,6 @@ static inline int pt_ioctl(int fd, unsigned long request, unsigned long arg)
 
 void pt_dump(CPUState *cpu, int bytes)
 {
-    /* DIAG: Log every pt_dump call with gate values */
-    static int pt_dump_call_count = 0;
-    pt_dump_call_count++;
-    nyx_printf("[WOX-DIAG] pt_dump #%d: bytes=%d, in_fuzzing=%d, decoder=%p, page_fault=%d, dump_page=%d\n",
-              pt_dump_call_count, bytes,
-              GET_GLOBAL_STATE()->in_fuzzing_mode,
-              (void*)GET_GLOBAL_STATE()->decoder,
-              GET_GLOBAL_STATE()->decoder_page_fault,
-              GET_GLOBAL_STATE()->dump_page);
 
     if (!(GET_GLOBAL_STATE()->redqueen_state &&
           GET_GLOBAL_STATE()->redqueen_state->intercept_mode))
@@ -118,8 +109,6 @@ void pt_dump(CPUState *cpu, int bytes)
             if (GET_GLOBAL_STATE()->decoder) {
                 decoder_result_t result =
                 libxdc_decode(GET_GLOBAL_STATE()->decoder, cpu->pt_mmap, bytes);
-                nyx_printf("[WOX-DIAG] pt_dump #%d: libxdc_decode result=%d (0=success, 2=page_fault)\n",
-                          pt_dump_call_count, (int)result);
                 switch (result) {
                 case decoder_success:
                     break;
@@ -130,9 +119,6 @@ void pt_dump(CPUState *cpu, int bytes)
                     GET_GLOBAL_STATE()->decoder_page_fault = true;
                     GET_GLOBAL_STATE()->decoder_page_fault_addr =
                         libxdc_get_page_fault_addr(GET_GLOBAL_STATE()->decoder);
-                    nyx_printf("[WOX-DIAG] pt_dump #%d: decoder_page_fault at 0x%lx\n",
-                              pt_dump_call_count,
-                              GET_GLOBAL_STATE()->decoder_page_fault_addr);
                     break;
                 case decoder_unkown_packet:
                     nyx_warn("libxdc_decode returned unknown_packet\n");
@@ -141,16 +127,7 @@ void pt_dump(CPUState *cpu, int bytes)
                     nyx_warn("libxdc_decode returned decoder_error\n");
                     break;
                 }
-            } else {
-                nyx_printf("[WOX-DIAG] pt_dump #%d: decoder is NULL, skipping decode\n",
-                          pt_dump_call_count);
             }
-        } else {
-            nyx_printf("[WOX-DIAG] pt_dump #%d: GATE BLOCKED — in_fuzzing=%d, page_fault=%d, dump_page=%d\n",
-                      pt_dump_call_count,
-                      GET_GLOBAL_STATE()->in_fuzzing_mode,
-                      GET_GLOBAL_STATE()->decoder_page_fault,
-                      GET_GLOBAL_STATE()->dump_page);
         }
     }
 }
@@ -158,9 +135,6 @@ void pt_dump(CPUState *cpu, int bytes)
 
 int pt_enable(CPUState *cpu, bool hmp_mode)
 {
-    nyx_printf("[WOX-DIAG] pt_enable called: pt_fd=%d, pt_enabled=%d, pt_trace_mode=%d\n",
-              cpu->pt_fd, cpu->pt_enabled, GET_GLOBAL_STATE()->pt_trace_mode);
-    
     if (!fast_reload_set_bitmap(get_fast_reload_snapshot())) {
         coverage_bitmap_reset();
     }
@@ -170,8 +144,6 @@ int pt_enable(CPUState *cpu, bool hmp_mode)
     }
     pt_truncate_pt_dump_file();
     int result = pt_cmd(cpu, KVM_VMX_PT_ENABLE, hmp_mode);
-    nyx_printf("[WOX-DIAG] pt_enable result=%d (0=success), pt_fd=%d, pt_enabled=%d\n",
-              result, cpu->pt_fd, cpu->pt_enabled);
     return result;
 }
 
@@ -382,10 +354,7 @@ void pt_pre_kvm_run(CPUState *cpu)
     if (GET_GLOBAL_STATE()->pt_trace_mode || GET_GLOBAL_STATE()->pt_trace_mode_force)
     {
         if (!cpu->pt_fd) {
-            nyx_printf("[WOX-DIAG] pt_pre_kvm_run: setting up pt_fd (pt_trace_mode=%d)\n",
-                      GET_GLOBAL_STATE()->pt_trace_mode);
             cpu->pt_fd = kvm_vcpu_ioctl(cpu, KVM_VMX_PT_SETUP_FD, (unsigned long)0);
-            nyx_printf("[WOX-DIAG] pt_pre_kvm_run: pt_fd=%d\n", cpu->pt_fd);
             assert(cpu->pt_fd != -1);
             ret = ioctl(cpu->pt_fd, KVM_VMX_PT_GET_TOPA_SIZE, (unsigned long)0x0);
 
@@ -402,13 +371,10 @@ void pt_pre_kvm_run(CPUState *cpu)
                         MAP_ANONYMOUS | MAP_FIXED | MAP_PRIVATE, -1,
                         0) == (void *)(cpu->pt_mmap + ret));
 
-            nyx_printf("[WOX-DIAG] pt_pre_kvm_run: pt_mmap=%p (size=%d)\n", cpu->pt_mmap, ret);
-
             memset(cpu->pt_mmap + ret, 0x55, 0x1000);
         }
 
         if (cpu->pt_cmd) {
-            nyx_printf("[WOX-DIAG] pt_pre_kvm_run: processing pt_cmd=%d\n", cpu->pt_cmd);
             switch (cpu->pt_cmd) {
             case KVM_VMX_PT_ENABLE:
                 if (cpu->pt_fd) {
@@ -418,9 +384,6 @@ void pt_pre_kvm_run(CPUState *cpu)
 
                     if (!ioctl(cpu->pt_fd, cpu->pt_cmd, 0)) {
                         cpu->pt_enabled = true;
-                        nyx_printf("[WOX-DIAG] pt_pre_kvm_run: PT ENABLED via ioctl (pt_fd=%d)\n", cpu->pt_fd);
-                    } else {
-                        nyx_printf("[WOX-DIAG] pt_pre_kvm_run: PT ENABLE ioctl FAILED\n");
                     }
                 }
                 break;
@@ -445,9 +408,6 @@ void pt_pre_kvm_run(CPUState *cpu)
                 filter_iprs.b =
                     GET_GLOBAL_STATE()
                         ->pt_ip_filter_b[(cpu->pt_cmd) - KVM_VMX_PT_CONFIGURE_ADDR0];
-                nyx_printf("[WOX-DIAG] pt_pre_kvm_run: CONFIGURE_ADDR%d: 0x%lx-0x%lx\n",
-                          cpu->pt_cmd - KVM_VMX_PT_CONFIGURE_ADDR0,
-                          filter_iprs.a, filter_iprs.b);
                 ret = pt_ioctl(cpu->pt_fd, cpu->pt_cmd, (unsigned long)&filter_iprs);
                 break;
             case KVM_VMX_PT_ENABLE_ADDR0:
@@ -471,14 +431,6 @@ void pt_pre_kvm_run(CPUState *cpu)
             }
             cpu->pt_cmd = 0;
             cpu->pt_ret = 0;
-        }
-    } else {
-        /* pt_trace_mode is OFF — log once to confirm */
-        static bool logged_trace_mode_off = false;
-        if (!logged_trace_mode_off && cpu->pt_cmd) {
-            nyx_printf("[WOX-DIAG] pt_pre_kvm_run: pt_trace_mode=OFF, pt_cmd=%d IGNORED (pt_fd=%d)\n",
-                      cpu->pt_cmd, cpu->pt_fd);
-            logged_trace_mode_off = true;
         }
     }
     pthread_mutex_unlock(&pt_dump_mutex);
@@ -538,14 +490,8 @@ void pt_flush_buffer(CPUState *cpu)
     static int flush_call_count = 0;
     flush_call_count++;
 
-    /* DIAG: Log every flush call with all gating values */
-    nyx_printf("[WOX-DIAG] pt_flush_buffer #%d: pt_fd=%d, pt_enabled=%d, pt_trace_mode=%d\n",
-              flush_call_count, cpu->pt_fd, cpu->pt_enabled,
-              GET_GLOBAL_STATE()->pt_trace_mode);
 
     if (!cpu->pt_fd) {
-        nyx_printf("[WOX-DIAG] pt_flush_buffer #%d: SKIPPED — pt_fd is 0 (PT hardware not set up)\n",
-                  flush_call_count);
         pthread_mutex_unlock(&pt_dump_mutex);
         return;
     }
@@ -553,36 +499,36 @@ void pt_flush_buffer(CPUState *cpu)
     /* 1. Drain any pending ToPA overflow first (same as pt_handle_overflow) */
     int overflow = ioctl(cpu->pt_fd, KVM_VMX_PT_CHECK_TOPA_OVERFLOW, (unsigned long)0);
     if (overflow > 0) {
-        nyx_printf("[WOX-DIAG] pt_flush_buffer #%d: ToPA overflow=%d bytes\n",
-                  flush_call_count, overflow);
         pt_dump(cpu, overflow);
     }
 
     /* 2. Force-flush: disable PT → decode remaining → re-enable PT */
     if (overflow <= 0 && cpu->pt_enabled) {
         int bytes = ioctl(cpu->pt_fd, KVM_VMX_PT_DISABLE, 0);
-        cpu->pt_enabled = false;
 
-        nyx_printf("[WOX-DIAG] pt_flush_buffer #%d: force-flush disabled PT, bytes=%d\n",
-                  flush_call_count, bytes);
+        if (bytes < 0) {
+            /* KVM_VMX_PT_DISABLE ioctl failed — PT was never actually
+             * disabled (kernel returned -1).  Leave pt_enabled=true and
+             * skip this flush cycle.  The next call will retry. */
+            nyx_debug_p(PT_PREFIX, "pt_flush_buffer #%d: KVM_VMX_PT_DISABLE returned -1, skipping\n",
+                       flush_call_count);
+            pthread_mutex_unlock(&pt_dump_mutex);
+            return;
+        }
+
+        cpu->pt_enabled = false;
 
         if (bytes > 0) {
             pt_dump(cpu, bytes);
-        } else {
-            nyx_printf("[WOX-DIAG] pt_flush_buffer #%d: NO data in PT buffer (bytes=%d)\n",
-                      flush_call_count, bytes);
         }
 
         /* Re-enable PT so tracing continues for the next KVM-run cycle */
         if (!ioctl(cpu->pt_fd, KVM_VMX_PT_ENABLE, 0)) {
             cpu->pt_enabled = true;
         } else {
-            nyx_printf("[WOX-DIAG] pt_flush_buffer #%d: FAILED to re-enable PT!\n",
-                      flush_call_count);
+            nyx_debug_p(PT_PREFIX, "pt_flush_buffer #%d: FAILED to re-enable PT!\n",
+                       flush_call_count);
         }
-    } else if (overflow <= 0 && !cpu->pt_enabled) {
-        nyx_printf("[WOX-DIAG] pt_flush_buffer #%d: SKIPPED force-flush — pt_enabled is false\n",
-                  flush_call_count);
     }
 
     /* Clear decoder page-fault flag (same as pt_handle_overflow) */
