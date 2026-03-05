@@ -2490,6 +2490,12 @@ static void wox_content_diff_report(CPUState *cpu, CPUX86State *env)
 void wox_bb_callback(void *opaque, int mode, uint64_t rip, uint64_t tsc)
 {
     static int wox_detect_count = 0;
+    static int bb_call_count = 0;
+    bb_call_count++;
+    if (bb_call_count <= 10 || (bb_call_count % 1000 == 0)) {
+        nyx_printf("[DIAG] wox_bb_callback #%d: mode=%d rip=0x%lx tsc=0x%lx\n",
+                   bb_call_count, mode, (unsigned long)rip, (unsigned long)tsc);
+    }
 
     if (rip >= WOX_USER_VA_START && rip < WOX_USER_VA_END) {
         int idx = wox_va_to_idx((uint32_t)rip);
