@@ -165,10 +165,13 @@ void handle_hypercall_kafl_acquire(struct kvm_run *run,
              * actually writes trace data.
              */
             if (!setup_snapshot_once) {
-                for (int i = 0; i < INTEL_PT_MAX_RANGES; i++) {
-                    if (GET_GLOBAL_STATE()->pt_ip_filter_configured[i]) {
-                        pt_enable_ip_filtering(cpu, i, true, false);
+                if(GET_GLOBAL_STATE()->nyx_pt && GET_GLOBAL_STATE()->cap_compile_time_tracing == false) {
+                    for (int i = 0; i < INTEL_PT_MAX_RANGES; i++) {
+                        if (GET_GLOBAL_STATE()->pt_ip_filter_configured[i]) {
+                            pt_enable_ip_filtering(cpu, i, true, false);
+                        }
                     }
+                    pt_init_decoder(cpu);
                 }
                 GET_GLOBAL_STATE()->in_fuzzing_mode = true;
                 setup_snapshot_once = true;
@@ -1505,6 +1508,23 @@ int handle_kafl_hypercall(struct kvm_run *run,
         nyx_printf("[WtE] WOX_SNAPSHOT hypercall: guest CR3=0x%lx\n", guest_cr3);
 
         if (!wte_is_active()) {
+            /*
+             * Create root snapshot to capture baseline memory content.
+             * read_snapshot_memory() will use this baseline to compute
+             * content diffs when dirty pages are detected.
+             * REQUEST_SAVE_SNAPSHOT_ROOT_FIX_RIP adjusts RIP past the
+             * hypercall instruction and creates an in-memory snapshot
+             * of the guest physical memory (shadow memory).
+             */
+            if (!fast_reload_root_created(get_fast_reload_snapshot())) {
+                nyx_printf("[WtE] Creating root snapshot for baseline...\n");
+                request_fast_vm_reload(GET_GLOBAL_STATE()->reload_state,
+                                       REQUEST_SAVE_SNAPSHOT_ROOT_FIX_RIP);
+                nyx_printf("[WtE] Root snapshot created successfully\n");
+            } else {
+                nyx_printf("[WtE] Root snapshot already exists, reusing\n");
+            }
+
             wte_init();
             wte_activate(guest_cr3, false);
             nyx_printf("[WtE] WtE tracking activated (baseline snapshot)\n");
@@ -1513,7 +1533,6 @@ int handle_kafl_hypercall(struct kvm_run *run,
         }
         ret = 0;
         break;
-    }
     }
     return ret;
 }

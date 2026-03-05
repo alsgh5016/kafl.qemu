@@ -23,6 +23,7 @@
 #include "nyx/wte.h"
 
 #include "nyx/snapshot/memory/backend/nyx_dirty_ring.h"
+#include "nyx/fast_vm_reload.h"
 
 /* ── Dirty Ring Globals (defined in nyx_dirty_ring.c) ──────────── */
 
@@ -231,6 +232,12 @@ void wte_scan_dirty_ring(void)
         uint64_t gfn = entry->offset;
         uint64_t gpa = gfn << 12;
 
+        /* Skip low system pages (IVT, BDA, etc.) — not target process memory */
+        if (gfn <= 0x10) {
+            scan_idx++;
+            continue;
+        }
+
         khiter_t k = kh_get(WTE_DIRTY, wte_state.dirty_map, gfn);
 
         if (k == kh_end(wte_state.dirty_map)) {
@@ -238,15 +245,26 @@ void wte_scan_dirty_ring(void)
             memset(info, 0, sizeof(wte_page_info_t));
             info->gpa = gpa;
 
-            /* Read baseline content (snapshot-time content via physical read) */
-            cpu_physical_memory_read(gpa, info->baseline, WTE_PAGE_SIZE);
+            /*
+             * Read baseline content from root snapshot (shadow memory).
+             * This gives us the pre-write content for accurate diff.
+             */
+            if (fast_reload_root_created(get_fast_reload_snapshot())) {
+                if (!read_snapshot_memory(get_fast_reload_snapshot(),
+                                         gpa, info->baseline, WTE_PAGE_SIZE)) {
+                    /* Snapshot doesn't cover this GPA — use current as baseline */
+                    cpu_physical_memory_read(gpa, info->baseline, WTE_PAGE_SIZE);
+                }
+            } else {
+                /* No snapshot available — fallback to current content */
+                cpu_physical_memory_read(gpa, info->baseline, WTE_PAGE_SIZE);
+            }
             info->baseline_valid = true;
 
             /* Read current content (post-write) */
             cpu_physical_memory_read(gpa, info->current, WTE_PAGE_SIZE);
 
             wte_compute_diff(info);
-
             /* DEBUG: log first 10 new dirty pages */
             if (new_pages < 10) {
                 nyx_printf("[WtE][DBG] new dirty GFN=0x%lx GPA=0x%lx diff_count=%d\n",
