@@ -62,6 +62,7 @@ along with QEMU-PT.  If not, see <http://www.gnu.org/licenses/>.
 #include "nyx/snapshot/memory/backend/nyx_debug.h"
 #include "nyx/snapshot/memory/block_list.h"
 #include "nyx/snapshot/memory/shadow_memory.h"
+#include "nyx/wte.h"
 
 FastReloadMemoryMode mode = RELOAD_MEMORY_MODE_DEBUG;
 
@@ -560,6 +561,11 @@ void fast_reload_qemu_user_fdl_set_dirty(fast_reload_t *self,
 
 void fast_reload_handle_dirty_ring_full(fast_reload_t *self)
 {
+
+    /* WtE: scan dirty ring for new writes before flushing */
+    if (wte_is_active()) {
+        wte_scan_dirty_ring();
+    }
     if (self->dirty_ring_state) {
         nyx_snapshot_nyx_dirty_ring_flush_and_collect(self->dirty_ring_state,
                                                       self->shadow_memory_state,

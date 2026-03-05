@@ -51,6 +51,7 @@ along with QEMU-PT.  If not, see <http://www.gnu.org/licenses/>.
 #include "nyx/redqueen.h"
 #include "nyx/state/state.h"
 #include "nyx/synchronization.h"
+#include "nyx/wte.h"
 
 bool hypercall_enabled = false;
 static bool init_state = true;
@@ -173,6 +174,14 @@ void handle_hypercall_kafl_acquire(struct kvm_run *run,
                 setup_snapshot_once = true;
             }
             acquire_print_once(cpu);
+
+            if (!wte_is_active()) {
+                kvm_arch_get_registers(cpu);
+                CPUX86State *env = &(X86_CPU(cpu)->env);
+                wte_init();
+                wte_activate(env->cr[3], false);
+            }
+
             synchronization_enter_fuzzing_loop(cpu);
         }
     }
@@ -346,6 +355,11 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
             }
 
             synchronization_disable_pt(cpu);
+
+            /* WtE: final dirty ring scan before release */
+            if (wte_is_active()) {
+                wte_scan_dirty_ring();
+            }
             release_print_once(cpu);
         }
     }

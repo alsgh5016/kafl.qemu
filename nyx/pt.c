@@ -44,10 +44,11 @@ along with QEMU-PT.  If not, see <http://www.gnu.org/licenses/>.
 #include "nyx/redqueen_trace.h"
 #include "nyx/state/state.h"
 #include "nyx/trace_dump.h"
+#include "nyx/wte.h"
+#include "nyx/redqueen.h"
 
 #ifdef CONFIG_REDQUEEN
 #include "nyx/patcher.h"
-#include "nyx/redqueen.h"
 #include "nyx/redqueen_patch.h"
 #endif
 
@@ -216,6 +217,13 @@ int pt_enable_ip_filtering(CPUState *cpu, uint8_t addrn, bool redqueen, bool hmp
     return r;
 }
 
+static void pt_combined_bb_callback(void *opaque, disassembler_mode_t mode,
+                                    uint64_t ip, uint64_t tsc)
+{
+    redqueen_callback(opaque, mode, ip, tsc);
+    wte_bb_callback(NULL, mode, ip, tsc);
+}
+
 void pt_init_decoder(CPUState *cpu)
 {
     uint64_t filters[4][2] = { 0 };
@@ -254,7 +262,7 @@ void pt_init_decoder(CPUState *cpu)
 
     libxdc_register_bb_callback(GET_GLOBAL_STATE()->decoder,
                                 (void (*)(void *, disassembler_mode_t, uint64_t,
-                                          uint64_t))redqueen_callback,
+                                          uint64_t))pt_combined_bb_callback,
                                 GET_GLOBAL_STATE()->redqueen_state);
 
     alt_bitmap_init(GET_GLOBAL_STATE()->shared_bitmap_ptr,
