@@ -354,12 +354,13 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
                 GET_GLOBAL_STATE()->starved = 0;
             }
 
-            synchronization_disable_pt(cpu);
-
-            /* WtE: final dirty ring scan before release */
+            /* WtE: scan dirty ring BEFORE pt_disable so dirty_map
+             * is populated when bb_callback fires during pt_dump. */
             if (wte_is_active()) {
                 wte_scan_dirty_ring();
             }
+
+            synchronization_disable_pt(cpu);
             release_print_once(cpu);
         }
     }
@@ -470,6 +471,12 @@ static void handle_hypercall_kafl_cr3(struct kvm_run *run,
         nyx_debug_p(CORE_PREFIX, "Setting CR3 filter: %lx\n", cr3_val);
         GET_GLOBAL_STATE()->parent_cr3 = cr3_val;
         pt_set_cr3(cpu, cr3_val, false);
+
+        /* Update WtE target CR3 to child process */
+        if (wte_is_active()) {
+            wte_get_state()->target_cr3 = cr3_val;
+            nyx_printf("[WtE] Updated target_cr3 to 0x%lx\n", (unsigned long)cr3_val);
+        }
         if (GET_GLOBAL_STATE()->dump_page) {
             set_page_dump_bp(cpu, cr3_val,
                              GET_GLOBAL_STATE()->dump_page_addr);
