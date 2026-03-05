@@ -150,10 +150,12 @@ void wte_init(void)
 {
     memset(&wte_state, 0, sizeof(wte_state_t));
 
-    wte_state.dirty_map = kh_init(WTE_DIRTY);
-    wte_state.exec_map  = kh_init(WTE_EXEC);
-    wte_state.round     = 0;
-    wte_state.active    = false;
+    wte_state.dirty_map    = kh_init(WTE_DIRTY);
+    wte_state.exec_map     = kh_init(WTE_EXEC);
+    wte_state.bb_deferred  = kh_init(WTE_BB_DEFER);
+    wte_state.round        = 0;
+    wte_state.active       = false;
+    wte_state.overflow_count = 0;
 
     nyx_printf("[WtE] Initialized\n");
 }
@@ -173,6 +175,9 @@ void wte_destroy(void)
     }
     if (wte_state.exec_map) {
         kh_destroy(WTE_EXEC, wte_state.exec_map);
+    }
+    if (wte_state.bb_deferred) {
+        kh_destroy(WTE_BB_DEFER, wte_state.bb_deferred);
     }
 
     memset(&wte_state, 0, sizeof(wte_state_t));
@@ -349,6 +354,9 @@ void wte_bb_callback(void *opaque, disassembler_mode_t mode,
             nyx_printf("[WtE][DBG] dirty_map MISS: ip=0x%lx gfn=0x%lx phys=0x%lx\n",
                        (unsigned long)ip, (unsigned long)gfn, (unsigned long)phys_addr);
         }
+        /* Defer this IP for later re-check when dirty_map is complete */
+        int defer_ret;
+        kh_put(WTE_BB_DEFER, wte_state.bb_deferred, ip, &defer_ret);
         return;
     }
 
@@ -402,7 +410,8 @@ void wte_print_debug_summary(void)
 {
     nyx_printf("[WtE][DBG] === BB_CALLBACK SUMMARY === "
                "total=%lu tfail=%lu miss=%lu dirty_hit=%lu diff0=%lu "
-               "exec_dup=%lu wte=%lu dirty_map_size=%lu\n",
+               "exec_dup=%lu wte=%lu dirty_map_size=%lu "
+               "deferred=%lu overflow=%lu\n",
                (unsigned long)dbg_bb_total_calls,
                (unsigned long)dbg_bb_translate_fail,
                (unsigned long)dbg_bb_dirty_miss,
@@ -410,7 +419,9 @@ void wte_print_debug_summary(void)
                (unsigned long)dbg_bb_diff_zero,
                (unsigned long)dbg_bb_exec_already,
                (unsigned long)dbg_bb_wte_hit,
-               (unsigned long)kh_size(wte_state.dirty_map));
+               (unsigned long)kh_size(wte_state.dirty_map),
+               (unsigned long)kh_size(wte_state.bb_deferred),
+               (unsigned long)wte_state.overflow_count);
 }
 
 /*
@@ -440,6 +451,7 @@ void wte_reset_round(void)
 
     kh_clear(WTE_DIRTY, wte_state.dirty_map);
     kh_clear(WTE_EXEC, wte_state.exec_map);
+    kh_clear(WTE_BB_DEFER, wte_state.bb_deferred);
 
 
     wte_state.round++;
@@ -455,6 +467,88 @@ void wte_reset_round(void)
 bool wte_is_active(void)
 {
     return wte_state.active;
+}
+
+/*
+ * Check deferred BB IPs against the now-complete dirty_map.
+ * Called at RELEASE after final dirty ring scan + pt_dump,
+ * when dirty_map is fully populated.
+ */
+void wte_check_deferred_bbs(void)
+{
+    if (!wte_state.active || !wte_state.bb_deferred) {
+        return;
+    }
+
+    int checked = 0, hits = 0;
+    CPUState *cpu = first_cpu;
+
+    nyx_printf("[WtE] Checking %lu deferred BBs against dirty_map (size=%lu)\n",
+               (unsigned long)kh_size(wte_state.bb_deferred),
+               (unsigned long)kh_size(wte_state.dirty_map));
+
+    khiter_t ki;
+    for (ki = kh_begin(wte_state.bb_deferred);
+         ki != kh_end(wte_state.bb_deferred); ++ki)
+    {
+        if (!kh_exist(wte_state.bb_deferred, ki)) {
+            continue;
+        }
+
+        uint64_t ip = kh_key(wte_state.bb_deferred, ki);
+        checked++;
+
+        /* Translate IP → physical → GFN */
+        uint64_t phys_addr = get_paging_phys_addr(cpu, wte_state.target_cr3, ip);
+        if (phys_addr == (uint64_t)-1) {
+            continue;
+        }
+
+        uint64_t gfn = phys_addr >> 12;
+
+        /* Check dirty_map */
+        khiter_t dk = kh_get(WTE_DIRTY, wte_state.dirty_map, gfn);
+        if (dk == kh_end(wte_state.dirty_map)) {
+            continue;  /* Still not in dirty_map — not a write target */
+        }
+
+        /* Skip if already confirmed WtE for this GFN */
+        khiter_t ek = kh_get(WTE_EXEC, wte_state.exec_map, gfn);
+        if (ek != kh_end(wte_state.exec_map)) {
+            continue;
+        }
+
+        /* Re-read current content and compute diff */
+        wte_page_info_t *info = kh_value(wte_state.dirty_map, dk);
+        cpu_physical_memory_read(info->gpa, info->current, WTE_PAGE_SIZE);
+        wte_compute_diff(info);
+
+        nyx_printf("[WtE][DBG] deferred HIT: ip=0x%lx gfn=0x%lx diff_count=%d\n",
+                   (unsigned long)ip, (unsigned long)gfn, info->diff_count);
+
+        if (info->diff_count == 0) {
+            continue;
+        }
+
+        /* Confirmed WtE via deferred check */
+        int ret;
+        ek = kh_put(WTE_EXEC, wte_state.exec_map, gfn, &ret);
+        kh_value(wte_state.exec_map, ek) = ip;
+
+        wte_state.wte_count++;
+        wte_state.total_wte_count++;
+        dbg_bb_wte_hit++;
+        hits++;
+
+        nyx_printf("[WtE] *** DEFERRED WtE DETECTED ***  round=%d  RIP=0x%lx  "
+                   "GFN=0x%lx  GPA=0x%lx  diffs=%d\n",
+                   wte_state.round, (unsigned long)ip, (unsigned long)gfn,
+                   (unsigned long)info->gpa, info->diff_count);
+
+        wte_dump_detection(ip, gfn, info, cpu);
+    }
+
+    nyx_printf("[WtE] Deferred check done: checked=%d hits=%d\n", checked, hits);
 }
 
 wte_state_t *wte_get_state(void)

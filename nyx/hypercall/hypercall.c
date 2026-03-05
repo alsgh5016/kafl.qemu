@@ -365,8 +365,10 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
 
             synchronization_disable_pt(cpu);
 
-            /* WtE: print debug summary after pt_dump (bb_callbacks done) */
+            /* WtE: check deferred BBs that missed dirty_map during overflow,
+             * then print debug summary. */
             if (wte_is_active()) {
+                wte_check_deferred_bbs();
                 wte_print_debug_summary();
             }
 

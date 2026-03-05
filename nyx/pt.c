@@ -435,7 +435,28 @@ void pt_handle_overflow(CPUState *cpu)
     pthread_mutex_lock(&pt_dump_mutex);
     int overflow = ioctl(cpu->pt_fd, KVM_VMX_PT_CHECK_TOPA_OVERFLOW, (unsigned long)0);
     if (overflow > 0) {
+        /* WtE: populate dirty_map BEFORE pt_dump so bb_callback
+         * can find freshly written pages during overflow decoding. */
+        if (wte_is_active()) {
+            wte_scan_dirty_ring();
+            wte_get_state()->overflow_count++;
+            nyx_printf("[WtE][OVF] PT overflow #%lu, %d bytes, scanning dirty ring first\n",
+                       (unsigned long)wte_get_state()->overflow_count, overflow);
+        }
+
         pt_dump(cpu, overflow);
+
+        /* WtE: if decoder_page_fault was set during this overflow decode,
+         * reset it so subsequent pt_dump calls can still decode.
+         * In WtE mode we expect page faults on freshly unpacked code;
+         * blocking all future decoding is unacceptable. */
+        if (wte_is_active() && GET_GLOBAL_STATE()->decoder_page_fault) {
+            nyx_printf("[WtE][OVF] Resetting decoder_page_fault "
+                       "(addr=0x%lx) to allow continued decoding\n",
+                       (unsigned long)GET_GLOBAL_STATE()->decoder_page_fault_addr);
+            GET_GLOBAL_STATE()->decoder_page_fault = false;
+            GET_GLOBAL_STATE()->decoder_page_fault_addr = 0;
+        }
     }
     pthread_mutex_unlock(&pt_dump_mutex);
 }

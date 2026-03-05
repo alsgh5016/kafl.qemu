@@ -47,11 +47,15 @@ KHASH_MAP_INIT_INT64(WTE_DIRTY, wte_page_info_t *)
 /* key = GFN (uint64_t), value = first execution RIP */
 KHASH_MAP_INIT_INT64(WTE_EXEC, uint64_t)
 
+/* key = IP (uint64_t) — set of deferred BB IPs that missed dirty_map during overflow */
+KHASH_SET_INIT_INT64(WTE_BB_DEFER)
+
 /* ── WtE Global State ─────────────────────────────────────────── */
 
 typedef struct {
-    khash_t(WTE_DIRTY) *dirty_map;          /* GFN → page info (write tracking)   */
-    khash_t(WTE_EXEC)  *exec_map;           /* GFN → RIP (execution tracking)     */
+    khash_t(WTE_DIRTY)    *dirty_map;       /* GFN → page info (write tracking)   */
+    khash_t(WTE_EXEC)     *exec_map;        /* GFN → RIP (execution tracking)     */
+    khash_t(WTE_BB_DEFER) *bb_deferred;     /* IPs that missed dirty_map (deferred)*/
 
     int      round;                          /* Current detection round            */
     bool     active;                         /* WtE detection enabled              */
@@ -63,6 +67,7 @@ typedef struct {
     uint32_t last_scanned_ring_index;        /* Last dirty ring index we scanned   */
     int      wte_count;                      /* Total WtE detections this round    */
     int      total_wte_count;                /* Total WtE detections across rounds */
+    uint64_t overflow_count;                 /* Number of PT overflows handled     */
 } wte_state_t;
 
 /* ── Public API ────────────────────────────────────────────────── */
@@ -79,6 +84,9 @@ void wte_scan_dirty_ring(void);
 /* bb_callback — registered with libxdc */
 void wte_bb_callback(void *opaque, disassembler_mode_t mode,
                      uint64_t ip, uint64_t tsc);
+
+/* Deferred BB check — call at RELEASE after final dirty ring scan + pt_dump */
+void wte_check_deferred_bbs(void);
 
 /* Round management */
 void wte_reset_round(void);
