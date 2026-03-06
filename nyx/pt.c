@@ -217,12 +217,6 @@ int pt_enable_ip_filtering(CPUState *cpu, uint8_t addrn, bool redqueen, bool hmp
     return r;
 }
 
-static void pt_combined_bb_callback(void *opaque, disassembler_mode_t mode,
-                                    uint64_t ip, uint64_t tsc)
-{
-    redqueen_callback(opaque, mode, ip, tsc);
-    wte_bb_callback(NULL, mode, ip, tsc);
-}
 
 void pt_init_decoder(CPUState *cpu)
 {
@@ -262,9 +256,8 @@ void pt_init_decoder(CPUState *cpu)
 
     libxdc_register_bb_callback(GET_GLOBAL_STATE()->decoder,
                                 (void (*)(void *, disassembler_mode_t, uint64_t,
-                                          uint64_t))pt_combined_bb_callback,
+                                          uint64_t))redqueen_callback,
                                 GET_GLOBAL_STATE()->redqueen_state);
-
     alt_bitmap_init(GET_GLOBAL_STATE()->shared_bitmap_ptr,
                     GET_GLOBAL_STATE()->shared_bitmap_size);
 }
