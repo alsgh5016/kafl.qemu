@@ -63,6 +63,7 @@ typedef struct {
     int      wte_count;                      /* Total WtE detections this round     */
     int      total_wte_count;                /* Total WtE detections across rounds  */
     int      nx_pages_set;                   /* Number of pages with NX bit set     */
+    uint64_t overflow_count;                  /* PT overflow events during this round */
 } wte_state_t;
 
 /* ── Public API ────────────────────────────────────────────────── */
