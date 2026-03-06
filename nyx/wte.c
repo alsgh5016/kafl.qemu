@@ -26,6 +26,9 @@
 #include "nyx/snapshot/memory/backend/nyx_dirty_ring.h"
 #include "nyx/fast_vm_reload.h"
 
+#include "nyx/hypercall/hypercall.h"
+#include "target/i386/cpu.h"
+
 /* ── Dirty Ring Globals (defined in nyx_dirty_ring.c) ──────────── */
 
 extern int                   dirty_ring_size;
@@ -432,7 +435,7 @@ void wte_scan_dirty_ring(void)
  * After handling, clear the NX bit so the guest can re-execute.
  * KVM_RUN will automatically retry the faulting instruction.
  */
-void wte_handle_nx_violation(uint64_t gfn, uint64_t gpa, uint64_t rip)
+void wte_handle_nx_violation(uint64_t gfn, uint64_t gpa, uint64_t rip, CPUState *cpu)
 {
     if (!wte_state.active) {
         /* Not active — just clear NX and let guest continue */
@@ -483,6 +486,16 @@ void wte_handle_nx_violation(uint64_t gfn, uint64_t gpa, uint64_t rip)
                (unsigned long)gpa, info->diff_count);
 
     wte_dump_detection(rip, gfn, info);
+
+    /* Full process memory dump at WtE detection */
+    {
+        X86CPU *cpux86 = X86_CPU(cpu);
+        CPUX86State *env = &cpux86->env;
+        char wte_label[128];
+        snprintf(wte_label, sizeof(wte_label), "wte_round%d_rip0x%lx_gfn0x%lx",
+                 wte_state.round, (unsigned long)rip, (unsigned long)gfn);
+        dump_full_process_memory(cpu, env, wte_label);
+    }
 
     /* Clear NX so the faulting instruction can re-execute.
      * If this page is written again, dirty ring will re-trigger NX set. */

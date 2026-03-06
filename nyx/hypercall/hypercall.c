@@ -758,7 +758,7 @@ typedef struct { uint32_t va; uint64_t phys; uint8_t perm; } mapped_page_t;
 
 static int dump_seq_counter = 0;
 
-static void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
+void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                                      const char *label)
 {
     int seq = dump_seq_counter++;
@@ -1567,11 +1567,12 @@ int handle_kafl_hypercall(struct kvm_run *run,
     case KVM_EXIT_KAFL_WTE:
     {
         /* EPT NX violation — guest executed a page marked NX.
-         * Extract gfn/gpa/rip from kvm_run and handle. */
+         * Sync registers for page table walk, then handle. */
+        kvm_arch_get_registers(cpu);
         uint64_t wte_gfn = run->kafl_wte.gfn;
         uint64_t wte_gpa = run->kafl_wte.gpa;
         uint64_t wte_rip = run->kafl_wte.rip;
-        wte_handle_nx_violation(wte_gfn, wte_gpa, wte_rip);
+        wte_handle_nx_violation(wte_gfn, wte_gpa, wte_rip, cpu);
         ret = 0;
         break;
     }

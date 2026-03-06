@@ -85,7 +85,7 @@ void wte_scan_dirty_ring(void);
 
 /* EPT NX violation handler — called on KVM_EXIT_KAFL_WTE.
  * Performs content diff, dumps if confirmed WtE, clears NX. */
-void wte_handle_nx_violation(uint64_t gfn, uint64_t gpa, uint64_t rip);
+void wte_handle_nx_violation(uint64_t gfn, uint64_t gpa, uint64_t rip, CPUState *cpu);
 
 /* Round management */
 void wte_reset_round(void);
