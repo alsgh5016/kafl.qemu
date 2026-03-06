@@ -1229,12 +1229,25 @@ static void handle_hypercall_kafl_dump_file(struct kvm_run *run,
         strncpy(filename, "tmp.XXXXXX", sizeof(filename) - 1);
     }
 
-    char *base_name = basename(filename); // clobbers the filename buffer!
+    /* Sanitize path: strip leading slashes, block directory traversal,
+     * but preserve subdirectory structure for organized dumps */
+    char *sanitized = filename;
+    while (*sanitized == '/' || *sanitized == '\\') sanitized++;
+    if (strstr(sanitized, "..")) {
+        sanitized = basename(sanitized);  /* fallback: strip path if traversal detected */
+    }
     assert(asprintf(&host_path, "%s/dump/%s", GET_GLOBAL_STATE()->workdir_path,
-                    base_name) != -1);
+                    sanitized) != -1);
 
-    // check if base_name is mkstemp() pattern, otherwise write/append to exact name
-    char *pattern = strstr(base_name, "XXXXXX");
+    /* Create parent directories if needed (supports round_N/ subdirs) */
+    {
+        char *dir_part = g_path_get_dirname(host_path);
+        g_mkdir_with_parents(dir_part, 0755);
+        g_free(dir_part);
+    }
+
+    // check if sanitized name is mkstemp() pattern, otherwise write/append to exact name
+    char *pattern = strstr(sanitized, "XXXXXX");
     if (pattern) {
         unsigned suffix = strlen(pattern) - strlen("XXXXXX");
         f               = fdopen(mkstemps(host_path, suffix), "w+");
