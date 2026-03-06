@@ -79,6 +79,7 @@ int  wte_kvm_enable(void);
 int  wte_kvm_disable(void);
 int  wte_kvm_set_nx(uint64_t *gfns, uint32_t count);
 int  wte_kvm_clear_nx(uint64_t *gfns, uint32_t count);
+int  wte_kvm_set_cr3(uint64_t cr3);
 
 /* Dirty ring scan — call before dirty ring flush.
  * Reads new dirty GFNs and marks them NX in EPT via ioctl. */

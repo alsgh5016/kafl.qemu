@@ -1572,6 +1572,10 @@ int handle_kafl_hypercall(struct kvm_run *run,
         uint64_t wte_gfn = run->kafl_wte.gfn;
         uint64_t wte_gpa = run->kafl_wte.gpa;
         uint64_t wte_rip = run->kafl_wte.rip;
+        uint64_t wte_cr3 = run->kafl_wte.cr3;
+        nyx_printf("[WtE] KVM exit: GFN=0x%lx RIP=0x%lx CR3=0x%lx\n",
+                   (unsigned long)wte_gfn, (unsigned long)wte_rip,
+                   (unsigned long)wte_cr3);
         wte_handle_nx_violation(wte_gfn, wte_gpa, wte_rip, cpu);
         ret = 0;
         break;

@@ -477,6 +477,7 @@ struct kvm_run {
 			__u64 gfn;
 			__u64 gpa;
 			__u64 rip;
+			__u64 cr3;
 		} kafl_wte;
 		/* Fix the size of the union. */
 		char padding[256];
@@ -1753,6 +1754,7 @@ struct kvm_hyperv_eventfd {
 #define KVM_NYX_WTE_DISABLE					_IO(KVMIO,	0xf3)
 #define KVM_NYX_WTE_SET_NX					_IOW(KVMIO,	0xf4, struct kvm_nyx_wte_gfns)
 #define KVM_NYX_WTE_CLEAR_NX				_IOW(KVMIO,	0xf5, struct kvm_nyx_wte_gfns)
+#define KVM_NYX_WTE_SET_CR3					_IOW(KVMIO,	0xf6, __u64)
 
 struct kvm_nyx_wte_gfns {
 	__u32 count;

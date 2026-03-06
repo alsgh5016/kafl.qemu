@@ -253,6 +253,17 @@ int wte_kvm_clear_nx(uint64_t *gfns, uint32_t count)
     return ret;
 }
 
+int wte_kvm_set_cr3(uint64_t cr3)
+{
+    int ret = kvm_vm_ioctl(kvm_state, KVM_NYX_WTE_SET_CR3, &cr3);
+    if (ret < 0) {
+        nyx_printf("[WtE] ERROR: KVM_NYX_WTE_SET_CR3 failed: %d\n", ret);
+    } else {
+        nyx_printf("[WtE] KVM target CR3 set to 0x%lx\n", (unsigned long)cr3);
+    }
+    return ret;
+}
+
 /* ── Public API ────────────────────────────────────────────────── */
 
 void wte_init(void)
@@ -299,6 +310,8 @@ void wte_activate(uint64_t cr3, bool is_64bit)
     if (!wte_state.kvm_wte_enabled) {
         wte_kvm_enable();
     }
+    /* Set target CR3 in KVM for kernel-side filtering */
+    wte_kvm_set_cr3(cr3);
 
     /* Sync to current dirty ring index so we only scan new entries */
     wte_state.last_scanned_ring_index = kvm_dirty_gfns_index;
@@ -443,6 +456,15 @@ void wte_handle_nx_violation(uint64_t gfn, uint64_t gpa, uint64_t rip, CPUState 
 {
     if (!wte_state.active) {
         /* Not active — just clear NX and let guest continue */
+        wte_kvm_clear_nx(&gfn, 1);
+        return;
+    }
+
+    /* Layer 2 safety net: skip kernel-mode RIP (should be filtered by KVM CR3,
+     * but catch any that slip through — e.g., CR3 not yet set) */
+    if (rip >= 0xFFFF800000000000ULL) {
+        nyx_printf("[WtE] Skipping kernel RIP=0x%lx GFN=0x%lx\n",
+                   (unsigned long)rip, (unsigned long)gfn);
         wte_kvm_clear_nx(&gfn, 1);
         return;
     }
