@@ -26,8 +26,12 @@
 #include "nyx/snapshot/memory/backend/nyx_dirty_ring.h"
 #include "nyx/fast_vm_reload.h"
 
-#include "nyx/hypercall/hypercall.h"
 #include "target/i386/cpu.h"
+
+/* Defined in hypercall.c — declared here because hypercall.h cannot
+ * reference CPUX86State (x86-specific type unknown to vl.c). */
+extern void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
+                                     const char *label);
 
 /* ── Dirty Ring Globals (defined in nyx_dirty_ring.c) ──────────── */
 

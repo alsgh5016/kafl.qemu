@@ -174,7 +174,3 @@ typedef struct req_data_bulk_s {
     uint64_t num_addresses;
     uint64_t addresses[479];
 } __attribute__((packed)) req_data_bulk_t;
-
-/* Full process memory dump via page table walk (defined in hypercall.c) */
-void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
-                              const char *label);
