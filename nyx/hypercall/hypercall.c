@@ -358,8 +358,8 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
             }
 
             if (wte_is_active()) {
-                /* WtE: scan dirty ring BEFORE pt_disable so dirty_map
-                 * is populated when bb_callback fires during pt_dump. */
+                /* WtE (EPT NX): final dirty ring scan to catch any
+                 * last-moment writes and mark them NX. */
                 wte_scan_dirty_ring();
 
                 /* Temporarily disable reload mode to prevent perform_reload()
@@ -372,9 +372,6 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
 
                 GET_GLOBAL_STATE()->in_reload_mode = saved_reload_mode;
 
-                /* Check deferred BBs that missed dirty_map during overflow,
-                 * then print debug summary. */
-                wte_check_deferred_bbs();
                 wte_print_debug_summary();
                 int wte_count = wte_get_state()->wte_count;
                 /* Return WtE count to guest via EAX so harness can decide
@@ -1564,6 +1561,17 @@ int handle_kafl_hypercall(struct kvm_run *run,
             nyx_printf("[WtE] WtE already active — forced round reset (round %d)\n",
                        wte_get_state()->round);
         }
+        ret = 0;
+        break;
+    }
+    case KVM_EXIT_KAFL_WTE:
+    {
+        /* EPT NX violation — guest executed a page marked NX.
+         * Extract gfn/gpa/rip from kvm_run and handle. */
+        uint64_t wte_gfn = run->kafl_wte.gfn;
+        uint64_t wte_gpa = run->kafl_wte.gpa;
+        uint64_t wte_rip = run->kafl_wte.rip;
+        wte_handle_nx_violation(wte_gfn, wte_gpa, wte_rip);
         ret = 0;
         break;
     }

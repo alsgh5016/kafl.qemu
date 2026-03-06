@@ -305,6 +305,8 @@ struct kvm_hyperv_exit {
 #define KVM_EXIT_KAFL_HOOK_API 140
 
 #define KVM_EXIT_KAFL_WOX_SNAPSHOT 141
+#define KVM_EXIT_KAFL_WTE 142
+
 
 
 #define KVM_CAP_NYX_PT 512
@@ -470,6 +472,12 @@ struct kvm_run {
 		} eoi;
 		/* KVM_EXIT_HYPERV */
 		struct kvm_hyperv_exit hyperv;
+		/* KVM_EXIT_KAFL_WTE */
+		struct {
+			__u64 gfn;
+			__u64 gpa;
+			__u64 rip;
+		} kafl_wte;
 		/* Fix the size of the union. */
 		char padding[256];
 	};
@@ -1739,6 +1747,18 @@ struct kvm_hyperv_eventfd {
 
 #define KVM_VMX_PT_ENABLE_MTF			_IO(KVMIO,	0xf0)	
 #define KVM_VMX_PT_DISABLE_MTF		_IO(KVMIO,	0xf1)	
+
+/* WtE (Written-then-Executed) EPT NX tracking */
+#define KVM_NYX_WTE_ENABLE					_IO(KVMIO,	0xf2)
+#define KVM_NYX_WTE_DISABLE					_IO(KVMIO,	0xf3)
+#define KVM_NYX_WTE_SET_NX					_IOW(KVMIO,	0xf4, struct kvm_nyx_wte_gfns)
+#define KVM_NYX_WTE_CLEAR_NX				_IOW(KVMIO,	0xf5, struct kvm_nyx_wte_gfns)
+
+struct kvm_nyx_wte_gfns {
+	__u32 count;
+	__u32 flags;			/* reserved */
+	__u64 gfns[];			/* flexible array of GFNs */
+};
 
 /* KVM dirty-ring */
 #define KVM_CAP_DIRTY_LOG_RING 192

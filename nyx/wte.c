@@ -1,9 +1,10 @@
 /*
- * WtE (Written-then-Executed) Detection — Core Implementation
+ * WtE (Written-then-Executed) Detection — EPT NX Implementation
  *
- * Leverages KVM Dirty Ring for EPT-based write tracking and Intel PT
- * bb_callback for execution monitoring. Content diff eliminates false
- * positives from incidental dirty pages.
+ * Uses KVM Dirty Ring for write tracking and EPT NX bit manipulation
+ * via KVM ioctls. When a dirty page is executed, KVM intercepts the
+ * EPT NX violation and exits with KVM_EXIT_KAFL_WTE. Content diff
+ * eliminates false positives from incidental dirty pages.
  */
 
 #include "qemu/osdep.h"
@@ -36,31 +37,52 @@ extern uint32_t              kvm_dirty_gfns_index_mask;
 
 static wte_state_t wte_state;
 
-/* ── Debug Counters (bb_callback stats) ────────────────────────────── */
+/* ── Internal: Page Tracking (simple dynamic array) ─────────────── */
 
-static uint64_t dbg_bb_total_calls   = 0;
-static uint64_t dbg_bb_translate_fail = 0;
-static uint64_t dbg_bb_dirty_miss     = 0;
-static uint64_t dbg_bb_exec_already   = 0;
-static uint64_t dbg_bb_diff_zero      = 0;
-static uint64_t dbg_bb_wte_hit        = 0;
+#define WTE_INITIAL_CAPACITY 256
 
-static void wte_reset_debug_counters(void)
+static int wte_find_page(uint64_t gfn)
 {
-    dbg_bb_total_calls    = 0;
-    dbg_bb_translate_fail = 0;
-    dbg_bb_dirty_miss     = 0;
-    dbg_bb_exec_already   = 0;
-    dbg_bb_diff_zero      = 0;
-    dbg_bb_wte_hit        = 0;
+    for (int i = 0; i < wte_state.page_count; i++) {
+        if (wte_state.gfns[i] == gfn) {
+            return i;
+        }
+    }
+    return -1;
 }
 
-/* ── Helpers ───────────────────────────────────────────────────── */
+static wte_page_info_t *wte_add_page(uint64_t gfn)
+{
+    if (wte_state.page_count >= wte_state.page_capacity) {
+        int new_cap = wte_state.page_capacity * 2;
+        wte_state.pages = realloc(wte_state.pages,
+                                  new_cap * sizeof(wte_page_info_t *));
+        wte_state.gfns  = realloc(wte_state.gfns,
+                                  new_cap * sizeof(uint64_t));
+        wte_state.page_capacity = new_cap;
+    }
 
-/*
- * Compute content diff between baseline and current page content.
- * Records changed byte ranges (contiguous changed regions).
- */
+    wte_page_info_t *info = malloc(sizeof(wte_page_info_t));
+    memset(info, 0, sizeof(wte_page_info_t));
+
+    int idx = wte_state.page_count;
+    wte_state.pages[idx] = info;
+    wte_state.gfns[idx]  = gfn;
+    wte_state.page_count++;
+
+    return info;
+}
+
+static void wte_free_all_pages(void)
+{
+    for (int i = 0; i < wte_state.page_count; i++) {
+        free(wte_state.pages[i]);
+    }
+    wte_state.page_count = 0;
+}
+
+/* ── Content Diff ──────────────────────────────────────────────── */
+
 static void wte_compute_diff(wte_page_info_t *info)
 {
     info->diff_count = 0;
@@ -73,11 +95,9 @@ static void wte_compute_diff(wte_page_info_t *info)
         bool differ = (info->baseline[i] != info->current[i]);
 
         if (differ && !in_diff) {
-
             in_diff = true;
             start   = i;
         } else if (!differ && in_diff) {
-
             in_diff = false;
             if (info->diff_count < WTE_MAX_DIFF_RANGES) {
                 info->diff_offsets[info->diff_count] = (uint16_t)start;
@@ -87,7 +107,6 @@ static void wte_compute_diff(wte_page_info_t *info)
         }
     }
 
-
     if (in_diff && info->diff_count < WTE_MAX_DIFF_RANGES) {
         info->diff_offsets[info->diff_count] = (uint16_t)start;
         info->diff_lengths[info->diff_count] = (uint16_t)(WTE_PAGE_SIZE - start);
@@ -95,11 +114,10 @@ static void wte_compute_diff(wte_page_info_t *info)
     }
 }
 
-/*
- * Dump WtE detection results: page content + diff info + module map.
- */
+/* ── Dump ──────────────────────────────────────────────────────── */
+
 static void wte_dump_detection(uint64_t exec_rip, uint64_t gfn,
-                               wte_page_info_t *info, CPUState *cpu)
+                               wte_page_info_t *info)
 {
     char *dump_dir = NULL;
     assert(asprintf(&dump_dir, "%s/dump/wte_round%03d_gfn%lx",
@@ -107,7 +125,7 @@ static void wte_dump_detection(uint64_t exec_rip, uint64_t gfn,
                     wte_state.round, (unsigned long)gfn) != -1);
     mkdir(dump_dir, 0755);
 
-
+    /* baseline.bin */
     char *path = NULL;
     assert(asprintf(&path, "%s/baseline.bin", dump_dir) != -1);
     FILE *f = fopen(path, "wb");
@@ -117,7 +135,7 @@ static void wte_dump_detection(uint64_t exec_rip, uint64_t gfn,
     }
     free(path);
 
-
+    /* current.bin */
     assert(asprintf(&path, "%s/current.bin", dump_dir) != -1);
     f = fopen(path, "wb");
     if (f) {
@@ -126,12 +144,12 @@ static void wte_dump_detection(uint64_t exec_rip, uint64_t gfn,
     }
     free(path);
 
-
+    /* diff_report.txt */
     assert(asprintf(&path, "%s/diff_report.txt", dump_dir) != -1);
     f = fopen(path, "w");
     if (f) {
-        fprintf(f, "WtE Detection Report\n");
-        fprintf(f, "====================\n");
+        fprintf(f, "WtE Detection Report (EPT NX)\n");
+        fprintf(f, "=============================\n");
         fprintf(f, "Round:     %d\n", wte_state.round);
         fprintf(f, "GFN:       0x%lx\n", (unsigned long)gfn);
         fprintf(f, "GPA:       0x%lx\n", (unsigned long)info->gpa);
@@ -154,41 +172,107 @@ static void wte_dump_detection(uint64_t exec_rip, uint64_t gfn,
     free(dump_dir);
 }
 
+/* ── KVM ioctl Wrappers ───────────────────────────────────────── */
+
+int wte_kvm_enable(void)
+{
+    int ret = kvm_vm_ioctl(kvm_state, KVM_NYX_WTE_ENABLE, 0);
+    if (ret < 0) {
+        nyx_printf("[WtE] ERROR: KVM_NYX_WTE_ENABLE failed: %d\n", ret);
+    } else {
+        nyx_printf("[WtE] KVM WtE enabled\n");
+        wte_state.kvm_wte_enabled = true;
+    }
+    return ret;
+}
+
+int wte_kvm_disable(void)
+{
+    int ret = kvm_vm_ioctl(kvm_state, KVM_NYX_WTE_DISABLE, 0);
+    if (ret < 0) {
+        nyx_printf("[WtE] ERROR: KVM_NYX_WTE_DISABLE failed: %d\n", ret);
+    } else {
+        nyx_printf("[WtE] KVM WtE disabled\n");
+        wte_state.kvm_wte_enabled = false;
+    }
+    return ret;
+}
+
+int wte_kvm_set_nx(uint64_t *gfns, uint32_t count)
+{
+    if (count == 0) {
+        return 0;
+    }
+
+    /*
+     * Allocate kvm_nyx_wte_gfns with flexible array member.
+     * struct kvm_nyx_wte_gfns { __u32 count; __u32 flags; __u64 gfns[]; };
+     */
+    size_t size = sizeof(struct kvm_nyx_wte_gfns) + count * sizeof(uint64_t);
+    struct kvm_nyx_wte_gfns *req = malloc(size);
+    req->count = count;
+    req->flags = 0;
+    memcpy(req->gfns, gfns, count * sizeof(uint64_t));
+
+    int ret = kvm_vm_ioctl(kvm_state, KVM_NYX_WTE_SET_NX, req);
+    if (ret < 0) {
+        nyx_printf("[WtE] ERROR: KVM_NYX_WTE_SET_NX failed: %d (count=%u)\n",
+                   ret, count);
+    }
+
+    free(req);
+    return ret;
+}
+
+int wte_kvm_clear_nx(uint64_t *gfns, uint32_t count)
+{
+    if (count == 0) {
+        return 0;
+    }
+
+    size_t size = sizeof(struct kvm_nyx_wte_gfns) + count * sizeof(uint64_t);
+    struct kvm_nyx_wte_gfns *req = malloc(size);
+    req->count = count;
+    req->flags = 0;
+    memcpy(req->gfns, gfns, count * sizeof(uint64_t));
+
+    int ret = kvm_vm_ioctl(kvm_state, KVM_NYX_WTE_CLEAR_NX, req);
+    if (ret < 0) {
+        nyx_printf("[WtE] ERROR: KVM_NYX_WTE_CLEAR_NX failed: %d (count=%u)\n",
+                   ret, count);
+    }
+
+    free(req);
+    return ret;
+}
+
 /* ── Public API ────────────────────────────────────────────────── */
 
 void wte_init(void)
 {
     memset(&wte_state, 0, sizeof(wte_state_t));
 
-    wte_state.dirty_map    = kh_init(WTE_DIRTY);
-    wte_state.exec_map     = kh_init(WTE_EXEC);
-    wte_state.bb_deferred  = kh_init(WTE_BB_DEFER);
-    wte_state.round        = 0;
-    wte_state.active       = false;
-    wte_state.overflow_count = 0;
+    wte_state.pages = malloc(WTE_INITIAL_CAPACITY * sizeof(wte_page_info_t *));
+    wte_state.gfns  = malloc(WTE_INITIAL_CAPACITY * sizeof(uint64_t));
+    wte_state.page_capacity = WTE_INITIAL_CAPACITY;
+    wte_state.page_count    = 0;
 
-    nyx_printf("[WtE] Initialized\n");
+    wte_state.round  = 0;
+    wte_state.active = false;
+    wte_state.kvm_wte_enabled = false;
+
+    nyx_printf("[WtE] Initialized (EPT NX mode)\n");
 }
 
 void wte_destroy(void)
 {
-    if (wte_state.dirty_map) {
-        khiter_t k;
-        for (k = kh_begin(wte_state.dirty_map);
-             k != kh_end(wte_state.dirty_map); ++k)
-        {
-            if (kh_exist(wte_state.dirty_map, k)) {
-                free(kh_value(wte_state.dirty_map, k));
-            }
-        }
-        kh_destroy(WTE_DIRTY, wte_state.dirty_map);
+    if (wte_state.kvm_wte_enabled) {
+        wte_kvm_disable();
     }
-    if (wte_state.exec_map) {
-        kh_destroy(WTE_EXEC, wte_state.exec_map);
-    }
-    if (wte_state.bb_deferred) {
-        kh_destroy(WTE_BB_DEFER, wte_state.bb_deferred);
-    }
+
+    wte_free_all_pages();
+    free(wte_state.pages);
+    free(wte_state.gfns);
 
     memset(&wte_state, 0, sizeof(wte_state_t));
     nyx_printf("[WtE] Destroyed\n");
@@ -202,6 +286,12 @@ void wte_activate(uint64_t cr3, bool is_64bit)
     wte_state.round      = 0;
     wte_state.wte_count  = 0;
     wte_state.total_wte_count = 0;
+    wte_state.nx_pages_set    = 0;
+
+    /* Enable KVM WtE tracking */
+    if (!wte_state.kvm_wte_enabled) {
+        wte_kvm_enable();
+    }
 
     /* Sync to current dirty ring index so we only scan new entries */
     wte_state.last_scanned_ring_index = kvm_dirty_gfns_index;
@@ -214,13 +304,19 @@ void wte_deactivate(void)
 {
     nyx_printf("[WtE] Deactivated: total detections=%d across %d rounds\n",
                wte_state.total_wte_count, wte_state.round + 1);
+
+    if (wte_state.kvm_wte_enabled) {
+        wte_kvm_disable();
+    }
+
     wte_state.active = false;
 }
 
 /*
  * Scan dirty ring entries that haven't been processed yet.
- * For each new dirty GFN: read current page content via GPA,
- * store baseline (if first time) and current content for later diff.
+ * For each new dirty GFN: read baseline + current content,
+ * then mark the page NX in EPT via ioctl so execution will
+ * trigger KVM_EXIT_KAFL_WTE.
  *
  * MUST be called BEFORE dirty_ring_flush_and_collect() so entries
  * are still valid in the ring.
@@ -234,7 +330,10 @@ void wte_scan_dirty_ring(void)
     uint32_t scan_idx = wte_state.last_scanned_ring_index;
     int      new_pages = 0;
     int      updated_pages = 0;
-    int      diff_at_scan = 0;  /* pages with diff_count > 0 at scan time */
+
+    /* Collect GFNs that need NX set (new dirty pages not yet NX-protected) */
+    uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
+    int      nx_batch_count = 0;
 
     while (true) {
         uint32_t ring_idx = scan_idx & kvm_dirty_gfns_index_mask;
@@ -247,61 +346,59 @@ void wte_scan_dirty_ring(void)
         uint64_t gfn = entry->offset;
         uint64_t gpa = gfn << 12;
 
-        /* Skip low system pages (IVT, BDA, etc.) — not target process memory */
+        /* Skip low system pages (IVT, BDA, etc.) */
         if (gfn <= 0x10) {
             scan_idx++;
             continue;
         }
 
-        khiter_t k = kh_get(WTE_DIRTY, wte_state.dirty_map, gfn);
+        int idx = wte_find_page(gfn);
 
-        if (k == kh_end(wte_state.dirty_map)) {
-            wte_page_info_t *info = malloc(sizeof(wte_page_info_t));
-            memset(info, 0, sizeof(wte_page_info_t));
+        if (idx < 0) {
+            /* New dirty page — create tracking entry */
+            wte_page_info_t *info = wte_add_page(gfn);
             info->gpa = gpa;
 
-            /*
-             * Read baseline content from root snapshot (shadow memory).
-             * This gives us the pre-write content for accurate diff.
-             */
+            /* Read baseline from root snapshot (shadow memory) */
             if (fast_reload_root_created(get_fast_reload_snapshot())) {
                 if (!read_snapshot_memory(get_fast_reload_snapshot(),
                                          gpa, info->baseline, WTE_PAGE_SIZE)) {
-                    /* Snapshot doesn't cover this GPA — use current as baseline */
                     cpu_physical_memory_read(gpa, info->baseline, WTE_PAGE_SIZE);
                 }
             } else {
-                /* No snapshot available — fallback to current content */
                 cpu_physical_memory_read(gpa, info->baseline, WTE_PAGE_SIZE);
             }
             info->baseline_valid = true;
 
             /* Read current content (post-write) */
             cpu_physical_memory_read(gpa, info->current, WTE_PAGE_SIZE);
-
             wte_compute_diff(info);
-            /* DEBUG: log first 3 new dirty pages */
+
+            /* Mark NX in EPT — batch for efficiency */
+            if (!info->nx_set && nx_batch_count < WTE_MAX_BATCH_GFNS) {
+                nx_batch[nx_batch_count++] = gfn;
+                info->nx_set = true;
+            }
+
             if (new_pages < 3) {
                 nyx_printf("[WtE][DBG] new dirty GFN=0x%lx GPA=0x%lx diff_count=%d\n",
                            (unsigned long)gfn, (unsigned long)gpa, info->diff_count);
             }
-            if (info->diff_count > 0) {
-                diff_at_scan++;
-            }
-
-            int ret;
-            k = kh_put(WTE_DIRTY, wte_state.dirty_map, gfn, &ret);
-            kh_value(wte_state.dirty_map, k) = info;
 
             new_pages++;
         } else {
-            wte_page_info_t *info = kh_value(wte_state.dirty_map, k);
+            /* Existing dirty page — re-written, update content */
+            wte_page_info_t *info = wte_state.pages[idx];
             cpu_physical_memory_read(gpa, info->current, WTE_PAGE_SIZE);
             wte_compute_diff(info);
-            updated_pages++;
-            if (info->diff_count > 0) {
-                diff_at_scan++;
+
+            /* Re-set NX if it was cleared after a previous WtE detection */
+            if (!info->nx_set && nx_batch_count < WTE_MAX_BATCH_GFNS) {
+                nx_batch[nx_batch_count++] = gfn;
+                info->nx_set = true;
             }
+
+            updated_pages++;
         }
 
         scan_idx++;
@@ -309,117 +406,94 @@ void wte_scan_dirty_ring(void)
 
     wte_state.last_scanned_ring_index = scan_idx;
 
+    /* Batch ioctl: set NX on all newly dirty pages */
+    if (nx_batch_count > 0) {
+        wte_kvm_set_nx(nx_batch, nx_batch_count);
+        wte_state.nx_pages_set += nx_batch_count;
+
+        nyx_printf("[WtE] Set NX on %d pages (total NX: %d)\n",
+                   nx_batch_count, wte_state.nx_pages_set);
+    }
+
     if (new_pages > 0 || updated_pages > 0) {
-        nyx_printf("[WtE] Scanned ring: %d new, %d updated dirty pages ",
-                   new_pages, updated_pages);
-        nyx_printf("(total tracked: %lu, diff_at_scan: %d)\n",
-                   (unsigned long)kh_size(wte_state.dirty_map), diff_at_scan);
+        nyx_printf("[WtE] Scanned ring: %d new, %d updated dirty pages "
+                   "(total tracked: %d)\n",
+                   new_pages, updated_pages, wte_state.page_count);
     }
 }
 
 /*
- * Intel PT bb_callback — called for every basic block executed by guest.
+ * Handle EPT NX violation — called when KVM exits with KVM_EXIT_KAFL_WTE.
  *
- * Checks if the execution target falls within a dirty page (GFN in dirty_map).
- * If so, verifies content diff to confirm WtE, then dumps.
+ * The guest attempted to execute code on a page we marked NX because
+ * it was written to (dirty). We perform a content diff to confirm
+ * the write actually changed code, then dump if confirmed.
+ *
+ * After handling, clear the NX bit so the guest can re-execute.
+ * KVM_RUN will automatically retry the faulting instruction.
  */
-void wte_bb_callback(void *opaque, disassembler_mode_t mode,
-                     uint64_t ip, uint64_t tsc)
+void wte_handle_nx_violation(uint64_t gfn, uint64_t gpa, uint64_t rip)
 {
-
     if (!wte_state.active) {
+        /* Not active — just clear NX and let guest continue */
+        wte_kvm_clear_nx(&gfn, 1);
         return;
     }
 
-    dbg_bb_total_calls++;
+    nyx_printf("[WtE] NX violation: GFN=0x%lx GPA=0x%lx RIP=0x%lx\n",
+               (unsigned long)gfn, (unsigned long)gpa, (unsigned long)rip);
 
-    /*
-     * Convert virtual IP → physical GFN.
-     * Use the target process CR3 for translation.
-     */
-    CPUState *cpu = first_cpu;
-    uint64_t phys_addr = get_paging_phys_addr(cpu, wte_state.target_cr3, ip);
+    int idx = wte_find_page(gfn);
 
-    if (phys_addr == (uint64_t)-1) {
-        dbg_bb_translate_fail++;
-        if (dbg_bb_translate_fail <= 3) {
-            nyx_printf("[WtE][DBG] translate FAIL: ip=0x%lx cr3=0x%lx\n",
-                       (unsigned long)ip, (unsigned long)wte_state.target_cr3);
-        }
+    if (idx < 0) {
+        /*
+         * Page not in our tracking — might have been marked NX before
+         * we started tracking, or from a stale state. Clear NX and go.
+         */
+        nyx_printf("[WtE] WARN: NX violation for untracked GFN=0x%lx, clearing\n",
+                   (unsigned long)gfn);
+        wte_kvm_clear_nx(&gfn, 1);
         return;
     }
 
-    uint64_t gfn = phys_addr >> 12;
+    wte_page_info_t *info = wte_state.pages[idx];
 
-    khiter_t k = kh_get(WTE_DIRTY, wte_state.dirty_map, gfn);
-    if (k == kh_end(wte_state.dirty_map)) {
-        dbg_bb_dirty_miss++;
-        /* Defer this IP for later re-check when dirty_map is complete */
-        int defer_ret;
-        kh_put(WTE_BB_DEFER, wte_state.bb_deferred, ip, &defer_ret);
-        return;
-    }
-
-    khiter_t ek = kh_get(WTE_EXEC, wte_state.exec_map, gfn);
-    if (ek != kh_end(wte_state.exec_map)) {
-        dbg_bb_exec_already++;
-        return;
-    }
-    wte_page_info_t *info = kh_value(wte_state.dirty_map, k);
-
-    /*
-     * Re-read current content to get latest state at execution time.
-     * This is crucial: the page may have been written further between
-     * the dirty ring scan and this execution.
-     */
-    cpu_physical_memory_read(info->gpa, info->current, WTE_PAGE_SIZE);
+    /* Re-read current content at execution time for accurate diff */
+    cpu_physical_memory_read(gpa, info->current, WTE_PAGE_SIZE);
     wte_compute_diff(info);
 
     if (info->diff_count == 0) {
-        dbg_bb_diff_zero++;
+        /* No actual code change — false positive (incidental dirty page).
+         * Clear NX so guest can execute without further exits. */
+        nyx_printf("[WtE] False positive (no diff): GFN=0x%lx, clearing NX\n",
+                   (unsigned long)gfn);
+        info->nx_set = false;
+        wte_state.nx_pages_set--;
+        wte_kvm_clear_nx(&gfn, 1);
         return;
     }
 
-    /* Confirmed WtE */
-    int ret;
-    ek = kh_put(WTE_EXEC, wte_state.exec_map, gfn, &ret);
-    kh_value(wte_state.exec_map, ek) = ip;
-
+    /* Confirmed WtE — dump detection results */
     wte_state.wte_count++;
     wte_state.total_wte_count++;
-    dbg_bb_wte_hit++;
 
     nyx_printf("[WtE] *** WRITTEN-THEN-EXECUTED ***  round=%d  RIP=0x%lx  "
                "GFN=0x%lx  GPA=0x%lx  diffs=%d\n",
-               wte_state.round, (unsigned long)ip, (unsigned long)gfn,
-               (unsigned long)info->gpa, info->diff_count);
+               wte_state.round, (unsigned long)rip, (unsigned long)gfn,
+               (unsigned long)gpa, info->diff_count);
 
-    wte_dump_detection(ip, gfn, info, cpu);
-}
+    wte_dump_detection(rip, gfn, info);
 
-/* ── Debug summary — call after pt_dump completes to see bb_callback stats ─── */
-
-void wte_print_debug_summary(void)
-{
-    nyx_printf("[WtE][DBG] === BB_CALLBACK SUMMARY === "
-               "total=%lu tfail=%lu miss=%lu dirty_hit=%lu diff0=%lu "
-               "exec_dup=%lu wte=%lu dirty_map_size=%lu "
-               "deferred=%lu overflow=%lu\n",
-               (unsigned long)dbg_bb_total_calls,
-               (unsigned long)dbg_bb_translate_fail,
-               (unsigned long)dbg_bb_dirty_miss,
-               (unsigned long)(dbg_bb_diff_zero + dbg_bb_wte_hit),
-               (unsigned long)dbg_bb_diff_zero,
-               (unsigned long)dbg_bb_exec_already,
-               (unsigned long)dbg_bb_wte_hit,
-               (unsigned long)kh_size(wte_state.dirty_map),
-               (unsigned long)kh_size(wte_state.bb_deferred),
-               (unsigned long)wte_state.overflow_count);
+    /* Clear NX so the faulting instruction can re-execute.
+     * If this page is written again, dirty ring will re-trigger NX set. */
+    info->nx_set = false;
+    wte_state.nx_pages_set--;
+    wte_kvm_clear_nx(&gfn, 1);
 }
 
 /*
  * Reset WtE tracking for next detection round.
- * Clears dirty_map and exec_map, increments round counter.
+ * Clears all NX bits, frees page tracking, increments round counter.
  * After this, new writes will be tracked from zero base.
  */
 void wte_reset_round(void)
@@ -431,120 +505,53 @@ void wte_reset_round(void)
     nyx_printf("[WtE] Round %d complete: %d WtE detections. Resetting.\n",
                wte_state.round, wte_state.wte_count);
 
+    /* Collect all GFNs that still have NX set and clear them */
+    uint64_t clear_batch[WTE_MAX_BATCH_GFNS];
+    int      clear_count = 0;
 
-    khiter_t k;
-    for (k = kh_begin(wte_state.dirty_map);
-         k != kh_end(wte_state.dirty_map); ++k)
-    {
-        if (kh_exist(wte_state.dirty_map, k)) {
-            free(kh_value(wte_state.dirty_map, k));
+    for (int i = 0; i < wte_state.page_count; i++) {
+        if (wte_state.pages[i]->nx_set) {
+            if (clear_count < WTE_MAX_BATCH_GFNS) {
+                clear_batch[clear_count++] = wte_state.gfns[i];
+            }
         }
     }
 
+    if (clear_count > 0) {
+        wte_kvm_clear_nx(clear_batch, clear_count);
+        nyx_printf("[WtE] Cleared NX on %d pages\n", clear_count);
+    }
 
-    kh_clear(WTE_DIRTY, wte_state.dirty_map);
-    kh_clear(WTE_EXEC, wte_state.exec_map);
-    kh_clear(WTE_BB_DEFER, wte_state.bb_deferred);
+    /* Free all page tracking */
+    wte_free_all_pages();
 
-
+    /* Reset counters */
     wte_state.round++;
-    wte_state.wte_count = 0;
-    wte_state.overflow_count = 0;
+    wte_state.wte_count    = 0;
+    wte_state.nx_pages_set = 0;
 
-    wte_reset_debug_counters();
-
-    /* Sync to current dirty ring index so we only scan new entries */
+    /* Sync to current dirty ring index */
     wte_state.last_scanned_ring_index = kvm_dirty_gfns_index;
 
     nyx_printf("[WtE] Round %d started. Tracking from clean state.\n",
                wte_state.round);
 }
 
+void wte_print_debug_summary(void)
+{
+    nyx_printf("[WtE][DBG] === SUMMARY === "
+               "round=%d wte_count=%d total=%d "
+               "tracked_pages=%d nx_pages=%d\n",
+               wte_state.round,
+               wte_state.wte_count,
+               wte_state.total_wte_count,
+               wte_state.page_count,
+               wte_state.nx_pages_set);
+}
+
 bool wte_is_active(void)
 {
     return wte_state.active;
-}
-
-/*
- * Check deferred BB IPs against the now-complete dirty_map.
- * Called at RELEASE after final dirty ring scan + pt_dump,
- * when dirty_map is fully populated.
- */
-void wte_check_deferred_bbs(void)
-{
-    if (!wte_state.active || !wte_state.bb_deferred) {
-        return;
-    }
-
-    int checked = 0, hits = 0;
-    CPUState *cpu = first_cpu;
-
-    nyx_printf("[WtE] Checking %lu deferred BBs against dirty_map (size=%lu)\n",
-               (unsigned long)kh_size(wte_state.bb_deferred),
-               (unsigned long)kh_size(wte_state.dirty_map));
-
-    khiter_t ki;
-    for (ki = kh_begin(wte_state.bb_deferred);
-         ki != kh_end(wte_state.bb_deferred); ++ki)
-    {
-        if (!kh_exist(wte_state.bb_deferred, ki)) {
-            continue;
-        }
-
-        uint64_t ip = kh_key(wte_state.bb_deferred, ki);
-        checked++;
-
-        /* Translate IP → physical → GFN */
-        uint64_t phys_addr = get_paging_phys_addr(cpu, wte_state.target_cr3, ip);
-        if (phys_addr == (uint64_t)-1) {
-            continue;
-        }
-
-        uint64_t gfn = phys_addr >> 12;
-
-        /* Check dirty_map */
-        khiter_t dk = kh_get(WTE_DIRTY, wte_state.dirty_map, gfn);
-        if (dk == kh_end(wte_state.dirty_map)) {
-            continue;  /* Still not in dirty_map — not a write target */
-        }
-
-        /* Skip if already confirmed WtE for this GFN */
-        khiter_t ek = kh_get(WTE_EXEC, wte_state.exec_map, gfn);
-        if (ek != kh_end(wte_state.exec_map)) {
-            continue;
-        }
-
-        /* Re-read current content and compute diff */
-        wte_page_info_t *info = kh_value(wte_state.dirty_map, dk);
-        cpu_physical_memory_read(info->gpa, info->current, WTE_PAGE_SIZE);
-        wte_compute_diff(info);
-
-        nyx_printf("[WtE][DBG] deferred HIT: ip=0x%lx gfn=0x%lx diff_count=%d\n",
-                   (unsigned long)ip, (unsigned long)gfn, info->diff_count);
-
-        if (info->diff_count == 0) {
-            continue;
-        }
-
-        /* Confirmed WtE via deferred check */
-        int ret;
-        ek = kh_put(WTE_EXEC, wte_state.exec_map, gfn, &ret);
-        kh_value(wte_state.exec_map, ek) = ip;
-
-        wte_state.wte_count++;
-        wte_state.total_wte_count++;
-        dbg_bb_wte_hit++;
-        hits++;
-
-        nyx_printf("[WtE] *** DEFERRED WtE DETECTED ***  round=%d  RIP=0x%lx  "
-                   "GFN=0x%lx  GPA=0x%lx  diffs=%d\n",
-                   wte_state.round, (unsigned long)ip, (unsigned long)gfn,
-                   (unsigned long)info->gpa, info->diff_count);
-
-        wte_dump_detection(ip, gfn, info, cpu);
-    }
-
-    nyx_printf("[WtE] Deferred check done: checked=%d hits=%d\n", checked, hits);
 }
 
 wte_state_t *wte_get_state(void)
