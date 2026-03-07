@@ -223,8 +223,23 @@ static void set_return_value(CPUState *cpu, uint64_t return_value)
 {
     kvm_arch_get_registers(cpu);
     CPUX86State *env = &(X86_CPU(cpu))->env;
+    uint64_t old_rax = env->regs[R_EAX];
     env->regs[R_EAX] = return_value;
-    kvm_arch_put_registers(cpu, KVM_PUT_RUNTIME_STATE);
+    int ret = kvm_arch_put_registers(cpu, KVM_PUT_RUNTIME_STATE);
+
+    /* Diagnostic: verify the write succeeded and value persists */
+    nyx_printf("[set_return_value] old_RAX=0x%lx new_RAX=0x%lx "
+               "put_registers ret=%d\n",
+               (unsigned long)old_rax, (unsigned long)return_value, ret);
+
+    /* Read back to verify KVM actually has the new value */
+    kvm_arch_get_registers(cpu);
+    uint64_t readback = env->regs[R_EAX];
+    if (readback != return_value) {
+        nyx_printf("[set_return_value] WARNING: readback mismatch! "
+                   "expected=0x%lx got=0x%lx\n",
+                   (unsigned long)return_value, (unsigned long)readback);
+    }
 }
 
 static void handle_hypercall_kafl_req_stream_data(struct kvm_run *run,
@@ -491,11 +506,16 @@ static void handle_hypercall_kafl_cr3(struct kvm_run *run,
         GET_GLOBAL_STATE()->parent_cr3 = cr3_val;
         pt_set_cr3(cpu, cr3_val, false);
 
-        /* Update WtE target CR3 to child process */
+        /* WtE target CR3 was already set by WTE_SETUP —
+         * SUBMIT_CR3 must NOT overwrite it.
+         * Intel PT CR3 filter (parent_cr3/pt_set_cr3) uses harness CR3,
+         * which is correct for PT tracing. But WtE EPT NX filter must
+         * keep using the child process CR3 discovered by EPROCESS walk. */
         if (wte_is_active()) {
-            wte_get_state()->target_cr3 = cr3_val;
-            nyx_printf("[WtE] Updated target_cr3 to 0x%lx\n", (unsigned long)cr3_val);
-            wte_kvm_set_cr3(cr3_val);
+            nyx_printf("[WtE] SUBMIT_CR3: keeping target_cr3=0x%lx "
+                       "(ignoring harness cr3=0x%lx)\n",
+                       (unsigned long)wte_get_state()->target_cr3,
+                       (unsigned long)cr3_val);
         }
         if (GET_GLOBAL_STATE()->dump_page) {
             set_page_dump_bp(cpu, cr3_val,
