@@ -365,16 +365,23 @@ void wte_scan_dirty_ring(void)
             uint64_t gfn = wte_state.renx_queue[i];
             int idx = wte_find_page(gfn);
             if (idx >= 0 && !wte_state.pages[idx]->nx_set) {
-                if (renx_batch_count < WTE_MAX_BATCH_GFNS) {
-                    renx_batch[renx_batch_count++] = gfn;
-                    wte_state.pages[idx]->nx_set = true;
-                    re_nx++;
+                renx_batch[renx_batch_count++] = gfn;
+                wte_state.pages[idx]->nx_set = true;
+                re_nx++;
+
+                /* Flush batch when full */
+                if (renx_batch_count >= WTE_MAX_BATCH_GFNS) {
+                    wte_kvm_set_nx(renx_batch, renx_batch_count);
+                    wte_state.nx_pages_set += renx_batch_count;
+                    renx_batch_count = 0;
                 }
             }
         }
         if (renx_batch_count > 0) {
             wte_kvm_set_nx(renx_batch, renx_batch_count);
             wte_state.nx_pages_set += renx_batch_count;
+        }
+        if (re_nx > 0) {
             nyx_printf("[WtE] Re-NX applied to %d pages (kernel RIP recovery)\n", re_nx);
         }
         wte_state.renx_count = 0;
@@ -383,6 +390,7 @@ void wte_scan_dirty_ring(void)
     uint32_t scan_idx = wte_state.last_scanned_ring_index;
     int      new_pages = 0;
     int      updated_pages = 0;
+    int      total_nx_set_this_scan = 0;
 
     /* Collect GFNs that need NX set (new dirty pages not yet NX-protected) */
     uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
@@ -428,9 +436,16 @@ void wte_scan_dirty_ring(void)
             wte_compute_diff(info);
 
             /* Mark NX in EPT — batch for efficiency */
-            if (!info->nx_set && nx_batch_count < WTE_MAX_BATCH_GFNS) {
+            if (!info->nx_set) {
                 nx_batch[nx_batch_count++] = gfn;
                 info->nx_set = true;
+
+                /* Flush batch when full (kernel ioctl limit = 4096) */
+                if (nx_batch_count >= WTE_MAX_BATCH_GFNS) {
+                    wte_kvm_set_nx(nx_batch, nx_batch_count);
+                    total_nx_set_this_scan += nx_batch_count;
+                    nx_batch_count = 0;
+                }
             }
 
             if (new_pages < 3) {
@@ -446,9 +461,16 @@ void wte_scan_dirty_ring(void)
             wte_compute_diff(info);
 
             /* Re-set NX if it was cleared after a previous WtE detection */
-            if (!info->nx_set && nx_batch_count < WTE_MAX_BATCH_GFNS) {
+            if (!info->nx_set) {
                 nx_batch[nx_batch_count++] = gfn;
                 info->nx_set = true;
+
+                /* Flush batch when full */
+                if (nx_batch_count >= WTE_MAX_BATCH_GFNS) {
+                    wte_kvm_set_nx(nx_batch, nx_batch_count);
+                    total_nx_set_this_scan += nx_batch_count;
+                    nx_batch_count = 0;
+                }
             }
 
             updated_pages++;
@@ -459,13 +481,16 @@ void wte_scan_dirty_ring(void)
 
     wte_state.last_scanned_ring_index = scan_idx;
 
-    /* Batch ioctl: set NX on all newly dirty pages */
+    /* Flush remaining NX batch */
     if (nx_batch_count > 0) {
         wte_kvm_set_nx(nx_batch, nx_batch_count);
-        wte_state.nx_pages_set += nx_batch_count;
+        total_nx_set_this_scan += nx_batch_count;
+    }
 
+    if (total_nx_set_this_scan > 0) {
+        wte_state.nx_pages_set += total_nx_set_this_scan;
         nyx_printf("[WtE] Set NX on %d pages (total NX: %d)\n",
-                   nx_batch_count, wte_state.nx_pages_set);
+                   total_nx_set_this_scan, wte_state.nx_pages_set);
     }
 
     if (new_pages > 0 || updated_pages > 0) {
@@ -594,18 +619,28 @@ void wte_reset_round(void)
     /* Collect all GFNs that still have NX set and clear them */
     uint64_t clear_batch[WTE_MAX_BATCH_GFNS];
     int      clear_count = 0;
+    int      total_cleared = 0;
 
     for (int i = 0; i < wte_state.page_count; i++) {
         if (wte_state.pages[i]->nx_set) {
-            if (clear_count < WTE_MAX_BATCH_GFNS) {
-                clear_batch[clear_count++] = wte_state.gfns[i];
+            clear_batch[clear_count++] = wte_state.gfns[i];
+
+            /* Flush batch when full */
+            if (clear_count >= WTE_MAX_BATCH_GFNS) {
+                wte_kvm_clear_nx(clear_batch, clear_count);
+                total_cleared += clear_count;
+                clear_count = 0;
             }
         }
     }
 
     if (clear_count > 0) {
         wte_kvm_clear_nx(clear_batch, clear_count);
-        nyx_printf("[WtE] Cleared NX on %d pages\n", clear_count);
+        total_cleared += clear_count;
+    }
+
+    if (total_cleared > 0) {
+        nyx_printf("[WtE] Cleared NX on %d pages\n", total_cleared);
     }
 
     /* Free all page tracking */

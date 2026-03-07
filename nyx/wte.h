@@ -29,7 +29,7 @@
 #define WTE_MAX_DIFF_RANGES 256
 
 /* Maximum GFNs per batch ioctl call */
-#define WTE_MAX_BATCH_GFNS  512
+#define WTE_MAX_BATCH_GFNS  4096
 
 typedef struct {
     uint64_t gpa;                            /* Guest Physical Address (GFN << 12) */
