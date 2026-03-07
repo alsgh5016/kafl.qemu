@@ -1786,10 +1786,10 @@ int handle_kafl_hypercall(struct kvm_run *run,
         } __attribute__((packed)) kafl_wte_setup_t;
 
         kafl_wte_setup_t setup = {0};
-        if (!read_virtual_memory(hypercall_arg, (uint8_t *)&setup,
+        if (!read_virtual_memory(arg, (uint8_t *)&setup,
                                  sizeof(setup), cpu)) {
             nyx_printf("[WtE] WTE_SETUP: failed to read setup struct at 0x%lx\n",
-                       (unsigned long)hypercall_arg);
+                       (unsigned long)arg);
             set_return_value(cpu, 0);
             ret = 0;
             break;
