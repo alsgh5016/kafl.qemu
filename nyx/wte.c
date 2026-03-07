@@ -606,11 +606,72 @@ void wte_handle_nx_violation(uint64_t gfn, uint64_t gpa, uint64_t rip, CPUState 
 
     if (idx < 0) {
         /*
-         * Page not in our tracking — might have been marked NX before
-         * we started tracking, or from a stale state. Clear NX and go.
+         * GFN not in tracking. Check if RIP is in target PE VA range.
+         * This handles Windows page remapping (CoW) where a PE page's
+         * physical backing changes after WTE_SETUP.
          */
-        nyx_printf("[WtE] WARN: NX violation for untracked GFN=0x%lx, clearing\n",
-                   (unsigned long)gfn);
+        bool rip_in_pe = (wte_state.target_image_base != 0 &&
+                          rip >= wte_state.target_image_base &&
+                          rip < wte_state.target_image_end);
+
+        if (rip_in_pe) {
+            /*
+             * VA-based detection: RIP is in target PE range but GFN is new.
+             * This is likely a CoW page or Windows page remapping.
+             * Add this GFN to tracking and proceed with WtE detection.
+             */
+            nyx_printf("[WtE][VA-DETECT] Untracked GFN=0x%lx but RIP=0x%lx is in PE range "
+                       "[0x%lx-0x%lx] — adding to tracking\n",
+                       (unsigned long)gfn, (unsigned long)rip,
+                       (unsigned long)wte_state.target_image_base,
+                       (unsigned long)wte_state.target_image_end);
+
+            /* Add this new GFN to tracking */
+            wte_page_info_t *new_info = wte_add_page(gfn);
+            new_info->gpa = gpa & ~0xFFFULL;  /* Page-aligned GPA */
+            new_info->nx_set = true;
+            wte_state.nx_pages_set++;
+
+            /* Read baseline from root snapshot GPA (if available) and current content */
+            cpu_physical_memory_read(new_info->gpa, new_info->baseline, WTE_PAGE_SIZE);
+            new_info->baseline_valid = true;
+
+            /* Re-read current content for diff */
+            cpu_physical_memory_read(gpa, new_info->current, WTE_PAGE_SIZE);
+            wte_compute_diff(new_info);
+
+            /* VA-based detection always triggers WtE (we trust VA range) even if diff is 0 */
+            wte_state.wte_count++;
+            wte_state.total_wte_count++;
+
+            nyx_printf("[WtE] *** VA-BASED WRITTEN-THEN-EXECUTED ***  round=%d  RIP=0x%lx  "
+                       "GFN=0x%lx  GPA=0x%lx  diffs=%d (remapped page)\n",
+                       wte_state.round, (unsigned long)rip, (unsigned long)gfn,
+                       (unsigned long)gpa, new_info->diff_count);
+
+            wte_dump_detection(rip, gfn, new_info);
+
+            /* Full process memory dump */
+            {
+                X86CPU *cpux86 = X86_CPU(cpu);
+                CPUX86State *env = &cpux86->env;
+                char wte_label[128];
+                snprintf(wte_label, sizeof(wte_label), "wte_round%d_rip0x%lx_gfn0x%lx_va",
+                         wte_state.round, (unsigned long)rip, (unsigned long)gfn);
+                dump_full_process_memory(cpu, env, wte_label);
+            }
+
+            /* Update baseline and clear NX */
+            memcpy(new_info->baseline, new_info->current, WTE_PAGE_SIZE);
+            new_info->nx_set = false;
+            wte_state.nx_pages_set--;
+            wte_kvm_clear_nx(&gfn, 1);
+            return;
+        }
+
+        /* Not in PE range — just clear NX and continue */
+        nyx_printf("[WtE] WARN: NX violation for untracked GFN=0x%lx RIP=0x%lx, clearing\n",
+                   (unsigned long)gfn, (unsigned long)rip);
         wte_kvm_clear_nx(&gfn, 1);
         return;
     }
