@@ -828,10 +828,22 @@ uint64_t wte_find_cr3_by_pid(CPUState *cpu, uint64_t harness_cr3, uint64_t targe
      * We use approach (a-d) since we have full register access.
      */
 
-    /* Read IA32_GS_BASE to get KPCR (kernel GS base for x64) */
     kvm_arch_get_registers(cpu);
     CPUX86State *env = &(X86_CPU(cpu)->env);
-    uint64_t gs_base = env->segs[R_GS].base;
+
+    /* Read GS base — in user mode (CPL=3), GS base is TEB, not KPCR.
+     * KPCR is stored in IA32_KERNEL_GS_BASE (swapped by SWAPGS on syscall).
+     * In kernel mode (CPL=0), GS base is KPCR directly. */
+    uint64_t gs_base;
+    if ((env->segs[R_CS].selector & 3) == 3) {
+        /* User mode: KPCR is in IA32_KERNEL_GS_BASE MSR */
+        gs_base = env->kernelgsbase;
+        nyx_printf("[WtE][CR3] User-mode detected (CPL=3), using kernelgsbase for KPCR\n");
+    } else {
+        /* Kernel mode: KPCR is in GS base */
+        gs_base = env->segs[R_GS].base;
+        nyx_printf("[WtE][CR3] Kernel-mode detected (CPL=0), using GS base for KPCR\n");
+    }
 
     nyx_printf("[WtE][CR3] Looking up CR3 for PID %lu via EPROCESS walk\n",
                (unsigned long)target_pid);

@@ -1826,6 +1826,22 @@ int handle_kafl_hypercall(struct kvm_run *run,
             ret = 0;
             break;
         }
+
+        /* Validate CR3: must be page-aligned, not a known garbage value,
+         * and within reasonable physical address range */
+        if ((child_cr3 & 0xFFF) != 0 ||
+            child_cr3 == 0x1f ||  /* HYPERCALL_KAFL_RAX_ID — leftover from failed dispatch */
+            child_cr3 < 0x10000) {  /* Too low to be a real page table base */
+            nyx_printf("[WtE] WTE_SETUP: INVALID CR3=0x%lx for PID %lu "
+                       "(page-aligned=%d, not-magic=%d)\n",
+                       (unsigned long)child_cr3,
+                       (unsigned long)setup.target_pid,
+                       (child_cr3 & 0xFFF) == 0,
+                       child_cr3 != 0x1f);
+            set_return_value(cpu, 0);
+            ret = 0;
+            break;
+        }
         nyx_printf("[WtE] WTE_SETUP: Found child CR3=0x%lx for PID %lu\n",
                    (unsigned long)child_cr3, (unsigned long)setup.target_pid);
 
