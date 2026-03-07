@@ -363,8 +363,8 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
                 wte_scan_dirty_ring();
 
                 /* Temporarily disable reload mode to prevent perform_reload()
-                 * from restoring the WOX_SNAPSHOT. This allows the harness
-                 * do-while loop to continue for multi-round WtE detection. */
+                 * from restoring the snapshot. The harness will call habort()
+                 * after receiving the WtE count, cleanly stopping kAFL. */
                 bool saved_reload_mode = GET_GLOBAL_STATE()->in_reload_mode;
                 GET_GLOBAL_STATE()->in_reload_mode = false;
 
@@ -377,9 +377,8 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
                 /* Return WtE count to guest via EAX so harness can decide
                  * whether to start another round. */
                 set_return_value(cpu, (uint64_t)wte_count);
-                if (wte_count > 0) {
-                    wte_reset_round();
-                }
+                /* Deactivate WtE — single execution mode, no more rounds. */
+                wte_deactivate();
             } else {
                 synchronization_disable_pt(cpu);
             }
