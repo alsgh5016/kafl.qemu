@@ -31,6 +31,9 @@
 /* Maximum GFNs per batch ioctl call */
 #define WTE_MAX_BATCH_GFNS  4096
 
+/* Maximum pages in target PE image for diagnostic tracking */
+#define WTE_MAX_TARGET_PE_PAGES 256
+
 typedef struct {
     uint64_t gpa;                            /* Guest Physical Address (GFN << 12) */
     uint8_t  baseline[WTE_PAGE_SIZE];        /* Content at snapshot time            */
@@ -71,7 +74,14 @@ typedef struct {
      * dirty ring scan so user-mode WtE on the same page is not missed. */
     uint64_t *renx_queue;                    /* GFNs pending NX re-set            */
     int       renx_count;                    /* Number of pending re-NX GFNs      */
-    int       renx_capacity;                 /* Allocated capacity                */
+    int       renx_capacity;                /* Allocated capacity                */
+
+    /* Diagnostic: target PE VA→GFN mapping for tracking */
+    uint64_t  target_image_base;             /* Target PE image base VA           */
+    uint64_t  target_image_end;              /* Target PE image end VA            */
+    uint64_t  target_pe_gfns[WTE_MAX_TARGET_PE_PAGES]; /* GFNs backing target PE */
+    uint64_t  target_pe_vas[WTE_MAX_TARGET_PE_PAGES];  /* Corresponding VAs      */
+    int       target_pe_gfn_count;           /* Number of mapped target PE pages  */
 } wte_state_t;
 
 /* ── Public API ────────────────────────────────────────────────── */
@@ -106,3 +116,10 @@ wte_state_t *wte_get_state(void);
 
 /* Debug */
 void wte_print_debug_summary(void);
+
+/* Diagnostic: map target PE VA range to GFNs via page table walk.
+ * Call after wte_activate() with valid CPU state. */
+void wte_diagnose_target_pe(CPUState *cpu, uint64_t image_base, uint64_t image_size);
+
+/* Check if a GFN belongs to the target PE image */
+bool wte_is_target_pe_gfn(uint64_t gfn);

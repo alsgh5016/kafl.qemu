@@ -453,6 +453,35 @@ void wte_scan_dirty_ring(void)
                            (unsigned long)gfn, (unsigned long)gpa, info->diff_count);
             }
 
+            /* Diagnostic: check if this new dirty GFN is in target PE range */
+            if (wte_is_target_pe_gfn(gfn)) {
+                nyx_printf("[WtE][DIAG] *** TARGET PE GFN 0x%lx IS DIRTY! ***\n",
+                           (unsigned long)gfn);
+                nyx_printf("[WtE][DIAG]   diff_count=%d, baseline_valid=%d\n",
+                           info->diff_count, info->baseline_valid);
+                /* Print first 16 bytes of baseline and current for comparison */
+                nyx_printf("[WtE][DIAG]   baseline[0..15]: %02x %02x %02x %02x  %02x %02x %02x %02x"
+                           "  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+                           info->baseline[0],  info->baseline[1],
+                           info->baseline[2],  info->baseline[3],
+                           info->baseline[4],  info->baseline[5],
+                           info->baseline[6],  info->baseline[7],
+                           info->baseline[8],  info->baseline[9],
+                           info->baseline[10], info->baseline[11],
+                           info->baseline[12], info->baseline[13],
+                           info->baseline[14], info->baseline[15]);
+                nyx_printf("[WtE][DIAG]   current[0..15]:  %02x %02x %02x %02x  %02x %02x %02x %02x"
+                           "  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+                           info->current[0],  info->current[1],
+                           info->current[2],  info->current[3],
+                           info->current[4],  info->current[5],
+                           info->current[6],  info->current[7],
+                           info->current[8],  info->current[9],
+                           info->current[10], info->current[11],
+                           info->current[12], info->current[13],
+                           info->current[14], info->current[15]);
+            }
+
             new_pages++;
         } else {
             /* Existing dirty page — re-written, update content */
@@ -473,6 +502,12 @@ void wte_scan_dirty_ring(void)
                 }
             }
 
+
+            /* Diagnostic: check if re-dirtied GFN is in target PE */
+            if (wte_is_target_pe_gfn(gfn)) {
+                nyx_printf("[WtE][DIAG] *** TARGET PE GFN 0x%lx RE-DIRTIED! diff=%d ***\n",
+                           (unsigned long)gfn, info->diff_count);
+            }
             updated_pages++;
         }
 
@@ -543,6 +578,12 @@ void wte_handle_nx_violation(uint64_t gfn, uint64_t gpa, uint64_t rip, CPUState 
 
     nyx_printf("[WtE] NX violation: GFN=0x%lx GPA=0x%lx RIP=0x%lx\n",
                (unsigned long)gfn, (unsigned long)gpa, (unsigned long)rip);
+
+    /* Diagnostic: check if NX violation is in target PE */
+    if (wte_is_target_pe_gfn(gfn)) {
+        nyx_printf("[WtE][DIAG] *** TARGET PE NX VIOLATION! *** GFN=0x%lx RIP=0x%lx\n",
+                   (unsigned long)gfn, (unsigned long)rip);
+    }
 
     int idx = wte_find_page(gfn);
 
@@ -679,4 +720,118 @@ bool wte_is_active(void)
 wte_state_t *wte_get_state(void)
 {
     return &wte_state;
+}
+
+/* ── Diagnostic: Target PE GFN Mapping ────────────────────────── */
+
+bool wte_is_target_pe_gfn(uint64_t gfn)
+{
+    for (int i = 0; i < wte_state.target_pe_gfn_count; i++) {
+        if (wte_state.target_pe_gfns[i] == gfn) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Walk target process page tables to map target PE VA range to GFNs.
+ * This reveals which physical pages back the target PE image and
+ * allows us to track them specifically in dirty ring scans.
+ *
+ * Must be called after wte_activate() with valid CPU state.
+ */
+void wte_diagnose_target_pe(CPUState *cpu, uint64_t image_base, uint64_t image_size)
+{
+    if (!wte_state.active) {
+        nyx_printf("[WtE][DIAG] Cannot diagnose — WtE not active\n");
+        return;
+    }
+
+    wte_state.target_image_base = image_base;
+    wte_state.target_image_end  = image_base + image_size;
+    wte_state.target_pe_gfn_count = 0;
+
+    uint64_t cr3 = wte_state.target_cr3;
+
+    nyx_printf("[WtE][DIAG] ============================================\n");
+    nyx_printf("[WtE][DIAG] Target PE diagnostic: VA 0x%lx - 0x%lx (size=0x%lx)\n",
+               (unsigned long)image_base, (unsigned long)(image_base + image_size),
+               (unsigned long)image_size);
+    nyx_printf("[WtE][DIAG] Target CR3: 0x%lx\n", (unsigned long)cr3);
+
+    int mapped = 0, unmapped = 0;
+    uint64_t va;
+    for (va = image_base; va < image_base + image_size; va += WTE_PAGE_SIZE) {
+        uint64_t pa = get_paging_phys_addr(cpu, cr3, va);
+
+        if (pa == 0xFFFFFFFFFFFFFFFFULL || pa == 0) {
+            if (unmapped < 5) {
+                nyx_printf("[WtE][DIAG]   VA 0x%08lx → UNMAPPED\n",
+                           (unsigned long)va);
+            }
+            unmapped++;
+            continue;
+        }
+
+        uint64_t gfn = pa >> 12;
+        mapped++;
+
+        /* Store in target PE GFN list */
+        if (wte_state.target_pe_gfn_count < WTE_MAX_TARGET_PE_PAGES) {
+            wte_state.target_pe_gfns[wte_state.target_pe_gfn_count] = gfn;
+            wte_state.target_pe_vas[wte_state.target_pe_gfn_count] = va;
+            wte_state.target_pe_gfn_count++;
+        }
+
+        /* Log each mapping */
+        if (mapped <= 20 || (mapped % 16 == 0)) {
+            nyx_printf("[WtE][DIAG]   VA 0x%08lx → PA 0x%lx (GFN=0x%lx)\n",
+                       (unsigned long)va, (unsigned long)pa, (unsigned long)gfn);
+        }
+
+        /* Also check: is this GFN already in dirty ring tracking? */
+        int idx = wte_find_page(gfn);
+        if (idx >= 0) {
+            nyx_printf("[WtE][DIAG]   ** GFN 0x%lx ALREADY TRACKED (diff=%d, nx=%d) **\n",
+                       (unsigned long)gfn,
+                       wte_state.pages[idx]->diff_count,
+                       wte_state.pages[idx]->nx_set);
+        }
+
+        /* Read current content vs snapshot baseline */
+        uint8_t current_page[WTE_PAGE_SIZE];
+        uint8_t baseline_page[WTE_PAGE_SIZE];
+        cpu_physical_memory_read(pa & 0xFFFFFFFFFFFFF000ULL, current_page, WTE_PAGE_SIZE);
+
+        bool baseline_read = false;
+        if (fast_reload_root_created(get_fast_reload_snapshot())) {
+            baseline_read = read_snapshot_memory(get_fast_reload_snapshot(),
+                                                  pa & 0xFFFFFFFFFFFFF000ULL,
+                                                  baseline_page, WTE_PAGE_SIZE);
+        }
+        if (!baseline_read) {
+            memcpy(baseline_page, current_page, WTE_PAGE_SIZE);
+        }
+
+        /* Compute diff between baseline and current */
+        int diff_bytes = 0;
+        for (int i = 0; i < WTE_PAGE_SIZE; i++) {
+            if (baseline_page[i] != current_page[i]) {
+                diff_bytes++;
+            }
+        }
+
+        if (diff_bytes > 0) {
+            nyx_printf("[WtE][DIAG]   ** VA 0x%08lx (GFN=0x%lx): %d bytes DIFFER from baseline! **\n",
+                       (unsigned long)va, (unsigned long)gfn, diff_bytes);
+        }
+    }
+
+    nyx_printf("[WtE][DIAG] Target PE: %d pages mapped, %d unmapped, %d stored for tracking\n",
+               mapped, unmapped, wte_state.target_pe_gfn_count);
+    if (unmapped > 5) {
+        nyx_printf("[WtE][DIAG]   (suppressed %d unmapped page logs)\n", unmapped - 5);
+    }
+    nyx_printf("[WtE][DIAG] ============================================\n");
 }

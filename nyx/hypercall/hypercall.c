@@ -1557,6 +1557,13 @@ int handle_kafl_hypercall(struct kvm_run *run,
             wte_init();
             wte_activate(guest_cr3, false);
             nyx_printf("[WtE] WtE tracking activated (baseline snapshot)\n");
+
+            /* Diagnostic: map target PE VA→GFN for tracking */
+            if (GET_GLOBAL_STATE()->pt_ip_filter_configured[0]) {
+                uint64_t img_base = GET_GLOBAL_STATE()->pt_ip_filter_a[0];
+                uint64_t img_end  = GET_GLOBAL_STATE()->pt_ip_filter_b[0];
+                wte_diagnose_target_pe(cpu, img_base, img_end - img_base);
+            }
         } else {
             wte_reset_round();
             nyx_printf("[WtE] WtE already active — forced round reset (round %d)\n",
