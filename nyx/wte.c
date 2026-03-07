@@ -313,6 +313,13 @@ void wte_activate(uint64_t cr3, bool is_64bit)
     wte_state.nx_pages_set    = 0;
     wte_state.renx_count      = 0;
 
+    /* DLL noise filter — skip dump for system DLL VA range */
+    wte_state.dll_filter_enabled  = true;
+    wte_state.dll_va_threshold    = is_64bit ? WTE_DLL_VA_THRESHOLD_64
+                                             : WTE_DLL_VA_THRESHOLD_32;
+    wte_state.dll_filtered_count  = 0;
+    wte_state.dll_filtered_total  = 0;
+
     /* Enable KVM WtE tracking */
     if (!wte_state.kvm_wte_enabled) {
         wte_kvm_enable();
@@ -323,14 +330,18 @@ void wte_activate(uint64_t cr3, bool is_64bit)
     /* Sync to current dirty ring index so we only scan new entries */
     wte_state.last_scanned_ring_index = kvm_dirty_gfns_index;
 
-    nyx_printf("[WtE] Activated: CR3=0x%lx, 64bit=%d\n",
-               (unsigned long)cr3, is_64bit);
+    nyx_printf("[WtE] Activated: CR3=0x%lx, 64bit=%d, DLL filter threshold=0x%lx\n",
+               (unsigned long)cr3, is_64bit,
+               (unsigned long)wte_state.dll_va_threshold);
 }
 
 void wte_deactivate(void)
 {
-    nyx_printf("[WtE] Deactivated: total detections=%d across %d rounds\n",
-               wte_state.total_wte_count, wte_state.round + 1);
+    nyx_printf("[WtE] Deactivated: total detections=%d (%d dumped, %d DLL-filtered) across %d rounds\n",
+               wte_state.total_wte_count,
+               wte_state.total_wte_count - wte_state.dll_filtered_total,
+               wte_state.dll_filtered_total,
+               wte_state.round + 1);
 
     if (wte_state.kvm_wte_enabled) {
         wte_kvm_disable();
@@ -615,9 +626,26 @@ void wte_handle_nx_violation(uint64_t gfn, uint64_t gpa, uint64_t rip, CPUState 
         return;
     }
 
-    /* Confirmed WtE — dump detection results */
+    /* Confirmed WtE — check DLL noise filter before dumping */
     wte_state.wte_count++;
     wte_state.total_wte_count++;
+
+    /* DLL noise filter: if RIP is in system DLL VA range, log but skip dump.
+     * NX is still cleared so guest can continue. The WtE is counted but
+     * no expensive file I/O or process memory dump is performed. */
+    if (wte_state.dll_filter_enabled && rip >= wte_state.dll_va_threshold) {
+        wte_state.dll_filtered_count++;
+        wte_state.dll_filtered_total++;
+        nyx_printf("[WtE] DLL-FILTERED: RIP=0x%lx >= 0x%lx  GFN=0x%lx  diffs=%d  "
+                   "(filtered %d this round, %d total)\n",
+                   (unsigned long)rip, (unsigned long)wte_state.dll_va_threshold,
+                   (unsigned long)gfn, info->diff_count,
+                   wte_state.dll_filtered_count, wte_state.dll_filtered_total);
+        info->nx_set = false;
+        wte_state.nx_pages_set--;
+        wte_kvm_clear_nx(&gfn, 1);
+        return;
+    }
 
     nyx_printf("[WtE] *** WRITTEN-THEN-EXECUTED ***  round=%d  RIP=0x%lx  "
                "GFN=0x%lx  GPA=0x%lx  diffs=%d\n",
@@ -654,8 +682,8 @@ void wte_reset_round(void)
         return;
     }
 
-    nyx_printf("[WtE] Round %d complete: %d WtE detections. Resetting.\n",
-               wte_state.round, wte_state.wte_count);
+    nyx_printf("[WtE] Round %d complete: %d WtE detections (%d filtered by DLL). Resetting.\n",
+               wte_state.round, wte_state.wte_count, wte_state.dll_filtered_count);
 
     /* Collect all GFNs that still have NX set and clear them */
     uint64_t clear_batch[WTE_MAX_BATCH_GFNS];
@@ -692,6 +720,7 @@ void wte_reset_round(void)
     wte_state.wte_count    = 0;
     wte_state.nx_pages_set = 0;
     wte_state.renx_count   = 0;  /* Clear re-NX queue */
+    wte_state.dll_filtered_count = 0; /* Reset per-round DLL filter count */
 
     /* Sync to current dirty ring index */
     wte_state.last_scanned_ring_index = kvm_dirty_gfns_index;
@@ -704,12 +733,15 @@ void wte_print_debug_summary(void)
 {
     nyx_printf("[WtE][DBG] === SUMMARY === "
                "round=%d wte_count=%d total=%d "
-               "tracked_pages=%d nx_pages=%d\n",
+               "tracked_pages=%d nx_pages=%d "
+               "dll_filtered=%d dll_filtered_total=%d\n",
                wte_state.round,
                wte_state.wte_count,
                wte_state.total_wte_count,
                wte_state.page_count,
-               wte_state.nx_pages_set);
+               wte_state.nx_pages_set,
+               wte_state.dll_filtered_count,
+               wte_state.dll_filtered_total);
 }
 
 bool wte_is_active(void)

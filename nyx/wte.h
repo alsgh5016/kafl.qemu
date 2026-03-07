@@ -34,6 +34,13 @@
 /* Maximum pages in target PE image for diagnostic tracking */
 #define WTE_MAX_TARGET_PE_PAGES 256
 
+/* RIP VA threshold for system DLL noise filtering.
+ * In 32-bit Windows processes, system DLLs (ntdll, KERNELBASE, etc.)
+ * load at VA >= 0x70000000. User code + dynamic allocs live below.
+ * For 64-bit targets, adjust to 0x00007FF000000000. */
+#define WTE_DLL_VA_THRESHOLD_32  0x70000000ULL
+#define WTE_DLL_VA_THRESHOLD_64  0x00007FF000000000ULL
+
 typedef struct {
     uint64_t gpa;                            /* Guest Physical Address (GFN << 12) */
     uint8_t  baseline[WTE_PAGE_SIZE];        /* Content at snapshot time            */
@@ -67,6 +74,12 @@ typedef struct {
     int      total_wte_count;                /* Total WtE detections across rounds  */
     int      nx_pages_set;                   /* Number of pages with NX bit set     */
     uint64_t overflow_count;                  /* PT overflow events during this round */
+
+    /* DLL noise filter: skip dump for system DLL WtE detections */
+    bool     dll_filter_enabled;              /* Enable DLL VA range filtering       */
+    uint64_t dll_va_threshold;                /* VA threshold (set per 32/64-bit)    */
+    int      dll_filtered_count;              /* WtE detections filtered (this round)*/
+    int      dll_filtered_total;              /* WtE detections filtered (all rounds)*/
 
     /* Re-NX queue: GFNs that need NX re-set after kernel RIP skip.
      * When a kernel RIP triggers an NX violation, we clear NX to let
