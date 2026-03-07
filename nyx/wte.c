@@ -771,6 +771,257 @@ wte_state_t *wte_get_state(void)
     return &wte_state;
 }
 
+
+/* ── EPROCESS Walking: Find CR3 by PID ────────────────────────── */
+
+/* Windows 10 x64 EPROCESS layout offsets.
+ * These are stable across Windows 10 21H2 (19044) / 22H2 (19045).
+ * EPROCESS starts with KPROCESS (Pcb), so DirectoryTableBase is
+ * at KPROCESS+0x28 = EPROCESS+0x28. */
+#define EPROCESS_OFF_DTB           0x28   /* DirectoryTableBase (CR3) */
+#define EPROCESS_OFF_PID           0x440  /* UniqueProcessId          */
+#define EPROCESS_OFF_LINKS         0x448  /* ActiveProcessLinks        */
+#define EPROCESS_OFF_IMAGENAME     0x5A8  /* ImageFileName[15]         */
+
+/* Maximum iterations to prevent infinite loop on corrupted list */
+#define EPROCESS_WALK_MAX          4096
+
+/*
+ * Walk the Windows EPROCESS linked list to find a process's CR3 given its PID.
+ *
+ * Strategy:
+ *   1. Use the harness CR3 (current vCPU CR3) to access kernel VA space.
+ *      In Windows x64, all processes share the kernel page tables (upper
+ *      half of PML4), so ANY process CR3 can read kernel-mode addresses.
+ *   2. Start from the System process (PID=4) by scanning known locations,
+ *      or start from the current process and walk the circular list.
+ *   3. Walk ActiveProcessLinks (doubly-linked circular list) until we
+ *      find the target PID.
+ *
+ * @param cpu       vCPU state for memory access
+ * @param harness_cr3  CR3 of the harness process (for kernel VA access)
+ * @param target_pid   PID of the process whose CR3 we want
+ * @return CR3 value (page-aligned), or 0 on failure
+ */
+uint64_t wte_find_cr3_by_pid(CPUState *cpu, uint64_t harness_cr3, uint64_t target_pid)
+{
+    /*
+     * Step 1: Find the current process (harness) EPROCESS.
+     * We read GS:[0x188] → KTHREAD, then KTHREAD.ApcState.Process → EPROCESS.
+     * But this requires reading GS base which is MSR-dependent.
+     *
+     * Simpler approach: Use KPCR → KdVersionBlock → PsActiveProcessHead.
+     * But finding PsActiveProcessHead without symbols is unreliable.
+     *
+     * Most reliable approach for our use case:
+     *   Walk ALL physical memory pages looking for EPROCESS with PID=4 (System),
+     *   or use the fact that PID=4 (System) always exists and its EPROCESS
+     *   is usually at a well-known position.
+     *
+     * BEST approach: Since the harness already knows its own PID,
+     * and we have the harness CR3, we can:
+     *   a) Scan GS base (IA32_GS_BASE MSR) → KPCR
+     *   b) KPCR+0x180 → KPRCB → KPRCB+0x008 → CurrentThread (KTHREAD)
+     *   c) KTHREAD+0x220 → KTHREAD.Process → EPROCESS of current process
+     *   d) Walk ActiveProcessLinks from there until we find target_pid
+     *
+     * We use approach (a-d) since we have full register access.
+     */
+
+    /* Read IA32_GS_BASE to get KPCR (kernel GS base for x64) */
+    kvm_arch_get_registers(cpu);
+    CPUX86State *env = &(X86_CPU(cpu)->env);
+    uint64_t gs_base = env->segs[R_GS].base;
+
+    nyx_printf("[WtE][CR3] Looking up CR3 for PID %lu via EPROCESS walk\n",
+               (unsigned long)target_pid);
+    nyx_printf("[WtE][CR3] Harness CR3=0x%lx, GS base=0x%lx\n",
+               (unsigned long)harness_cr3, (unsigned long)gs_base);
+
+    /* KPCR+0x180 → KPRCB, KPRCB+0x008 → CurrentThread (KTHREAD*) */
+    uint64_t kthread_ptr = 0;
+    if (!read_virtual_memory_cr3(gs_base + 0x188, (uint8_t *)&kthread_ptr,
+                                 sizeof(kthread_ptr), cpu, harness_cr3)) {
+        nyx_printf("[WtE][CR3] ERROR: Failed to read KPCR.CurrentThread at 0x%lx\n",
+                   (unsigned long)(gs_base + 0x188));
+        return 0;
+    }
+    nyx_printf("[WtE][CR3] CurrentThread (KTHREAD): 0x%lx\n",
+               (unsigned long)kthread_ptr);
+
+    /* KTHREAD+0x220 → KTHREAD.Process (EPROCESS*) — Win10 x64 offset */
+    uint64_t eprocess_ptr = 0;
+    if (!read_virtual_memory_cr3(kthread_ptr + 0x220, (uint8_t *)&eprocess_ptr,
+                                 sizeof(eprocess_ptr), cpu, harness_cr3)) {
+        nyx_printf("[WtE][CR3] ERROR: Failed to read KTHREAD.Process at 0x%lx\n",
+                   (unsigned long)(kthread_ptr + 0x220));
+        return 0;
+    }
+    nyx_printf("[WtE][CR3] Current EPROCESS: 0x%lx\n",
+               (unsigned long)eprocess_ptr);
+
+    /* Walk ActiveProcessLinks circular list starting from current EPROCESS */
+    uint64_t start_eprocess = eprocess_ptr;
+    int iter = 0;
+
+    do {
+        /* Read PID at EPROCESS+0x440 */
+        uint64_t pid = 0;
+        if (!read_virtual_memory_cr3(eprocess_ptr + EPROCESS_OFF_PID,
+                                     (uint8_t *)&pid, sizeof(pid),
+                                     cpu, harness_cr3)) {
+            nyx_printf("[WtE][CR3] ERROR: Failed to read PID at EPROCESS 0x%lx\n",
+                       (unsigned long)eprocess_ptr);
+            return 0;
+        }
+
+        /* Read ImageFileName for logging */
+        char image_name[16] = {0};
+        read_virtual_memory_cr3(eprocess_ptr + EPROCESS_OFF_IMAGENAME,
+                                (uint8_t *)image_name, 15, cpu, harness_cr3);
+        image_name[15] = '\0';
+
+        if (iter < 10 || pid == target_pid) {
+            nyx_printf("[WtE][CR3]   EPROCESS=0x%lx PID=%lu Name=%s\n",
+                       (unsigned long)eprocess_ptr, (unsigned long)pid, image_name);
+        }
+
+        if (pid == target_pid) {
+            /* Found! Read DirectoryTableBase (CR3) */
+            uint64_t cr3 = 0;
+            if (!read_virtual_memory_cr3(eprocess_ptr + EPROCESS_OFF_DTB,
+                                         (uint8_t *)&cr3, sizeof(cr3),
+                                         cpu, harness_cr3)) {
+                nyx_printf("[WtE][CR3] ERROR: Failed to read CR3 at EPROCESS 0x%lx\n",
+                           (unsigned long)eprocess_ptr);
+                return 0;
+            }
+            cr3 &= 0xFFFFFFFFFFFFF000ULL;  /* Page-align */
+            nyx_printf("[WtE][CR3] Found target PID %lu: CR3=0x%lx Name=%s\n",
+                       (unsigned long)target_pid, (unsigned long)cr3, image_name);
+            return cr3;
+        }
+
+        /* Follow ActiveProcessLinks.Flink to next EPROCESS.
+         * LIST_ENTRY.Flink at EPROCESS+0x448 points to the NEXT
+         * EPROCESS's ActiveProcessLinks field, so subtract 0x448
+         * to get the base of the next EPROCESS. */
+        uint64_t next_link = 0;
+        if (!read_virtual_memory_cr3(eprocess_ptr + EPROCESS_OFF_LINKS,
+                                     (uint8_t *)&next_link, sizeof(next_link),
+                                     cpu, harness_cr3)) {
+            nyx_printf("[WtE][CR3] ERROR: Failed to read ActiveProcessLinks at 0x%lx\n",
+                       (unsigned long)(eprocess_ptr + EPROCESS_OFF_LINKS));
+            return 0;
+        }
+
+        /* next_link points to ActiveProcessLinks of next EPROCESS,
+         * subtract offset to get EPROCESS base */
+        eprocess_ptr = next_link - EPROCESS_OFF_LINKS;
+
+        iter++;
+    } while (eprocess_ptr != start_eprocess && iter < EPROCESS_WALK_MAX);
+
+    nyx_printf("[WtE][CR3] ERROR: PID %lu not found after %d iterations\n",
+               (unsigned long)target_pid, iter);
+    return 0;
+}
+
+/* ── Eager NX: Set NX on target PE pages at setup time ────────── */
+
+/*
+ * Set EPT NX bit on all pages backing the target PE image.
+ * Called during WTE_SETUP, BEFORE the target process executes any code.
+ * This ensures the very first execution of any PE page triggers an NX
+ * violation, catching the initial unpacking write+exec.
+ *
+ * Unlike the lazy approach (NX set only when dirty ring reports writes),
+ * this eagerly protects all PE pages so even the first instruction
+ * execution after a write is caught.
+ *
+ * @param cpu         vCPU state for page table walks
+ * @param image_base  Target PE image base VA
+ * @param image_size  Target PE SizeOfImage
+ * @param cr3         Target process CR3 (for page table walk)
+ */
+void wte_eager_set_nx_on_pe(CPUState *cpu, uint64_t image_base,
+                            uint64_t image_size, uint64_t cr3)
+{
+    nyx_printf("[WtE][EAGER] Setting NX on target PE pages: VA 0x%lx - 0x%lx (size=0x%lx)\n",
+               (unsigned long)image_base, (unsigned long)(image_base + image_size),
+               (unsigned long)image_size);
+
+    uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
+    int nx_batch_count = 0;
+    int total_nx = 0;
+    int mapped = 0;
+    int unmapped = 0;
+
+    uint64_t va;
+    for (va = image_base; va < image_base + image_size; va += WTE_PAGE_SIZE) {
+        uint64_t pa = get_paging_phys_addr(cpu, cr3, va);
+
+        if (pa == 0xFFFFFFFFFFFFFFFFULL || pa == 0) {
+            unmapped++;
+            continue;
+        }
+
+        uint64_t gfn = pa >> 12;
+        uint64_t gpa = pa & 0xFFFFFFFFFFFFF000ULL;
+        mapped++;
+
+        /* Add page to WtE tracking with baseline content */
+        int idx = wte_find_page(gfn);
+        wte_page_info_t *info;
+
+        if (idx < 0) {
+            info = wte_add_page(gfn);
+            info->gpa = gpa;
+
+            /* Read baseline from root snapshot (shadow memory) */
+            if (fast_reload_root_created(get_fast_reload_snapshot())) {
+                if (!read_snapshot_memory(get_fast_reload_snapshot(),
+                                         gpa, info->baseline, WTE_PAGE_SIZE)) {
+                    cpu_physical_memory_read(gpa, info->baseline, WTE_PAGE_SIZE);
+                }
+            } else {
+                cpu_physical_memory_read(gpa, info->baseline, WTE_PAGE_SIZE);
+            }
+            info->baseline_valid = true;
+
+            /* Current content = baseline at setup time (no writes yet) */
+            memcpy(info->current, info->baseline, WTE_PAGE_SIZE);
+            info->diff_done = true;
+            info->diff_count = 0;
+        } else {
+            info = wte_state.pages[idx];
+        }
+
+        /* Set NX via batch */
+        if (!info->nx_set) {
+            nx_batch[nx_batch_count++] = gfn;
+            info->nx_set = true;
+
+            if (nx_batch_count >= WTE_MAX_BATCH_GFNS) {
+                wte_kvm_set_nx(nx_batch, nx_batch_count);
+                total_nx += nx_batch_count;
+                nx_batch_count = 0;
+            }
+        }
+    }
+
+    /* Flush remaining batch */
+    if (nx_batch_count > 0) {
+        wte_kvm_set_nx(nx_batch, nx_batch_count);
+        total_nx += nx_batch_count;
+    }
+
+    wte_state.nx_pages_set += total_nx;
+
+    nyx_printf("[WtE][EAGER] NX set on %d pages (%d mapped, %d unmapped) "
+               "total NX now: %d\n",
+               total_nx, mapped, unmapped, wte_state.nx_pages_set);
+}
 /* ── Diagnostic: Target PE GFN Mapping ────────────────────────── */
 
 bool wte_is_target_pe_gfn(uint64_t gfn)

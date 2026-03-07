@@ -141,6 +141,17 @@ void wte_diagnose_target_pe(CPUState *cpu, uint64_t image_base, uint64_t image_s
 /* Check if a GFN belongs to the target PE image */
 bool wte_is_target_pe_gfn(uint64_t gfn);
 
+/* EPROCESS walking: find target process CR3 by PID.
+ * Uses the harness CR3 (which shares kernel page tables on Windows x64)
+ * to walk the ActiveProcessLinks circular list in kernel VA space. */
+uint64_t wte_find_cr3_by_pid(CPUState *cpu, uint64_t harness_cr3, uint64_t target_pid);
+
+/* Eager NX: set EPT NX bit on all pages backing the target PE image.
+ * Call during WTE_SETUP, BEFORE the target process executes any code.
+ * Ensures the very first execution of any PE page triggers an NX violation. */
+void wte_eager_set_nx_on_pe(CPUState *cpu, uint64_t image_base,
+                            uint64_t image_size, uint64_t cr3);
+
 /* Cross-dump byte diff: compare consecutive full process memory dumps.
  * Maintains a previous snapshot in memory (~8MB) and generates a
  * diff_report.txt alongside each dump directory showing exactly which

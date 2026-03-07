@@ -306,6 +306,7 @@ struct kvm_hyperv_exit {
 
 #define KVM_EXIT_KAFL_WOX_SNAPSHOT 141
 #define KVM_EXIT_KAFL_WTE 142
+#define KVM_EXIT_KAFL_WTE_SETUP 143
 
 
 
