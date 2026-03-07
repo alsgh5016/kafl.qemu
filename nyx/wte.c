@@ -647,6 +647,11 @@ void wte_handle_nx_violation(uint64_t gfn, uint64_t gpa, uint64_t rip, CPUState 
                    (unsigned long)rip, (unsigned long)wte_state.dll_va_threshold,
                    (unsigned long)gfn, info->diff_count,
                    wte_state.dll_filtered_count, wte_state.dll_filtered_total);
+        /* Update baseline even for DLL-filtered pages, so repeated
+         * dirty ring re-entries don't re-trigger DLL filter logging
+         * for the same unchanged content. */
+        memcpy(info->baseline, info->current, WTE_PAGE_SIZE);
+
         info->nx_set = false;
         wte_state.nx_pages_set--;
         wte_kvm_clear_nx(&gfn, 1);
@@ -669,6 +674,12 @@ void wte_handle_nx_violation(uint64_t gfn, uint64_t gpa, uint64_t rip, CPUState 
                  wte_state.round, (unsigned long)rip, (unsigned long)gfn);
         dump_full_process_memory(cpu, env, wte_label);
     }
+
+    /* Update baseline to current content so that future NX violations
+     * on this page only trigger WtE if NEW writes occur after this point.
+     * Without this, the same diff (vs root snapshot) triggers repeated
+     * false positive WtE detections on already-unpacked pages. */
+    memcpy(info->baseline, info->current, WTE_PAGE_SIZE);
 
     /* Clear NX so the faulting instruction can re-execute.
      * If this page is written again, dirty ring will re-trigger NX set. */
