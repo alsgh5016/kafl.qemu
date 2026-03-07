@@ -500,6 +500,7 @@ static void handle_hypercall_kafl_cr3(struct kvm_run *run,
         if (wte_is_active()) {
             wte_get_state()->target_cr3 = cr3_val;
             nyx_printf("[WtE] Updated target_cr3 to 0x%lx\n", (unsigned long)cr3_val);
+            wte_kvm_set_cr3(cr3_val);
         }
         if (GET_GLOBAL_STATE()->dump_page) {
             set_page_dump_bp(cpu, cr3_val,
