@@ -178,12 +178,8 @@ void handle_hypercall_kafl_acquire(struct kvm_run *run,
             }
             acquire_print_once(cpu);
 
-            if (!wte_is_active()) {
-                kvm_arch_get_registers(cpu);
-                CPUX86State *env = &(X86_CPU(cpu)->env);
-                wte_init();
-                wte_activate(env->cr[3], false);
-            }
+            /* WtE is now initialized by WTE_SETUP hypercall before ACQUIRE.
+             * No fallback wte_init/activate here — target must call WTE_SETUP. */
 
             synchronization_enter_fuzzing_loop(cpu);
         }
@@ -1740,44 +1736,10 @@ int handle_kafl_hypercall(struct kvm_run *run,
         break;
     case KVM_EXIT_KAFL_WOX_SNAPSHOT:
     {
-        kvm_arch_get_registers(cpu);
-        CPUX86State *env = &(X86_CPU(cpu)->env);
-        uint64_t guest_cr3 = env->cr[3] & 0xFFFFFFFFFFFFF000ULL;
-        nyx_printf("[WtE] WOX_SNAPSHOT hypercall: guest CR3=0x%lx\n", guest_cr3);
-
-        if (!wte_is_active()) {
-            /*
-             * Create root snapshot to capture baseline memory content.
-             * read_snapshot_memory() will use this baseline to compute
-             * content diffs when dirty pages are detected.
-             * REQUEST_SAVE_SNAPSHOT_ROOT_FIX_RIP adjusts RIP past the
-             * hypercall instruction and creates an in-memory snapshot
-             * of the guest physical memory (shadow memory).
-             */
-            if (!fast_reload_root_created(get_fast_reload_snapshot())) {
-                nyx_printf("[WtE] Creating root snapshot for baseline...\n");
-                request_fast_vm_reload(GET_GLOBAL_STATE()->reload_state,
-                                       REQUEST_SAVE_SNAPSHOT_ROOT_FIX_RIP);
-                nyx_printf("[WtE] Root snapshot created successfully\n");
-            } else {
-                nyx_printf("[WtE] Root snapshot already exists, reusing\n");
-            }
-
-            wte_init();
-            wte_activate(guest_cr3, false);
-            nyx_printf("[WtE] WtE tracking activated (baseline snapshot)\n");
-
-            /* Diagnostic: map target PE VA→GFN for tracking */
-            if (GET_GLOBAL_STATE()->pt_ip_filter_configured[0]) {
-                uint64_t img_base = GET_GLOBAL_STATE()->pt_ip_filter_a[0];
-                uint64_t img_end  = GET_GLOBAL_STATE()->pt_ip_filter_b[0];
-                wte_diagnose_target_pe(cpu, img_base, img_end - img_base);
-            }
-        } else {
-            wte_reset_round();
-            nyx_printf("[WtE] WtE already active — forced round reset (round %d)\n",
-                       wte_get_state()->round);
-        }
+        /* DEPRECATED: Use KVM_EXIT_KAFL_WTE_SETUP instead.
+         * WOX_SNAPSHOT is kept for backward compatibility but does nothing.
+         * WTE_SETUP handles root snapshot + EPROCESS CR3 walk + eager NX. */
+        nyx_printf("[WtE] WOX_SNAPSHOT: DEPRECATED \u2014 use WTE_SETUP instead\n");
         ret = 0;
         break;
     }
@@ -1794,6 +1756,102 @@ int handle_kafl_hypercall(struct kvm_run *run,
                    (unsigned long)wte_gfn, (unsigned long)wte_rip,
                    (unsigned long)wte_cr3);
         wte_handle_nx_violation(wte_gfn, wte_gpa, wte_rip, cpu);
+        ret = 0;
+        break;
+    }
+    case KVM_EXIT_KAFL_WTE_SETUP:
+    {
+        /*
+         * WTE_SETUP: Initialize WtE detection BEFORE target process executes.
+         * Called by harness after CreateProcess(SUSPENDED), before ResumeThread.
+         *
+         * Flow:
+         *   1. Read kafl_wte_setup_t from guest memory (target PID, image info)
+         *   2. Create root snapshot for baseline memory content
+         *   3. Walk EPROCESS list to find target process CR3 by PID
+         *   4. wte_init() + wte_activate(child_cr3) — start WtE tracking
+         *   5. Eagerly set EPT NX on all target PE pages
+         *   6. Return discovered child CR3 to guest via EAX
+         */
+        kvm_arch_get_registers(cpu);
+        CPUX86State *env = &(X86_CPU(cpu)->env);
+        uint64_t harness_cr3 = env->cr[3] & 0xFFFFFFFFFFFFF000ULL;
+
+        /* Read kafl_wte_setup_t struct from guest memory */
+        typedef struct {
+            uint64_t target_pid;
+            uint64_t image_base;
+            uint64_t image_size;
+            uint32_t flags;
+        } __attribute__((packed)) kafl_wte_setup_t;
+
+        kafl_wte_setup_t setup = {0};
+        if (!read_virtual_memory(hypercall_arg, (uint8_t *)&setup,
+                                 sizeof(setup), cpu)) {
+            nyx_printf("[WtE] WTE_SETUP: failed to read setup struct at 0x%lx\n",
+                       (unsigned long)hypercall_arg);
+            set_return_value(cpu, 0);
+            ret = 0;
+            break;
+        }
+
+        bool is_32bit   = (setup.flags & (1 << 0)) != 0;  /* WTE_FLAG_32BIT */
+        bool eager_nx    = (setup.flags & (1 << 1)) != 0;  /* WTE_FLAG_EAGER_NX */
+
+        nyx_printf("[WtE] WTE_SETUP: PID=%lu image_base=0x%lx image_size=0x%lx "
+                   "flags=0x%x (32bit=%d eager_nx=%d) harness_cr3=0x%lx\n",
+                   (unsigned long)setup.target_pid,
+                   (unsigned long)setup.image_base,
+                   (unsigned long)setup.image_size,
+                   setup.flags, is_32bit, eager_nx,
+                   (unsigned long)harness_cr3);
+
+        /* Step 1: Create root snapshot for baseline (if not already created) */
+        if (!fast_reload_root_created(get_fast_reload_snapshot())) {
+            nyx_printf("[WtE] WTE_SETUP: Creating root snapshot for baseline...\n");
+            request_fast_vm_reload(GET_GLOBAL_STATE()->reload_state,
+                                   REQUEST_SAVE_SNAPSHOT_ROOT_FIX_RIP);
+            nyx_printf("[WtE] WTE_SETUP: Root snapshot created successfully\n");
+        } else {
+            nyx_printf("[WtE] WTE_SETUP: Root snapshot already exists, reusing\n");
+        }
+
+        /* Step 2: Walk EPROCESS to find target process CR3 by PID */
+        uint64_t child_cr3 = wte_find_cr3_by_pid(cpu, harness_cr3,
+                                                   setup.target_pid);
+        if (child_cr3 == 0) {
+            nyx_printf("[WtE] WTE_SETUP: FAILED to find CR3 for PID %lu\n",
+                       (unsigned long)setup.target_pid);
+            set_return_value(cpu, 0);
+            ret = 0;
+            break;
+        }
+        nyx_printf("[WtE] WTE_SETUP: Found child CR3=0x%lx for PID %lu\n",
+                   (unsigned long)child_cr3, (unsigned long)setup.target_pid);
+
+        /* Step 3: Initialize and activate WtE with child CR3 */
+        wte_init();
+        wte_activate(child_cr3, !is_32bit);  /* is_64bit = !is_32bit */
+        nyx_printf("[WtE] WTE_SETUP: WtE activated (cr3=0x%lx, %s)\n",
+                   (unsigned long)child_cr3, is_32bit ? "32-bit" : "64-bit");
+
+        /* Step 4: Eagerly set NX on target PE pages (if requested) */
+        if (eager_nx && setup.image_base != 0 && setup.image_size != 0) {
+            wte_eager_set_nx_on_pe(cpu, setup.image_base,
+                                   setup.image_size, child_cr3);
+            nyx_printf("[WtE] WTE_SETUP: Eager NX set on PE pages "
+                       "[0x%lx - 0x%lx]\n",
+                       (unsigned long)setup.image_base,
+                       (unsigned long)(setup.image_base + setup.image_size));
+        }
+
+        /* Step 5: Diagnostic — map target PE VA→GFN for tracking */
+        if (setup.image_base != 0 && setup.image_size != 0) {
+            wte_diagnose_target_pe(cpu, setup.image_base, setup.image_size);
+        }
+
+        /* Return child CR3 to guest so harness can use it for SUBMIT_CR3 */
+        set_return_value(cpu, child_cr3);
         ret = 0;
         break;
     }
