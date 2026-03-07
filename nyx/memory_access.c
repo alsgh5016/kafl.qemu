@@ -945,6 +945,63 @@ bool read_virtual_memory(uint64_t address, uint8_t *data, uint32_t size, CPUStat
     return true;
 }
 
+bool read_virtual_memory_cr3(uint64_t address, uint8_t *data, uint32_t size, CPUState *cpu, uint64_t cr3)
+{
+    uint8_t tmp_buf[x86_64_PAGE_SIZE];
+    hwaddr  phys_addr;
+    int     asidx;
+
+    uint64_t amount_copied = 0;
+
+    // copy per page
+    while (amount_copied < size) {
+        uint64_t len_to_copy = (size - amount_copied);
+        if (len_to_copy > x86_64_PAGE_SIZE)
+            len_to_copy = x86_64_PAGE_SIZE;
+
+        asidx = cpu_asidx_from_attrs(cpu, MEMTXATTRS_UNSPECIFIED);
+        phys_addr = (hwaddr)get_paging_phys_addr(cpu, cr3, address) &
+                    0xFFFFFFFFFFFFF000ULL;
+
+        if (phys_addr == INVALID_ADDRESS) {
+            uint64_t next_page   = (address & x86_64_PAGE_MASK) + x86_64_PAGE_SIZE;
+            uint64_t len_skipped = next_page - address;
+            if (len_skipped > size - amount_copied) {
+                len_skipped = size - amount_copied;
+            }
+
+            nyx_warn("Read from unmapped memory addr %lx (cr3=%lx), skipping to %lx\n",
+                     address, cr3, next_page);
+            memset(data + amount_copied, ' ', len_skipped);
+            address += len_skipped;
+            amount_copied += len_skipped;
+            continue;
+        }
+
+        phys_addr += (address & ~x86_64_PAGE_MASK);
+        uint64_t remaining_on_page = x86_64_PAGE_SIZE - (address & ~x86_64_PAGE_MASK);
+        if (len_to_copy > remaining_on_page) {
+            len_to_copy = remaining_on_page;
+        }
+
+        MemTxResult txt = address_space_rw(cpu_get_address_space(cpu, asidx),
+                                           phys_addr, MEMTXATTRS_UNSPECIFIED,
+                                           tmp_buf, len_to_copy, 0);
+        if (txt) {
+            nyx_debug_p(MEM_PREFIX,
+                        "Warning, read failed for virt addr %lx (phys: %lx, cr3: %lx)\n",
+                        address, phys_addr, cr3);
+        }
+
+        memcpy(data + amount_copied, tmp_buf, len_to_copy);
+
+        address += len_to_copy;
+        amount_copied += len_to_copy;
+    }
+
+    return true;
+}
+
 bool is_addr_mapped_cr3(uint64_t address, CPUState *cpu, uint64_t cr3)
 {
     return (get_paging_phys_addr(cpu, cr3, address) != INVALID_ADDRESS);
