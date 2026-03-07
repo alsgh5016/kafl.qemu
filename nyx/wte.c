@@ -280,6 +280,11 @@ void wte_init(void)
     wte_state.kvm_wte_enabled = false;
 
     nyx_printf("[WtE] Initialized (EPT NX mode)\n");
+
+    /* Re-NX queue for kernel RIP skip recovery */
+    wte_state.renx_queue    = malloc(WTE_MAX_BATCH_GFNS * sizeof(uint64_t));
+    wte_state.renx_count    = 0;
+    wte_state.renx_capacity = WTE_MAX_BATCH_GFNS;
 }
 
 void wte_destroy(void)
@@ -291,6 +296,7 @@ void wte_destroy(void)
     wte_free_all_pages();
     free(wte_state.pages);
     free(wte_state.gfns);
+    free(wte_state.renx_queue);
 
     memset(&wte_state, 0, sizeof(wte_state_t));
     nyx_printf("[WtE] Destroyed\n");
@@ -305,6 +311,7 @@ void wte_activate(uint64_t cr3, bool is_64bit)
     wte_state.wte_count  = 0;
     wte_state.total_wte_count = 0;
     wte_state.nx_pages_set    = 0;
+    wte_state.renx_count      = 0;
 
     /* Enable KVM WtE tracking */
     if (!wte_state.kvm_wte_enabled) {
@@ -345,6 +352,32 @@ void wte_scan_dirty_ring(void)
 {
     if (!wte_state.active || !kvm_dirty_gfns) {
         return;
+    }
+
+    /* Process re-NX queue: pages that had NX cleared for kernel RIP skip.
+     * Re-set NX on these pages so user-mode WtE can still be detected. */
+    if (wte_state.renx_count > 0) {
+        int re_nx = 0;
+        uint64_t renx_batch[WTE_MAX_BATCH_GFNS];
+        int renx_batch_count = 0;
+
+        for (int i = 0; i < wte_state.renx_count; i++) {
+            uint64_t gfn = wte_state.renx_queue[i];
+            int idx = wte_find_page(gfn);
+            if (idx >= 0 && !wte_state.pages[idx]->nx_set) {
+                if (renx_batch_count < WTE_MAX_BATCH_GFNS) {
+                    renx_batch[renx_batch_count++] = gfn;
+                    wte_state.pages[idx]->nx_set = true;
+                    re_nx++;
+                }
+            }
+        }
+        if (renx_batch_count > 0) {
+            wte_kvm_set_nx(renx_batch, renx_batch_count);
+            wte_state.nx_pages_set += renx_batch_count;
+            nyx_printf("[WtE] Re-NX applied to %d pages (kernel RIP recovery)\n", re_nx);
+        }
+        wte_state.renx_count = 0;
     }
 
     uint32_t scan_idx = wte_state.last_scanned_ring_index;
@@ -463,9 +496,23 @@ void wte_handle_nx_violation(uint64_t gfn, uint64_t gpa, uint64_t rip, CPUState 
     /* Layer 2 safety net: skip kernel-mode RIP (should be filtered by KVM CR3,
      * but catch any that slip through — e.g., CR3 not yet set) */
     if (rip >= 0xFFFF800000000000ULL) {
-        nyx_printf("[WtE] Skipping kernel RIP=0x%lx GFN=0x%lx\n",
+        nyx_printf("[WtE] Skipping kernel RIP=0x%lx GFN=0x%lx — queued for re-NX\n",
                    (unsigned long)rip, (unsigned long)gfn);
+        /* Clear NX so guest can continue executing this page,
+         * but queue the GFN for re-NX on next dirty ring scan.
+         * This prevents permanent NX loss: if user-mode code later
+         * executes this page, the re-applied NX will catch it. */
         wte_kvm_clear_nx(&gfn, 1);
+        if (wte_state.renx_count < wte_state.renx_capacity) {
+            wte_state.renx_queue[wte_state.renx_count++] = gfn;
+        }
+        /* Also mark page tracking as nx_set=false so re-NX logic
+         * in scan knows to re-set it */
+        int idx = wte_find_page(gfn);
+        if (idx >= 0) {
+            wte_state.pages[idx]->nx_set = false;
+            wte_state.nx_pages_set--;
+        }
         return;
     }
 
@@ -568,6 +615,7 @@ void wte_reset_round(void)
     wte_state.round++;
     wte_state.wte_count    = 0;
     wte_state.nx_pages_set = 0;
+    wte_state.renx_count   = 0;  /* Clear re-NX queue */
 
     /* Sync to current dirty ring index */
     wte_state.last_scanned_ring_index = kvm_dirty_gfns_index;

@@ -64,6 +64,14 @@ typedef struct {
     int      total_wte_count;                /* Total WtE detections across rounds  */
     int      nx_pages_set;                   /* Number of pages with NX bit set     */
     uint64_t overflow_count;                  /* PT overflow events during this round */
+
+    /* Re-NX queue: GFNs that need NX re-set after kernel RIP skip.
+     * When a kernel RIP triggers an NX violation, we clear NX to let
+     * the guest continue, but queue the GFN for re-NX on the next
+     * dirty ring scan so user-mode WtE on the same page is not missed. */
+    uint64_t *renx_queue;                    /* GFNs pending NX re-set            */
+    int       renx_count;                    /* Number of pending re-NX GFNs      */
+    int       renx_capacity;                 /* Allocated capacity                */
 } wte_state_t;
 
 /* ── Public API ────────────────────────────────────────────────── */
