@@ -223,23 +223,8 @@ static void set_return_value(CPUState *cpu, uint64_t return_value)
 {
     kvm_arch_get_registers(cpu);
     CPUX86State *env = &(X86_CPU(cpu))->env;
-    uint64_t old_rax = env->regs[R_EAX];
     env->regs[R_EAX] = return_value;
-    int ret = kvm_arch_put_registers(cpu, KVM_PUT_RUNTIME_STATE);
-
-    /* Diagnostic: verify the write succeeded and value persists */
-    nyx_printf("[set_return_value] old_RAX=0x%lx new_RAX=0x%lx "
-               "put_registers ret=%d\n",
-               (unsigned long)old_rax, (unsigned long)return_value, ret);
-
-    /* Read back to verify KVM actually has the new value */
-    kvm_arch_get_registers(cpu);
-    uint64_t readback = env->regs[R_EAX];
-    if (readback != return_value) {
-        nyx_printf("[set_return_value] WARNING: readback mismatch! "
-                   "expected=0x%lx got=0x%lx\n",
-                   (unsigned long)return_value, (unsigned long)readback);
-    }
+    kvm_arch_put_registers(cpu, KVM_PUT_RUNTIME_STATE);
 }
 
 static void handle_hypercall_kafl_req_stream_data(struct kvm_run *run,
@@ -1788,6 +1773,14 @@ int handle_kafl_hypercall(struct kvm_run *run,
          * Flow:
          *   1. Read kafl_wte_setup_t from guest memory (target PID, image info)
          *   2. Create root snapshot for baseline memory content
+         *      NOTE: If snapshot is created here, fast_reload_restore() resets
+         *      RIP to the VMCALL instruction. The guest will re-execute VMCALL
+         *      with correct RAX=0x1f, causing a second entry into this handler
+         *      where the snapshot already exists. We must NOT call
+         *      set_return_value() on the first entry because it would corrupt
+         *      RAX (changing it from 0x1f to child_cr3), causing KVM to
+         *      misidentify the re-executed VMCALL as a non-kAFL hypercall
+         *      and return -ENOSYS (0xFFFFFFFFFFFFFFFF) to the guest.
          *   3. Walk EPROCESS list to find target process CR3 by PID
          *   4. wte_init() + wte_activate(child_cr3) — start WtE tracking
          *   5. Eagerly set EPT NX on all target PE pages
@@ -1826,15 +1819,24 @@ int handle_kafl_hypercall(struct kvm_run *run,
                    setup.flags, is_32bit, eager_nx,
                    (unsigned long)harness_cr3);
 
-        /* Step 1: Create root snapshot for baseline (if not already created) */
+        /* Step 1: Create root snapshot for baseline (if not already created)
+         * If we create a snapshot here, fast_reload_restore() resets RIP to the
+         * VMCALL instruction and restores all registers to pre-hypercall state.
+         * We must skip all remaining work (WtE init, set_return_value) and let
+         * the guest re-execute VMCALL cleanly — it will re-enter this handler
+         * on the second call with the snapshot already in place. */
         if (!fast_reload_root_created(get_fast_reload_snapshot())) {
             nyx_printf("[WtE] WTE_SETUP: Creating root snapshot for baseline...\n");
             request_fast_vm_reload(GET_GLOBAL_STATE()->reload_state,
                                    REQUEST_SAVE_SNAPSHOT_ROOT_FIX_RIP);
-            nyx_printf("[WtE] WTE_SETUP: Root snapshot created successfully\n");
-        } else {
-            nyx_printf("[WtE] WTE_SETUP: Root snapshot already exists, reusing\n");
+            nyx_printf("[WtE] WTE_SETUP: Root snapshot created. "
+                       "Deferring WtE init to next VMCALL re-entry.\n");
+            ret = 0;
+            break;
         }
+
+        nyx_printf("[WtE] WTE_SETUP: Root snapshot already exists, "
+                   "proceeding with WtE initialization\n");
 
         /* Step 2: Walk EPROCESS to find target process CR3 by PID */
         uint64_t child_cr3 = wte_find_cr3_by_pid(cpu, harness_cr3,
@@ -1890,7 +1892,6 @@ int handle_kafl_hypercall(struct kvm_run *run,
         set_return_value(cpu, child_cr3);
         ret = 0;
         break;
-    }
     }
     return ret;
 }
