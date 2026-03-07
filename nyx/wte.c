@@ -285,6 +285,9 @@ void wte_init(void)
     wte_state.renx_queue    = malloc(WTE_MAX_BATCH_GFNS * sizeof(uint64_t));
     wte_state.renx_count    = 0;
     wte_state.renx_capacity = WTE_MAX_BATCH_GFNS;
+
+    /* Cross-dump byte diff snapshot */
+    wte_crossdump_init();
 }
 
 void wte_destroy(void)
@@ -297,6 +300,9 @@ void wte_destroy(void)
     free(wte_state.pages);
     free(wte_state.gfns);
     free(wte_state.renx_queue);
+
+    /* Cross-dump byte diff cleanup */
+    wte_crossdump_destroy();
 
     memset(&wte_state, 0, sizeof(wte_state_t));
     nyx_printf("[WtE] Destroyed\n");

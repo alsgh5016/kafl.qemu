@@ -41,6 +41,10 @@
 #define WTE_DLL_VA_THRESHOLD_32  0x70000000ULL
 #define WTE_DLL_VA_THRESHOLD_64  0x00007FF000000000ULL
 
+/* Cross-dump diff: maximum pages to retain for previous snapshot.
+ * ~2000 pages × 4KB = ~8MB of memory per snapshot. */
+#define WTE_CROSSDUMP_MAX_PAGES  8192
+
 typedef struct {
     uint64_t gpa;                            /* Guest Physical Address (GFN << 12) */
     uint8_t  baseline[WTE_PAGE_SIZE];        /* Content at snapshot time            */
@@ -136,3 +140,10 @@ void wte_diagnose_target_pe(CPUState *cpu, uint64_t image_base, uint64_t image_s
 
 /* Check if a GFN belongs to the target PE image */
 bool wte_is_target_pe_gfn(uint64_t gfn);
+
+/* Cross-dump byte diff: compare consecutive full process memory dumps.
+ * Maintains a previous snapshot in memory (~8MB) and generates a
+ * diff_report.txt alongside each dump directory showing exactly which
+ * VA pages changed and at what byte offsets/lengths. */
+void wte_crossdump_init(void);
+void wte_crossdump_destroy(void);

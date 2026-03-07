@@ -759,6 +759,58 @@ typedef struct { uint32_t va; uint64_t phys; uint8_t perm; } mapped_page_t;
 
 static int dump_seq_counter = 0;
 
+/* ── Cross-dump byte diff: previous snapshot state ────────────── */
+
+typedef struct {
+    uint32_t va;                              /* Virtual address of page   */
+    uint8_t  content[WTE_PAGE_SIZE];          /* Page content (4096 bytes) */
+} crossdump_page_t;
+
+static struct {
+    crossdump_page_t *pages;                  /* Array of saved pages      */
+    int               count;                  /* Number of pages saved     */
+    int               capacity;               /* Allocated capacity        */
+    int               prev_seq;               /* Sequence # of prev dump   */
+    bool              valid;                   /* Has previous snapshot?    */
+} crossdump_prev = { NULL, 0, 0, -1, false };
+
+void wte_crossdump_init(void)
+{
+    crossdump_prev.capacity = WTE_CROSSDUMP_MAX_PAGES;
+    crossdump_prev.pages = calloc(crossdump_prev.capacity,
+                                   sizeof(crossdump_page_t));
+    crossdump_prev.count = 0;
+    crossdump_prev.prev_seq = -1;
+    crossdump_prev.valid = false;
+    nyx_printf("[WtE] Cross-dump diff initialized (capacity=%d pages, ~%d MB)\n",
+               crossdump_prev.capacity,
+               (int)(crossdump_prev.capacity * sizeof(crossdump_page_t) / (1024*1024)));
+}
+
+void wte_crossdump_destroy(void)
+{
+    if (crossdump_prev.pages) {
+        free(crossdump_prev.pages);
+        crossdump_prev.pages = NULL;
+    }
+    crossdump_prev.count = 0;
+    crossdump_prev.valid = false;
+    nyx_printf("[WtE] Cross-dump diff destroyed\n");
+}
+
+/* Binary search helper — crossdump pages are sorted by VA */
+static int crossdump_find_va(uint32_t va)
+{
+    int lo = 0, hi = crossdump_prev.count - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (crossdump_prev.pages[mid].va == va) return mid;
+        if (crossdump_prev.pages[mid].va < va) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return -1;  /* not found */
+}
+
 void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                                      const char *label)
 {
@@ -978,6 +1030,13 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
     uint64_t total_bytes = 0;
     int i = 0;
 
+    /* Cross-dump: allocate current snapshot array */
+    crossdump_page_t *cur_snap = NULL;
+    int cur_snap_count = 0;
+    if (crossdump_prev.pages) {
+        cur_snap = malloc(pg_count * sizeof(crossdump_page_t));
+    }
+
     while (i < pg_count) {
         uint32_t region_start = pages[i].va;
         uint8_t  region_perm  = pages[i].perm;
@@ -1020,6 +1079,13 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
             for (int p = region_first; p <= region_last; p++) {
                 cpu_physical_memory_read(pages[p].phys, page_buf, 0x1000);
                 fwrite(page_buf, 1, 0x1000, rf);
+
+                /* Save page content to current snapshot for cross-dump diff */
+                if (cur_snap && cur_snap_count < pg_count) {
+                    cur_snap[cur_snap_count].va = pages[p].va;
+                    memcpy(cur_snap[cur_snap_count].content, page_buf, 0x1000);
+                    cur_snap_count++;
+                }
             }
             fclose(rf);
         }
@@ -1042,6 +1108,150 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
 
     nyx_printf("    [FULLDUMP] Saved %d regions (%lu bytes, %d pages) -> %s/\n",
                region_count, (unsigned long)total_bytes, pg_count, dump_dir);
+
+    /* --- 7. Cross-dump byte diff: compare with previous snapshot --- */
+    if (cur_snap && crossdump_prev.valid && crossdump_prev.count > 0) {
+        char *diff_path = NULL;
+        assert(asprintf(&diff_path, "%s/diff_report.txt", dump_dir) != -1);
+        FILE *diff_f = fopen(diff_path, "w");
+        if (diff_f) {
+            fprintf(diff_f, "# Cross-dump byte diff report\n");
+            fprintf(diff_f, "# Current dump:  #%03d (%s)\n", seq, label);
+            fprintf(diff_f, "# Previous dump: #%03d\n", crossdump_prev.prev_seq);
+            fprintf(diff_f, "# Current pages: %d, Previous pages: %d\n\n",
+                    cur_snap_count, crossdump_prev.count);
+
+            int changed_pages = 0;
+            int new_pages = 0;
+            int removed_pages = 0;
+            uint64_t total_changed_bytes = 0;
+
+            /* Compare each current page with previous snapshot */
+            for (int c = 0; c < cur_snap_count; c++) {
+                uint32_t va = cur_snap[c].va;
+                int prev_idx = crossdump_find_va(va);
+
+                if (prev_idx < 0) {
+                    /* Page exists in current but not in previous = new page */
+                    new_pages++;
+
+                    /* Identify module */
+                    const char *mname = NULL;
+                    for (int m = 0; m < num_modules; m++) {
+                        if (va >= modules[m].base &&
+                            va < modules[m].base + modules[m].size) {
+                            mname = modules[m].name;
+                            break;
+                        }
+                    }
+
+                    fprintf(diff_f, "NEW   VA=0x%08x  %s\n",
+                            va, mname ? mname : "(unmapped)");
+                    continue;
+                }
+
+                /* Page exists in both — do byte-level comparison */
+                const uint8_t *prev_data = crossdump_prev.pages[prev_idx].content;
+                const uint8_t *cur_data  = cur_snap[c].content;
+
+                if (memcmp(prev_data, cur_data, WTE_PAGE_SIZE) == 0) {
+                    continue;  /* Identical — skip */
+                }
+
+                /* Find changed byte ranges within this page */
+                changed_pages++;
+                int range_count = 0;
+                uint16_t range_offsets[WTE_MAX_DIFF_RANGES];
+                uint16_t range_lengths[WTE_MAX_DIFF_RANGES];
+                int page_changed_bytes = 0;
+
+                int b = 0;
+                while (b < WTE_PAGE_SIZE && range_count < WTE_MAX_DIFF_RANGES) {
+                    if (prev_data[b] != cur_data[b]) {
+                        int start = b;
+                        while (b < WTE_PAGE_SIZE && prev_data[b] != cur_data[b])
+                            b++;
+                        range_offsets[range_count] = (uint16_t)start;
+                        range_lengths[range_count] = (uint16_t)(b - start);
+                        page_changed_bytes += (b - start);
+                        range_count++;
+                    } else {
+                        b++;
+                    }
+                }
+
+                total_changed_bytes += page_changed_bytes;
+
+                /* Identify module */
+                const char *mname = NULL;
+                for (int m = 0; m < num_modules; m++) {
+                    if (va >= modules[m].base &&
+                        va < modules[m].base + modules[m].size) {
+                        mname = modules[m].name;
+                        break;
+                    }
+                }
+
+                fprintf(diff_f, "CHANGED  VA=0x%08x  %d ranges  %d bytes  %s\n",
+                        va, range_count, page_changed_bytes,
+                        mname ? mname : "(unmapped)");
+                for (int r = 0; r < range_count; r++) {
+                    fprintf(diff_f, "    offset=0x%04x  len=%d\n",
+                            range_offsets[r], range_lengths[r]);
+                }
+            }
+
+            /* Check for removed pages (in prev but not in current) */
+            for (int p = 0; p < crossdump_prev.count; p++) {
+                uint32_t prev_va = crossdump_prev.pages[p].va;
+                /* Linear scan in current snapshot (sorted by VA) */
+                bool found = false;
+                int lo = 0, hi = cur_snap_count - 1;
+                while (lo <= hi) {
+                    int mid = (lo + hi) / 2;
+                    if (cur_snap[mid].va == prev_va) { found = true; break; }
+                    if (cur_snap[mid].va < prev_va) lo = mid + 1;
+                    else hi = mid - 1;
+                }
+                if (!found) {
+                    removed_pages++;
+                    fprintf(diff_f, "REMOVED  VA=0x%08x\n", prev_va);
+                }
+            }
+
+            fprintf(diff_f, "\n# Summary: %d changed, %d new, %d removed pages  "
+                    "(%lu bytes changed total)\n",
+                    changed_pages, new_pages, removed_pages,
+                    (unsigned long)total_changed_bytes);
+            fclose(diff_f);
+
+            nyx_printf("    [FULLDUMP] Cross-dump diff: %d changed, %d new, %d removed "
+                       "pages (%lu bytes changed) vs dump #%03d\n",
+                       changed_pages, new_pages, removed_pages,
+                       (unsigned long)total_changed_bytes,
+                       crossdump_prev.prev_seq);
+        }
+        free(diff_path);
+    } else if (cur_snap && !crossdump_prev.valid) {
+        nyx_printf("    [FULLDUMP] Cross-dump diff: first dump, no previous to compare\n");
+    }
+
+    /* --- 8. Swap current snapshot into previous for next comparison --- */
+    if (cur_snap) {
+        /* Reuse the crossdump_prev.pages buffer if large enough */
+        if (cur_snap_count > crossdump_prev.capacity) {
+            free(crossdump_prev.pages);
+            crossdump_prev.capacity = cur_snap_count + 1024;
+            crossdump_prev.pages = malloc(crossdump_prev.capacity *
+                                          sizeof(crossdump_page_t));
+        }
+        memcpy(crossdump_prev.pages, cur_snap,
+               cur_snap_count * sizeof(crossdump_page_t));
+        crossdump_prev.count = cur_snap_count;
+        crossdump_prev.prev_seq = seq;
+        crossdump_prev.valid = true;
+        free(cur_snap);
+    }
 
     free(modules);
     free(map_path);
