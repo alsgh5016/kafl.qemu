@@ -54,6 +54,7 @@
 #include "nyx/hypercall/hypercall.h"
 #include "nyx/interface.h"
 #include "nyx/pt.h"
+#include "nyx/wte.h"
 #include "nyx/snapshot/memory/backend/nyx_dirty_ring.h"
 #include "nyx/state/state.h"
 #include "nyx/synchronization.h"
@@ -2520,6 +2521,17 @@ int kvm_cpu_exec(CPUState *cpu)
         // clang-format on
         if (!kvm_state->nyx_no_pt_mode) {
             pt_post_kvm_run(cpu);
+        }
+// clang-format off
+#endif
+
+#ifdef QEMU_NYX
+        // clang-format on
+        /* WtE: scan dirty ring on every KVM exit for deterministic
+         * NX marking. This ensures pages dirtied since the last exit
+         * get NX-protected before the guest can execute them. */
+        if (wte_is_active()) {
+            wte_scan_dirty_ring();
         }
 // clang-format off
 #endif
