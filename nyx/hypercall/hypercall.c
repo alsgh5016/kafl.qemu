@@ -1893,5 +1893,6 @@ int handle_kafl_hypercall(struct kvm_run *run,
         ret = 0;
         break;
     }
+    }
     return ret;
 }
