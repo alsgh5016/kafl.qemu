@@ -649,13 +649,20 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
 
         if (entry->diff_count == 0) {
             /* No actual content change — false positive (EPT trapped
-             * the write BEFORE it completed, or same value written) */
+             * the write BEFORE it completed, or same value written).
+             * For PE pages, re-protect W=0 so subsequent real writes
+             * (e.g., packer decryption after CoW copy) are still caught. */
             nyx_printf("[WtE][EXEC] False positive (no diff): VA=0x%lx\n",
                        (unsigned long)entry->va);
             entry->flags &= ~WTE_PAGE_WRITTEN;
             wte_kvm_clear_nx(&gfn, 1);
             entry->flags &= ~WTE_PAGE_X_BLOCKED;
             entry->flags |= WTE_PAGE_X_ALLOWED;
+
+            if (entry->flags & WTE_PAGE_IS_PE) {
+                wte_kvm_set_wp(&gfn, 1);
+                entry->flags |= WTE_PAGE_W_PROTECTED;
+            }
             return;
         }
 
@@ -1139,16 +1146,23 @@ void wte_pt_check(CPUState *cpu)
             cpu_physical_memory_read(entry->gpa, entry->current, WTE_PAGE_SIZE);
             wte_compute_diff(entry);
 
-            /* The page was likely written (CoW = write triggered copy) */
-            entry->flags |= WTE_PAGE_WRITTEN;
+            /* Only mark WRITTEN if content actually differs from baseline.
+             * CoW often just copies the same content to a new physical page,
+             * which would cause a false positive exec violation. */
+            if (entry->diff_count > 0) {
+                entry->flags |= WTE_PAGE_WRITTEN;
+            }
         } else {
             entry = wte_lookup_or_create_va(va, new_gfn);
-            entry->flags = WTE_PAGE_IS_PE | WTE_PAGE_WRITTEN;
+            entry->flags = WTE_PAGE_IS_PE;
             entry->gpa = new_gfn << 12;
             cpu_physical_memory_read(entry->gpa, entry->baseline, WTE_PAGE_SIZE);
             entry->baseline_valid = true;
             cpu_physical_memory_read(entry->gpa, entry->current, WTE_PAGE_SIZE);
             wte_compute_diff(entry);
+            if (entry->diff_count > 0) {
+                entry->flags |= WTE_PAGE_WRITTEN;
+            }
         }
 
         /* Set EPT protections on new GFN */
