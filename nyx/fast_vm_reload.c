@@ -563,10 +563,10 @@ void fast_reload_qemu_user_fdl_set_dirty(fast_reload_t *self,
 void fast_reload_handle_dirty_ring_full(fast_reload_t *self)
 {
 
-    /* WtE: CoW detection + dirty ring scan before flushing */
+    /* WtE: CoW detection before flushing */
     if (wte_is_active()) {
         wte_pt_check(current_cpu);  /* CoW detection via VA→GFN rescan */
-        wte_scan_dirty_ring();
+        /* wte_scan_dirty_ring() — disabled: EPT W=0 is primary path */
     }
     if (self->dirty_ring_state) {
         nyx_snapshot_nyx_dirty_ring_flush_and_collect(self->dirty_ring_state,
