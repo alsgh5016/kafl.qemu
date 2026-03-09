@@ -112,6 +112,7 @@ typedef struct {
     int      pt_cow_recoveries;    /* CoW recoveries via PT this round  */
 
     /* Statistics */
+    uint64_t overflow_count;
     uint64_t total_w_violations;
     uint64_t total_x_violations;
     uint64_t total_cow_recoveries;
