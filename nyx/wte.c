@@ -1030,6 +1030,9 @@ void wte_eager_set_nx_on_pe(CPUState *cpu, uint64_t image_base,
     int mapped = 0;
     int unmapped = 0;
 
+    /* Reset target PE tracking for CoW detection */
+    wte_state.target_pe_gfn_count = 0;
+
     uint64_t va;
     for (va = image_base; va < image_base + image_size; va += WTE_PAGE_SIZE) {
         uint64_t pa = get_paging_phys_addr(cpu, cr3, va);
@@ -1042,6 +1045,13 @@ void wte_eager_set_nx_on_pe(CPUState *cpu, uint64_t image_base,
         uint64_t gfn = pa >> 12;
         uint64_t gpa = pa & 0xFFFFFFFFFFFFF000ULL;
         mapped++;
+
+        /* Store VA→GFN mapping for CoW detection */
+        if (wte_state.target_pe_gfn_count < WTE_MAX_TARGET_PE_PAGES) {
+            wte_state.target_pe_gfns[wte_state.target_pe_gfn_count] = gfn;
+            wte_state.target_pe_vas[wte_state.target_pe_gfn_count] = va;
+            wte_state.target_pe_gfn_count++;
+        }
 
         /* Add page to WtE tracking with baseline content */
         int idx = wte_find_page(gfn);
@@ -1094,6 +1104,8 @@ void wte_eager_set_nx_on_pe(CPUState *cpu, uint64_t image_base,
     nyx_printf("[WtE][EAGER] NX set on %d pages (%d mapped, %d unmapped) "
                "total NX now: %d\n",
                total_nx, mapped, unmapped, wte_state.nx_pages_set);
+    nyx_printf("[WtE][EAGER] Target PE tracking initialized: %d VA→GFN entries for CoW detection\n",
+               wte_state.target_pe_gfn_count);
 }
 
 /*
