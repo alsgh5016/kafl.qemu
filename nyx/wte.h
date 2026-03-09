@@ -200,7 +200,6 @@ typedef struct {
     uint64_t    va;                /* target page VA                 */
     uint64_t    gfn;               /* target page GFN                */
     int         diff_count;        /* byte diffs in target page      */
-    int         round;             /* WtE round number               */
-    int         wte_count;         /* WtE count in current round     */
-    int         total_wte_count;   /* total WtE count all rounds     */
+    int         wte_count;         /* WtE count (this detection #)   */
+    int         total_wte_count;   /* total WtE count cumulative     */
 } wte_dump_event_t;

@@ -551,8 +551,7 @@ void wte_check_deferred_pages(CPUState *cpu)
                 CPUX86State *env = &cpux86->env;
                 char wte_label[128];
                 snprintf(wte_label, sizeof(wte_label),
-                         "wte_r%d_rip0x%lx_va0x%lx",
-                         wte_state.round,
+                         "wte_rip0x%lx_va0x%lx",
                          (unsigned long)entry->last_write_rip,
                          (unsigned long)entry->va);
                 wte_dump_event_t evt = {
@@ -561,7 +560,6 @@ void wte_check_deferred_pages(CPUState *cpu)
                     .va              = entry->va,
                     .gfn             = entry->gfn,
                     .diff_count      = entry->diff_count,
-                    .round           = wte_state.round,
                     .wte_count       = wte_state.wte_count,
                     .total_wte_count = wte_state.total_wte_count,
                 };
@@ -706,8 +704,8 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
             CPUX86State *env = &cpux86->env;
             char wte_label[128];
             snprintf(wte_label, sizeof(wte_label),
-                     "wte_r%d_rip0x%lx_va0x%lx",
-                     wte_state.round, (unsigned long)rip,
+                     "wte_rip0x%lx_va0x%lx",
+                     (unsigned long)rip,
                      (unsigned long)entry->va);
             wte_dump_event_t evt = {
                 .type            = "EXEC",
@@ -715,7 +713,6 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
                 .va              = entry->va,
                 .gfn             = entry->gfn,
                 .diff_count      = entry->diff_count,
-                .round           = wte_state.round,
                 .wte_count       = wte_state.wte_count,
                 .total_wte_count = wte_state.total_wte_count,
             };

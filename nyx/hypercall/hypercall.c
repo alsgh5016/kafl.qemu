@@ -908,8 +908,8 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
         fprintf(map_f, "#   Target GFN: 0x%lx\n", (unsigned long)event->gfn);
         fprintf(map_f, "#   Diffs:      %d bytes changed in target page\n",
                 event->diff_count);
-        fprintf(map_f, "#   Round:      %d  (WtE #%d this round, #%d total)\n",
-                event->round, event->wte_count, event->total_wte_count);
+        fprintf(map_f, "#   WtE#:       %d (total)\n",
+                event->total_wte_count);
     }
     fprintf(map_f, "\n");
     fprintf(map_f, "# %-10s  %-10s  %-10s  %-5s  %-40s  %s\n",
@@ -1199,15 +1199,15 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                 fprintf(tl_f, "# WtE Detection Timeline\n");
                 fprintf(tl_f, "# SEQ  TYPE       RIP         VA          "
                         "GFN        DIFFS  PAGES_WRITTEN  PAGES_TOTAL  "
-                        "ROUND  WTE#  LABEL\n");
+                        "WTE#  LABEL\n");
             }
             fprintf(tl_f, "%03d  %-9s  0x%08lx  0x%08lx  0x%06lx  %5d  %13d  %11d  "
-                    "r%-4d  #%-4d  %s\n",
+                    "#%-4d  %s\n",
                     seq, event->type,
                     (unsigned long)event->rip, (unsigned long)event->va,
                     (unsigned long)event->gfn, event->diff_count,
                     written_pages, pg_count,
-                    event->round, event->total_wte_count, label);
+                    event->total_wte_count, label);
             fclose(tl_f);
         }
         free(tl_path);
