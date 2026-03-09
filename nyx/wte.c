@@ -37,7 +37,8 @@
 
 /* Defined in hypercall.c */
 extern void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
-                                     const char *label);
+                                     const char *label,
+                                     const wte_dump_event_t *event);
 
 /* ── Dirty Ring Globals (defined in nyx_dirty_ring.c) ──────────── */
 
@@ -541,8 +542,6 @@ void wte_check_deferred_pages(CPUState *cpu)
                        (unsigned long)entry->va, (unsigned long)entry->gfn,
                        entry->diff_count);
 
-            /* wte_dump_detection(0, entry, "EPT-DEFERRED"); */
-
             /* Full process memory dump (incremental — only changed pages) */
             {
                 X86CPU *cpux86 = X86_CPU(cpu);
@@ -551,7 +550,17 @@ void wte_check_deferred_pages(CPUState *cpu)
                 snprintf(wte_label, sizeof(wte_label),
                          "wte_r%d_deferred_va0x%lx",
                          wte_state.round, (unsigned long)entry->va);
-                dump_full_process_memory(cpu, env, wte_label);
+                wte_dump_event_t evt = {
+                    .type            = "DEFERRED",
+                    .rip             = 0,
+                    .va              = entry->va,
+                    .gfn             = entry->gfn,
+                    .diff_count      = entry->diff_count,
+                    .round           = wte_state.round,
+                    .wte_count       = wte_state.wte_count,
+                    .total_wte_count = wte_state.total_wte_count,
+                };
+                dump_full_process_memory(cpu, env, wte_label, &evt);
             }
 
             /* Update baseline for next change detection */
@@ -686,8 +695,6 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
         wte_state.wte_count++;
         wte_state.total_wte_count++;
 
-        /* wte_dump_detection(rip, entry, "EPT-DUAL"); */
-
         /* Full process memory dump (incremental — only changed pages) */
         {
             X86CPU *cpux86 = X86_CPU(cpu);
@@ -697,7 +704,17 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
                      "wte_r%d_rip0x%lx_va0x%lx",
                      wte_state.round, (unsigned long)rip,
                      (unsigned long)entry->va);
-            dump_full_process_memory(cpu, env, wte_label);
+            wte_dump_event_t evt = {
+                .type            = "EXEC",
+                .rip             = rip,
+                .va              = entry->va,
+                .gfn             = entry->gfn,
+                .diff_count      = entry->diff_count,
+                .round           = wte_state.round,
+                .wte_count       = wte_state.wte_count,
+                .total_wte_count = wte_state.total_wte_count,
+            };
+            dump_full_process_memory(cpu, env, wte_label, &evt);
         }
 
         /* Post-detection: update baseline, re-protect for next layer */

@@ -812,7 +812,8 @@ static int crossdump_find_va(uint32_t va)
 }
 
 void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
-                                     const char *label)
+                                     const char *label,
+                                     const wte_dump_event_t *event)
 {
     int seq = dump_seq_counter++;
 
@@ -896,7 +897,21 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
     }
     fprintf(map_f, "# Full process memory dump #%03d\n", seq);
     fprintf(map_f, "# Trigger: %s\n", label);
-    fprintf(map_f, "# Modules: %d\n\n", num_modules);
+    fprintf(map_f, "# Modules: %d\n", num_modules);
+
+    if (event) {
+        fprintf(map_f, "#\n");
+        fprintf(map_f, "# WtE Event:\n");
+        fprintf(map_f, "#   Type:       %s\n", event->type);
+        fprintf(map_f, "#   RIP:        0x%lx\n", (unsigned long)event->rip);
+        fprintf(map_f, "#   Target VA:  0x%lx\n", (unsigned long)event->va);
+        fprintf(map_f, "#   Target GFN: 0x%lx\n", (unsigned long)event->gfn);
+        fprintf(map_f, "#   Diffs:      %d bytes changed in target page\n",
+                event->diff_count);
+        fprintf(map_f, "#   Round:      %d  (WtE #%d this round, #%d total)\n",
+                event->round, event->wte_count, event->total_wte_count);
+    }
+    fprintf(map_f, "\n");
     fprintf(map_f, "# %-10s  %-10s  %-10s  %-5s  %-40s  %s\n",
             "START", "END", "SIZE", "PERM", "FILE", "MODULE");
 
@@ -1172,6 +1187,32 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                region_count, is_incremental ? "changed pages" : "regions",
                (unsigned long)total_bytes, written_pages, pg_count, dump_dir);
 
+    /* --- 6b. Append to cumulative WtE timeline --- */
+    if (event) {
+        char *tl_path = NULL;
+        assert(asprintf(&tl_path, "%s/dump/wte_timeline.txt",
+                        GET_GLOBAL_STATE()->workdir_path) != -1);
+        FILE *tl_f = fopen(tl_path, "a");
+        if (tl_f) {
+            /* Write header on first event */
+            if (seq == 0) {
+                fprintf(tl_f, "# WtE Detection Timeline\n");
+                fprintf(tl_f, "# SEQ  TYPE       RIP         VA          "
+                        "GFN        DIFFS  PAGES_WRITTEN  PAGES_TOTAL  "
+                        "ROUND  WTE#  LABEL\n");
+            }
+            fprintf(tl_f, "%03d  %-9s  0x%08lx  0x%08lx  0x%06lx  %5d  %13d  %11d  "
+                    "r%-4d  #%-4d  %s\n",
+                    seq, event->type,
+                    (unsigned long)event->rip, (unsigned long)event->va,
+                    (unsigned long)event->gfn, event->diff_count,
+                    written_pages, pg_count,
+                    event->round, event->total_wte_count, label);
+            fclose(tl_f);
+        }
+        free(tl_path);
+    }
+
     /* --- 7. Cross-dump byte diff: compare with previous snapshot --- */
     if (cur_snap && crossdump_prev.valid && crossdump_prev.count > 0) {
         char *diff_path = NULL;
@@ -1378,7 +1419,7 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
                     /* Full process memory dump */
                     {
                         const char *dump_label = (proc_name[0] != '\0') ? proc_name : "unknown";
-                        dump_full_process_memory(cpu, env, dump_label);
+                        dump_full_process_memory(cpu, env, dump_label, NULL);
                     }
                 }
 hook_single_step:

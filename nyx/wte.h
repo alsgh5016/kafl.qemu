@@ -189,3 +189,16 @@ void wte_pt_check(CPUState *cpu);
 /* Cross-dump byte diff */
 void wte_crossdump_init(void);
 void wte_crossdump_destroy(void);
+
+/* ── WtE dump event metadata ──────────────────────────────────── */
+
+typedef struct {
+    const char *type;              /* "DEFERRED" or "EXEC"           */
+    uint64_t    rip;               /* trigger RIP (0 if unknown)     */
+    uint64_t    va;                /* target page VA                 */
+    uint64_t    gfn;               /* target page GFN                */
+    int         diff_count;        /* byte diffs in target page      */
+    int         round;             /* WtE round number               */
+    int         wte_count;         /* WtE count in current round     */
+    int         total_wte_count;   /* total WtE count all rounds     */
+} wte_dump_event_t;
