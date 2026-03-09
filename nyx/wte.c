@@ -502,13 +502,9 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
 
     wte_state.total_x_violations++;
 
-    /* Skip kernel-mode RIP */
+    /* Skip kernel-mode RIP — do NOT re-NX kernel pages (infinite loop) */
     if (rip >= 0xFFFF800000000000ULL) {
         wte_kvm_clear_nx(&gfn, 1);
-        /* Queue for re-NX on next scan */
-        if (wte_state.renx_count < wte_state.renx_capacity) {
-            wte_state.renx_queue[wte_state.renx_count++] = gfn;
-        }
         return;
     }
 
