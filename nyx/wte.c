@@ -1095,7 +1095,3 @@ void wte_pt_check(CPUState *cpu)
     if (wp_count > 0) wte_kvm_set_wp(wp_batch, wp_count);
 }
 
-/* ── Cross-dump (stub — preserved from legacy) ─────────────────── */
-
-void wte_crossdump_init(void)  { /* TODO: preserved from legacy */ }
-void wte_crossdump_destroy(void) { /* TODO: preserved from legacy */ }
