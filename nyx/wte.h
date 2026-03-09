@@ -1,19 +1,20 @@
 /*
- * WtE (Written-then-Executed) Detection — EPT NX Architecture
+ * WtE (Written-then-Executed) Detection — Dual-Watch Architecture
  *
- * Uses KVM Dirty Ring for write tracking and EPT NX bit for
- * execution interception. When a dirty page is executed, the
- * EPT NX violation causes a VM exit (KVM_EXIT_KAFL_WTE).
- * Content diff confirms actual code modification to avoid
- * false positives.
+ * Uses EPT Write Protection (W=0) for real-time write detection and
+ * EPT NX (X=0) for real-time execution interception on target PE pages.
+ * Non-PE pages use dirty ring + NX for write/execute tracking.
+ * Intel PT serves as a safety net to catch CoW-induced misses.
  *
  * Detection cycle:
- *   1. Guest writes to page → KVM Dirty Ring entry
- *   2. wte_scan_dirty_ring() → reads dirty GFNs → ioctl SET_NX
- *   3. Guest executes dirty page → EPT NX violation → VM exit
- *   4. wte_handle_nx_violation() → content diff → dump if confirmed
- *   5. ioctl CLEAR_NX on confirmed page → guest resumes
- *   6. Round reset: clear all NX bits → detect next unpacking layer
+ *   1. WTE_SETUP: Set EPT W=0 + X=0 on target PE pages
+ *   2. Guest writes to PE page → EPT write violation → VM exit
+ *      → mark page as "written" (VA-based), W=1, keep X=0
+ *   3. Guest executes PE page → EPT execute violation → VM exit
+ *      → written? → WtE detected → memory dump → W=0 re-protect, X=1
+ *      → not written? → allow exec (X=1)
+ *   4. Intel PT safety net: decode trace at each VM exit, catch CoW misses
+ *   5. Non-PE pages: dirty ring + NX (legacy path, supplementary)
  */
 
 #pragma once
@@ -23,82 +24,102 @@
 
 #include "qemu/osdep.h"
 
-/* ── Page Info ─────────────────────────────────────────────────── */
+/* ── Constants ─────────────────────────────────────────────────── */
 
 #define WTE_PAGE_SIZE       4096
 #define WTE_MAX_DIFF_RANGES 256
-
-/* Maximum GFNs per batch ioctl call */
 #define WTE_MAX_BATCH_GFNS  4096
+#define WTE_MAX_TARGET_PE_PAGES 512
 
-/* Maximum pages in target PE image for diagnostic tracking */
-#define WTE_MAX_TARGET_PE_PAGES 256
-
-/* RIP VA threshold for system DLL noise filtering.
- * In 32-bit Windows processes, system DLLs (ntdll, KERNELBASE, etc.)
- * load at VA >= 0x70000000. User code + dynamic allocs live below.
- * For 64-bit targets, adjust to 0x00007FF000000000. */
+/* DLL noise filter VA thresholds */
 #define WTE_DLL_VA_THRESHOLD_32  0x70000000ULL
 #define WTE_DLL_VA_THRESHOLD_64  0x00007FF000000000ULL
 
-/* Cross-dump diff: maximum pages to retain for previous snapshot.
- * ~2000 pages × 4KB = ~8MB of memory per snapshot. */
+/* Cross-dump max pages */
 #define WTE_CROSSDUMP_MAX_PAGES  8192
 
+/* EPT violation types (matches KVM kafl_wte.type) */
+#define WTE_VIOLATION_EXEC   0
+#define WTE_VIOLATION_WRITE  1
+
+/* ── Page flags ────────────────────────────────────────────────── */
+
+#define WTE_PAGE_WRITTEN       (1 << 0)  /* page was written to          */
+#define WTE_PAGE_W_PROTECTED   (1 << 1)  /* EPT W=0 is set              */
+#define WTE_PAGE_X_BLOCKED     (1 << 2)  /* EPT X=0 is set              */
+#define WTE_PAGE_X_ALLOWED     (1 << 3)  /* execution explicitly allowed */
+#define WTE_PAGE_IS_PE         (1 << 4)  /* belongs to target PE image   */
+#define WTE_PAGE_IS_DYNAMIC    (1 << 5)  /* dynamically detected region  */
+
+/* ── Per-page tracking entry ───────────────────────────────────── */
+
 typedef struct {
-    uint64_t gpa;                            /* Guest Physical Address (GFN << 12) */
-    uint8_t  baseline[WTE_PAGE_SIZE];        /* Content at snapshot time            */
-    uint8_t  current[WTE_PAGE_SIZE];         /* Content when dirty detected         */
+    uint64_t va;                             /* page VA (4KB aligned)     */
+    uint64_t gfn;                            /* current GFN mapping       */
+    uint64_t gpa;                            /* GFN << 12                 */
+    uint32_t flags;                          /* WTE_PAGE_* flags          */
+    uint32_t write_count;                    /* writes this round         */
+
+    /* Content tracking for diff */
+    uint8_t  baseline[WTE_PAGE_SIZE];        /* content at snapshot/setup */
+    uint8_t  current[WTE_PAGE_SIZE];         /* content at detection time */
     bool     baseline_valid;
-    bool     diff_done;
-    int      diff_count;                     /* Number of changed byte ranges       */
-    uint16_t diff_offsets[WTE_MAX_DIFF_RANGES]; /* Changed byte range start offsets */
-    uint16_t diff_lengths[WTE_MAX_DIFF_RANGES]; /* Changed byte range lengths       */
-    bool     nx_set;                         /* EPT NX bit currently set for page   */
-} wte_page_info_t;
+    int      diff_count;
+    uint16_t diff_offsets[WTE_MAX_DIFF_RANGES];
+    uint16_t diff_lengths[WTE_MAX_DIFF_RANGES];
+} wte_page_entry_t;
 
-/* ── WtE Global State ─────────────────────────────────────────── */
+/* ── Main state ────────────────────────────────────────────────── */
 
 typedef struct {
-    /* GFN → page_info tracking (simple dynamic array) */
-    wte_page_info_t **pages;                 /* Array of page info pointers         */
-    uint64_t         *gfns;                  /* Parallel array of GFN keys          */
-    int               page_count;            /* Number of tracked pages             */
-    int               page_capacity;         /* Allocated capacity                  */
+    bool     active;
+    bool     kvm_wte_enabled;
 
-    int      round;                          /* Current detection round             */
-    bool     active;                         /* WtE detection enabled               */
-    bool     kvm_wte_enabled;                /* KVM WtE ioctl enabled               */
+    /* Target process */
+    uint64_t target_cr3;
+    uint64_t target_pid;
+    bool     is_64bit;
 
-    uint64_t target_cr3;                     /* Target process CR3                  */
-    bool     is_64bit;                       /* 64-bit PE target mode               */
+    /* Target PE range */
+    uint64_t pe_base_va;
+    uint64_t pe_end_va;
+    uint64_t pe_size;
 
-    uint32_t last_scanned_ring_index;        /* Last dirty ring index we scanned    */
-    int      wte_count;                      /* Total WtE detections this round     */
-    int      total_wte_count;                /* Total WtE detections across rounds  */
-    int      nx_pages_set;                   /* Number of pages with NX bit set     */
-    uint64_t overflow_count;                  /* PT overflow events during this round */
+    /* VA-based page tracking (GHashTable: VA → wte_page_entry_t*) */
+    GHashTable *page_table;
 
-    /* DLL noise filter: skip dump for system DLL WtE detections */
-    bool     dll_filter_enabled;              /* Enable DLL VA range filtering       */
-    uint64_t dll_va_threshold;                /* VA threshold (set per 32/64-bit)    */
-    int      dll_filtered_count;              /* WtE detections filtered (this round)*/
-    int      dll_filtered_total;              /* WtE detections filtered (all rounds)*/
+    /* PE VA→GFN initial mappings (for CoW detection by PT safety net) */
+    uint64_t pe_vas[WTE_MAX_TARGET_PE_PAGES];
+    uint64_t pe_gfns[WTE_MAX_TARGET_PE_PAGES];
+    int      pe_page_count;
 
-    /* Re-NX queue: GFNs that need NX re-set after kernel RIP skip.
-     * When a kernel RIP triggers an NX violation, we clear NX to let
-     * the guest continue, but queue the GFN for re-NX on the next
-     * dirty ring scan so user-mode WtE on the same page is not missed. */
-    uint64_t *renx_queue;                    /* GFNs pending NX re-set            */
-    int       renx_count;                    /* Number of pending re-NX GFNs      */
-    int       renx_capacity;                /* Allocated capacity                */
+    /* Round management */
+    int      round;
+    int      wte_count;            /* WtE detections this round        */
+    int      total_wte_count;      /* WtE detections across all rounds */
 
-    /* Diagnostic: target PE VA→GFN mapping for tracking */
-    uint64_t  target_image_base;             /* Target PE image base VA           */
-    uint64_t  target_image_end;              /* Target PE image end VA            */
-    uint64_t  target_pe_gfns[WTE_MAX_TARGET_PE_PAGES]; /* GFNs backing target PE */
-    uint64_t  target_pe_vas[WTE_MAX_TARGET_PE_PAGES];  /* Corresponding VAs      */
-    int       target_pe_gfn_count;           /* Number of mapped target PE pages  */
+    /* DLL noise filter */
+    bool     dll_filter_enabled;
+    uint64_t dll_va_threshold;
+    int      dll_filtered_count;
+    int      dll_filtered_total;
+
+    /* Dirty ring for non-PE pages (legacy supplementary path) */
+    uint32_t last_scanned_ring_index;
+
+    /* PT safety net state */
+    uint64_t pt_decode_cursor;     /* last decoded offset in PT buffer  */
+    int      pt_cow_recoveries;    /* CoW recoveries via PT this round  */
+
+    /* Statistics */
+    uint64_t total_w_violations;
+    uint64_t total_x_violations;
+    uint64_t total_cow_recoveries;
+
+    /* Re-NX queue for non-PE pages (legacy path) */
+    uint64_t *renx_queue;
+    int       renx_count;
+    int       renx_capacity;
 } wte_state_t;
 
 /* ── Public API ────────────────────────────────────────────────── */
@@ -114,15 +135,23 @@ int  wte_kvm_enable(void);
 int  wte_kvm_disable(void);
 int  wte_kvm_set_nx(uint64_t *gfns, uint32_t count);
 int  wte_kvm_clear_nx(uint64_t *gfns, uint32_t count);
+int  wte_kvm_set_wp(uint64_t *gfns, uint32_t count);
+int  wte_kvm_clear_wp(uint64_t *gfns, uint32_t count);
 int  wte_kvm_set_cr3(uint64_t cr3);
 
-/* Dirty ring scan — call before dirty ring flush.
- * Reads new dirty GFNs and marks them NX in EPT via ioctl. */
-void wte_scan_dirty_ring(void);
+/* EPT violation handlers (called from hypercall.c) */
+void wte_handle_write_violation(uint64_t gfn, uint64_t gpa,
+                                uint64_t rip, CPUState *cpu);
+void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
+                               uint64_t rip, CPUState *cpu);
 
-/* EPT NX violation handler — called on KVM_EXIT_KAFL_WTE.
- * Performs content diff, dumps if confirmed WtE, clears NX. */
-void wte_handle_nx_violation(uint64_t gfn, uint64_t gpa, uint64_t rip, CPUState *cpu);
+/* PE range protection: W=0 + X=0 on target PE pages.
+ * Called during WTE_SETUP, BEFORE target process executes. */
+void wte_protect_pe_range(CPUState *cpu, uint64_t image_base,
+                          uint64_t image_size, uint64_t cr3);
+
+/* Dirty ring scan for non-PE pages (supplementary legacy path) */
+void wte_scan_dirty_ring(void);
 
 /* Round management */
 void wte_reset_round(void);
@@ -134,32 +163,21 @@ wte_state_t *wte_get_state(void);
 /* Debug */
 void wte_print_debug_summary(void);
 
-/* Diagnostic: map target PE VA range to GFNs via page table walk.
- * Call after wte_activate() with valid CPU state. */
-void wte_diagnose_target_pe(CPUState *cpu, uint64_t image_base, uint64_t image_size);
+/* EPROCESS walking: find target process CR3 by PID */
+uint64_t wte_find_cr3_by_pid(CPUState *cpu, uint64_t harness_cr3,
+                             uint64_t target_pid);
 
-/* Check if a GFN belongs to the target PE image */
+/* Diagnostic: map target PE VA range to GFNs */
+void wte_diagnose_target_pe(CPUState *cpu, uint64_t image_base,
+                            uint64_t image_size);
+
+/* Check if a GFN belongs to target PE */
 bool wte_is_target_pe_gfn(uint64_t gfn);
 
-/* EPROCESS walking: find target process CR3 by PID.
- * Uses the harness CR3 (which shares kernel page tables on Windows x64)
- * to walk the ActiveProcessLinks circular list in kernel VA space. */
-uint64_t wte_find_cr3_by_pid(CPUState *cpu, uint64_t harness_cr3, uint64_t target_pid);
+/* Intel PT safety net: check PT trace for CoW-missed WtE.
+ * Call at every VM exit after dirty ring scan. */
+void wte_pt_check(CPUState *cpu);
 
-/* Eager NX: set EPT NX bit on all pages backing the target PE image.
- * Call during WTE_SETUP, BEFORE the target process executes any code.
- * Ensures the very first execution of any PE page triggers an NX violation. */
-void wte_eager_set_nx_on_pe(CPUState *cpu, uint64_t image_base,
-                            uint64_t image_size, uint64_t cr3);
-
-/* Rescan target PE VA→GFN mappings to detect CoW-induced GFN changes.
- * Call periodically (e.g., before dirty ring scan) to catch page remapping.
- * Returns number of new GFNs that had NX set. */
-int wte_rescan_pe_gfns(CPUState *cpu);
-
-/* Cross-dump byte diff: compare consecutive full process memory dumps.
- * Maintains a previous snapshot in memory (~8MB) and generates a
- * diff_report.txt alongside each dump directory showing exactly which
- * VA pages changed and at what byte offsets/lengths. */
+/* Cross-dump byte diff */
 void wte_crossdump_init(void);
 void wte_crossdump_destroy(void);

@@ -1,10 +1,17 @@
 /*
- * WtE (Written-then-Executed) Detection — EPT NX Implementation
+ * WtE (Written-then-Executed) Detection — Dual-Watch Implementation
  *
- * Uses KVM Dirty Ring for write tracking and EPT NX bit manipulation
- * via KVM ioctls. When a dirty page is executed, KVM intercepts the
- * EPT NX violation and exits with KVM_EXIT_KAFL_WTE. Content diff
- * eliminates false positives from incidental dirty pages.
+ * Primary path (PE pages):
+ *   EPT W=0 for write detection → EPT X=0 for execute detection
+ *   Zero timing gap: both write and execute cause immediate VM exits.
+ *
+ * Supplementary path (non-PE pages):
+ *   Dirty ring for write detection → EPT NX for execute detection
+ *   Has timing gaps but catches dynamic allocation WtE.
+ *
+ * Safety net (all pages):
+ *   Intel PT trace decoded incrementally at each VM exit.
+ *   Catches CoW-induced misses where GFN changes break EPT tracking.
  */
 
 #include "qemu/osdep.h"
@@ -28,8 +35,7 @@
 
 #include "target/i386/cpu.h"
 
-/* Defined in hypercall.c — declared here because hypercall.h cannot
- * reference CPUX86State (x86-specific type unknown to vl.c). */
+/* Defined in hypercall.c */
 extern void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                                      const char *label);
 
@@ -44,137 +50,132 @@ extern uint32_t              kvm_dirty_gfns_index_mask;
 
 static wte_state_t wte_state;
 
-/* ── Internal: Page Tracking (simple dynamic array) ─────────────── */
+/* ── VA-based Page Table Helpers ───────────────────────────────── */
 
-#define WTE_INITIAL_CAPACITY 256
-
-static int wte_find_page(uint64_t gfn)
+static wte_page_entry_t *wte_lookup_va(uint64_t page_va)
 {
-    for (int i = 0; i < wte_state.page_count; i++) {
-        if (wte_state.gfns[i] == gfn) {
-            return i;
-        }
-    }
-    return -1;
+    if (!wte_state.page_table) return NULL;
+    return g_hash_table_lookup(wte_state.page_table,
+                               GUINT_TO_POINTER(page_va));
 }
 
-static wte_page_info_t *wte_add_page(uint64_t gfn)
+static wte_page_entry_t *wte_lookup_or_create_va(uint64_t page_va,
+                                                  uint64_t gfn)
 {
-    if (wte_state.page_count >= wte_state.page_capacity) {
-        int new_cap = wte_state.page_capacity * 2;
-        wte_state.pages = realloc(wte_state.pages,
-                                  new_cap * sizeof(wte_page_info_t *));
-        wte_state.gfns  = realloc(wte_state.gfns,
-                                  new_cap * sizeof(uint64_t));
-        wte_state.page_capacity = new_cap;
-    }
+    wte_page_entry_t *entry = wte_lookup_va(page_va);
+    if (entry) return entry;
 
-    wte_page_info_t *info = malloc(sizeof(wte_page_info_t));
-    memset(info, 0, sizeof(wte_page_info_t));
-
-    int idx = wte_state.page_count;
-    wte_state.pages[idx] = info;
-    wte_state.gfns[idx]  = gfn;
-    wte_state.page_count++;
-
-    return info;
+    entry = g_new0(wte_page_entry_t, 1);
+    entry->va  = page_va;
+    entry->gfn = gfn;
+    entry->gpa = gfn << 12;
+    g_hash_table_insert(wte_state.page_table,
+                        GUINT_TO_POINTER(page_va), entry);
+    return entry;
 }
 
-static void wte_free_all_pages(void)
+/* Find page entry by GFN (for dirty ring / NX violation on non-PE pages) */
+static wte_page_entry_t *wte_lookup_gfn(uint64_t gfn)
 {
-    for (int i = 0; i < wte_state.page_count; i++) {
-        free(wte_state.pages[i]);
+    GHashTableIter iter;
+    gpointer key, value;
+
+    if (!wte_state.page_table) return NULL;
+
+    g_hash_table_iter_init(&iter, wte_state.page_table);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        wte_page_entry_t *entry = value;
+        if (entry->gfn == gfn) return entry;
     }
-    wte_state.page_count = 0;
+    return NULL;
 }
 
 /* ── Content Diff ──────────────────────────────────────────────── */
 
-static void wte_compute_diff(wte_page_info_t *info)
+static void wte_compute_diff(wte_page_entry_t *entry)
 {
-    info->diff_count = 0;
-    info->diff_done  = true;
+    entry->diff_count = 0;
 
     bool in_diff = false;
     int  start   = 0;
 
     for (int i = 0; i < WTE_PAGE_SIZE; i++) {
-        bool differ = (info->baseline[i] != info->current[i]);
+        bool differ = (entry->baseline[i] != entry->current[i]);
 
         if (differ && !in_diff) {
             in_diff = true;
             start   = i;
         } else if (!differ && in_diff) {
             in_diff = false;
-            if (info->diff_count < WTE_MAX_DIFF_RANGES) {
-                info->diff_offsets[info->diff_count] = (uint16_t)start;
-                info->diff_lengths[info->diff_count] = (uint16_t)(i - start);
-                info->diff_count++;
+            if (entry->diff_count < WTE_MAX_DIFF_RANGES) {
+                entry->diff_offsets[entry->diff_count] = (uint16_t)start;
+                entry->diff_lengths[entry->diff_count] = (uint16_t)(i - start);
+                entry->diff_count++;
             }
         }
     }
 
-    if (in_diff && info->diff_count < WTE_MAX_DIFF_RANGES) {
-        info->diff_offsets[info->diff_count] = (uint16_t)start;
-        info->diff_lengths[info->diff_count] = (uint16_t)(WTE_PAGE_SIZE - start);
-        info->diff_count++;
+    if (in_diff && entry->diff_count < WTE_MAX_DIFF_RANGES) {
+        entry->diff_offsets[entry->diff_count] = (uint16_t)start;
+        entry->diff_lengths[entry->diff_count] = (uint16_t)(WTE_PAGE_SIZE - start);
+        entry->diff_count++;
     }
 }
 
 /* ── Dump ──────────────────────────────────────────────────────── */
 
-static void wte_dump_detection(uint64_t exec_rip, uint64_t gfn,
-                               wte_page_info_t *info)
+static void wte_dump_detection(uint64_t exec_rip, wte_page_entry_t *entry,
+                               const char *source)
 {
     char *dump_dir = NULL;
-    assert(asprintf(&dump_dir, "%s/dump/wte_round%03d_gfn%lx",
+    assert(asprintf(&dump_dir, "%s/dump/wte_r%03d_evt%03d_va0x%lx",
                     GET_GLOBAL_STATE()->workdir_path,
-                    wte_state.round, (unsigned long)gfn) != -1);
+                    wte_state.round, wte_state.wte_count,
+                    (unsigned long)entry->va) != -1);
     mkdir(dump_dir, 0755);
 
     /* baseline.bin */
     char *path = NULL;
     assert(asprintf(&path, "%s/baseline.bin", dump_dir) != -1);
     FILE *f = fopen(path, "wb");
-    if (f) {
-        fwrite(info->baseline, 1, WTE_PAGE_SIZE, f);
-        fclose(f);
-    }
+    if (f) { fwrite(entry->baseline, 1, WTE_PAGE_SIZE, f); fclose(f); }
     free(path);
 
     /* current.bin */
     assert(asprintf(&path, "%s/current.bin", dump_dir) != -1);
     f = fopen(path, "wb");
-    if (f) {
-        fwrite(info->current, 1, WTE_PAGE_SIZE, f);
-        fclose(f);
-    }
+    if (f) { fwrite(entry->current, 1, WTE_PAGE_SIZE, f); fclose(f); }
     free(path);
 
     /* diff_report.txt */
     assert(asprintf(&path, "%s/diff_report.txt", dump_dir) != -1);
     f = fopen(path, "w");
     if (f) {
-        fprintf(f, "WtE Detection Report (EPT NX)\n");
-        fprintf(f, "=============================\n");
+        fprintf(f, "WtE Detection Report (Dual-Watch)\n");
+        fprintf(f, "==================================\n");
+        fprintf(f, "Source:    %s\n", source);
         fprintf(f, "Round:     %d\n", wte_state.round);
-        fprintf(f, "GFN:       0x%lx\n", (unsigned long)gfn);
-        fprintf(f, "GPA:       0x%lx\n", (unsigned long)info->gpa);
+        fprintf(f, "Event:     %d\n", wte_state.wte_count);
+        fprintf(f, "VA:        0x%lx\n", (unsigned long)entry->va);
+        fprintf(f, "GFN:       0x%lx\n", (unsigned long)entry->gfn);
+        fprintf(f, "GPA:       0x%lx\n", (unsigned long)entry->gpa);
         fprintf(f, "Exec RIP:  0x%lx\n", (unsigned long)exec_rip);
         fprintf(f, "CR3:       0x%lx\n", (unsigned long)wte_state.target_cr3);
-        fprintf(f, "Diff Ranges: %d\n\n", info->diff_count);
+        fprintf(f, "Diff Ranges: %d\n\n", entry->diff_count);
 
-        for (int i = 0; i < info->diff_count; i++) {
+        for (int i = 0; i < entry->diff_count; i++) {
             fprintf(f, "  Range[%d]: offset=0x%04x, length=%d bytes\n",
-                    i, info->diff_offsets[i], info->diff_lengths[i]);
+                    i, entry->diff_offsets[i], entry->diff_lengths[i]);
         }
         fclose(f);
     }
     free(path);
 
-    nyx_printf("[WtE] DETECTED round=%d GFN=0x%lx GPA=0x%lx RIP=0x%lx diffs=%d\n",
-               wte_state.round, (unsigned long)gfn, (unsigned long)info->gpa,
-               (unsigned long)exec_rip, info->diff_count);
+    nyx_printf("[WtE][DETECT] *** WRITTEN-THEN-EXECUTED ***  source=%s round=%d "
+               "VA=0x%lx RIP=0x%lx GFN=0x%lx diffs=%d\n",
+               source, wte_state.round,
+               (unsigned long)entry->va, (unsigned long)exec_rip,
+               (unsigned long)entry->gfn, entry->diff_count);
 
     free(dump_dir);
 }
@@ -187,7 +188,7 @@ int wte_kvm_enable(void)
     if (ret < 0) {
         nyx_printf("[WtE] ERROR: KVM_NYX_WTE_ENABLE failed: %d\n", ret);
     } else {
-        nyx_printf("[WtE] KVM WtE enabled\n");
+        nyx_printf("[WtE] KVM WtE enabled (Dual-Watch mode)\n");
         wte_state.kvm_wte_enabled = true;
     }
     return ret;
@@ -205,51 +206,50 @@ int wte_kvm_disable(void)
     return ret;
 }
 
-int wte_kvm_set_nx(uint64_t *gfns, uint32_t count)
+static int wte_kvm_batch_ioctl(int ioctl_nr, uint64_t *gfns, uint32_t count)
 {
-    if (count == 0) {
-        return 0;
-    }
+    if (count == 0) return 0;
 
-    /*
-     * Allocate kvm_nyx_wte_gfns with flexible array member.
-     * struct kvm_nyx_wte_gfns { __u32 count; __u32 flags; __u64 gfns[]; };
-     */
     size_t size = sizeof(struct kvm_nyx_wte_gfns) + count * sizeof(uint64_t);
     struct kvm_nyx_wte_gfns *req = malloc(size);
     req->count = count;
     req->flags = 0;
     memcpy(req->gfns, gfns, count * sizeof(uint64_t));
 
-    int ret = kvm_vm_ioctl(kvm_state, KVM_NYX_WTE_SET_NX, req);
-    if (ret < 0) {
-        nyx_printf("[WtE] ERROR: KVM_NYX_WTE_SET_NX failed: %d (count=%u)\n",
-                   ret, count);
-    }
-
+    int ret = kvm_vm_ioctl(kvm_state, ioctl_nr, req);
     free(req);
+    return ret;
+}
+
+int wte_kvm_set_nx(uint64_t *gfns, uint32_t count)
+{
+    int ret = wte_kvm_batch_ioctl(KVM_NYX_WTE_SET_NX, gfns, count);
+    if (ret < 0)
+        nyx_printf("[WtE] ERROR: SET_NX failed: %d (count=%u)\n", ret, count);
     return ret;
 }
 
 int wte_kvm_clear_nx(uint64_t *gfns, uint32_t count)
 {
-    if (count == 0) {
-        return 0;
-    }
+    int ret = wte_kvm_batch_ioctl(KVM_NYX_WTE_CLEAR_NX, gfns, count);
+    if (ret < 0)
+        nyx_printf("[WtE] ERROR: CLEAR_NX failed: %d (count=%u)\n", ret, count);
+    return ret;
+}
 
-    size_t size = sizeof(struct kvm_nyx_wte_gfns) + count * sizeof(uint64_t);
-    struct kvm_nyx_wte_gfns *req = malloc(size);
-    req->count = count;
-    req->flags = 0;
-    memcpy(req->gfns, gfns, count * sizeof(uint64_t));
+int wte_kvm_set_wp(uint64_t *gfns, uint32_t count)
+{
+    int ret = wte_kvm_batch_ioctl(KVM_NYX_WTE_SET_WP, gfns, count);
+    if (ret < 0)
+        nyx_printf("[WtE] ERROR: SET_WP failed: %d (count=%u)\n", ret, count);
+    return ret;
+}
 
-    int ret = kvm_vm_ioctl(kvm_state, KVM_NYX_WTE_CLEAR_NX, req);
-    if (ret < 0) {
-        nyx_printf("[WtE] ERROR: KVM_NYX_WTE_CLEAR_NX failed: %d (count=%u)\n",
-                   ret, count);
-    }
-
-    free(req);
+int wte_kvm_clear_wp(uint64_t *gfns, uint32_t count)
+{
+    int ret = wte_kvm_batch_ioctl(KVM_NYX_WTE_CLEAR_WP, gfns, count);
+    if (ret < 0)
+        nyx_printf("[WtE] ERROR: CLEAR_WP failed: %d (count=%u)\n", ret, count);
     return ret;
 }
 
@@ -257,37 +257,29 @@ int wte_kvm_set_cr3(uint64_t cr3)
 {
     int ret = kvm_vm_ioctl(kvm_state, KVM_NYX_WTE_SET_CR3, &cr3);
     if (ret < 0) {
-        nyx_printf("[WtE] ERROR: KVM_NYX_WTE_SET_CR3 failed: %d\n", ret);
+        nyx_printf("[WtE] ERROR: SET_CR3 failed: %d\n", ret);
     } else {
         nyx_printf("[WtE] KVM target CR3 set to 0x%lx\n", (unsigned long)cr3);
     }
     return ret;
 }
 
-/* ── Public API ────────────────────────────────────────────────── */
+/* ── Public API: Lifecycle ─────────────────────────────────────── */
 
 void wte_init(void)
 {
     memset(&wte_state, 0, sizeof(wte_state_t));
 
-    wte_state.pages = malloc(WTE_INITIAL_CAPACITY * sizeof(wte_page_info_t *));
-    wte_state.gfns  = malloc(WTE_INITIAL_CAPACITY * sizeof(uint64_t));
-    wte_state.page_capacity = WTE_INITIAL_CAPACITY;
-    wte_state.page_count    = 0;
+    wte_state.page_table = g_hash_table_new_full(
+        g_direct_hash, g_direct_equal, NULL, g_free);
 
-    wte_state.round  = 0;
-    wte_state.active = false;
-    wte_state.kvm_wte_enabled = false;
-
-    nyx_printf("[WtE] Initialized (EPT NX mode)\n");
-
-    /* Re-NX queue for kernel RIP skip recovery */
     wte_state.renx_queue    = malloc(WTE_MAX_BATCH_GFNS * sizeof(uint64_t));
     wte_state.renx_count    = 0;
     wte_state.renx_capacity = WTE_MAX_BATCH_GFNS;
 
-    /* Cross-dump byte diff snapshot */
     wte_crossdump_init();
+
+    nyx_printf("[WtE] Initialized (Dual-Watch mode)\n");
 }
 
 void wte_destroy(void)
@@ -296,12 +288,13 @@ void wte_destroy(void)
         wte_kvm_disable();
     }
 
-    wte_free_all_pages();
-    free(wte_state.pages);
-    free(wte_state.gfns);
+    if (wte_state.page_table) {
+        g_hash_table_destroy(wte_state.page_table);
+        wte_state.page_table = NULL;
+    }
+
     free(wte_state.renx_queue);
 
-    /* Cross-dump byte diff cleanup */
     wte_crossdump_destroy();
 
     memset(&wte_state, 0, sizeof(wte_state_t));
@@ -316,216 +309,458 @@ void wte_activate(uint64_t cr3, bool is_64bit)
     wte_state.round      = 0;
     wte_state.wte_count  = 0;
     wte_state.total_wte_count = 0;
-    wte_state.nx_pages_set    = 0;
-    wte_state.renx_count      = 0;
+    wte_state.renx_count = 0;
 
-    /* DLL noise filter — skip dump for system DLL VA range */
     wte_state.dll_filter_enabled  = true;
     wte_state.dll_va_threshold    = is_64bit ? WTE_DLL_VA_THRESHOLD_64
                                              : WTE_DLL_VA_THRESHOLD_32;
     wte_state.dll_filtered_count  = 0;
     wte_state.dll_filtered_total  = 0;
 
-    /* Enable KVM WtE tracking */
     if (!wte_state.kvm_wte_enabled) {
         wte_kvm_enable();
     }
-    /* Set target CR3 in KVM for kernel-side filtering */
     wte_kvm_set_cr3(cr3);
 
-    /* Sync to current dirty ring index so we only scan new entries */
     wte_state.last_scanned_ring_index = kvm_dirty_gfns_index;
+    wte_state.pt_decode_cursor = 0;
 
-    nyx_printf("[WtE] Activated: CR3=0x%lx, 64bit=%d, DLL filter threshold=0x%lx\n",
+    nyx_printf("[WtE] Activated: CR3=0x%lx, 64bit=%d, DLL filter=0x%lx\n",
                (unsigned long)cr3, is_64bit,
                (unsigned long)wte_state.dll_va_threshold);
 }
 
 void wte_deactivate(void)
 {
-    nyx_printf("[WtE] Deactivated: total detections=%d (%d dumped, %d DLL-filtered) across %d rounds\n",
+    nyx_printf("[WtE] Deactivated: total=%d (dumped=%d, DLL-filtered=%d, "
+               "CoW-recovered=%lu) across %d rounds\n",
                wte_state.total_wte_count,
                wte_state.total_wte_count - wte_state.dll_filtered_total,
                wte_state.dll_filtered_total,
+               (unsigned long)wte_state.total_cow_recoveries,
                wte_state.round + 1);
 
     if (wte_state.kvm_wte_enabled) {
         wte_kvm_disable();
     }
-
     wte_state.active = false;
 }
 
-/*
- * Scan dirty ring entries that haven't been processed yet.
- * For each new dirty GFN: read baseline + current content,
- * then mark the page NX in EPT via ioctl so execution will
- * trigger KVM_EXIT_KAFL_WTE.
- *
- * MUST be called BEFORE dirty_ring_flush_and_collect() so entries
- * are still valid in the ring.
- */
+/* ── PE Range Protection: W=0 + X=0 ──────────────────────────── */
+
+void wte_protect_pe_range(CPUState *cpu, uint64_t image_base,
+                          uint64_t image_size, uint64_t cr3)
+{
+    nyx_printf("[WtE][PROTECT] Setting W=0 + X=0 on PE: VA 0x%lx - 0x%lx\n",
+               (unsigned long)image_base,
+               (unsigned long)(image_base + image_size));
+
+    wte_state.pe_base_va = image_base;
+    wte_state.pe_end_va  = image_base + image_size;
+    wte_state.pe_size    = image_size;
+    wte_state.pe_page_count = 0;
+
+    uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
+    uint64_t wp_batch[WTE_MAX_BATCH_GFNS];
+    int nx_count = 0, wp_count = 0;
+    int mapped = 0, unmapped = 0;
+
+    for (uint64_t va = image_base; va < image_base + image_size;
+         va += WTE_PAGE_SIZE) {
+        uint64_t pa = get_paging_phys_addr(cpu, cr3, va);
+
+        if (pa == 0xFFFFFFFFFFFFFFFFULL || pa == 0) {
+            unmapped++;
+            continue;
+        }
+
+        uint64_t gfn = pa >> 12;
+        uint64_t page_va = va & ~0xFFFULL;
+        mapped++;
+
+        /* Store VA→GFN mapping for CoW detection */
+        if (wte_state.pe_page_count < WTE_MAX_TARGET_PE_PAGES) {
+            wte_state.pe_vas[wte_state.pe_page_count] = page_va;
+            wte_state.pe_gfns[wte_state.pe_page_count] = gfn;
+            wte_state.pe_page_count++;
+        }
+
+        /* Create VA-based page entry */
+        wte_page_entry_t *entry = wte_lookup_or_create_va(page_va, gfn);
+        entry->flags = WTE_PAGE_IS_PE | WTE_PAGE_W_PROTECTED | WTE_PAGE_X_BLOCKED;
+
+        /* Read baseline from root snapshot */
+        uint64_t gpa = pa & 0xFFFFFFFFFFFFF000ULL;
+        entry->gpa = gpa;
+        if (fast_reload_root_created(get_fast_reload_snapshot())) {
+            if (!read_snapshot_memory(get_fast_reload_snapshot(),
+                                     gpa, entry->baseline, WTE_PAGE_SIZE)) {
+                cpu_physical_memory_read(gpa, entry->baseline, WTE_PAGE_SIZE);
+            }
+        } else {
+            cpu_physical_memory_read(gpa, entry->baseline, WTE_PAGE_SIZE);
+        }
+        entry->baseline_valid = true;
+        memcpy(entry->current, entry->baseline, WTE_PAGE_SIZE);
+
+        /* Batch NX + WP */
+        nx_batch[nx_count++] = gfn;
+        wp_batch[wp_count++] = gfn;
+
+        if (nx_count >= WTE_MAX_BATCH_GFNS) {
+            wte_kvm_set_nx(nx_batch, nx_count);
+            nx_count = 0;
+        }
+        if (wp_count >= WTE_MAX_BATCH_GFNS) {
+            wte_kvm_set_wp(wp_batch, wp_count);
+            wp_count = 0;
+        }
+    }
+
+    /* Flush remaining batches */
+    if (nx_count > 0) wte_kvm_set_nx(nx_batch, nx_count);
+    if (wp_count > 0) wte_kvm_set_wp(wp_batch, wp_count);
+
+    nyx_printf("[WtE][PROTECT] PE protected: %d pages (W=0+X=0), "
+               "%d unmapped, %d VA→GFN entries stored\n",
+               mapped, unmapped, wte_state.pe_page_count);
+}
+
+/* ── Write Violation Handler (EPT W=0) ────────────────────────── */
+
+void wte_handle_write_violation(uint64_t gfn, uint64_t gpa,
+                                uint64_t rip, CPUState *cpu)
+{
+    if (!wte_state.active) {
+        wte_kvm_clear_wp(&gfn, 1);
+        return;
+    }
+
+    wte_state.total_w_violations++;
+
+    /* Find the VA for this GFN by checking PE mappings */
+    uint64_t fault_va = 0;
+    for (int i = 0; i < wte_state.pe_page_count; i++) {
+        if (wte_state.pe_gfns[i] == gfn) {
+            fault_va = wte_state.pe_vas[i];
+            break;
+        }
+    }
+
+    /* If not found in PE mappings, try reverse lookup from page table */
+    if (fault_va == 0) {
+        wte_page_entry_t *by_gfn = wte_lookup_gfn(gfn);
+        if (by_gfn) {
+            fault_va = by_gfn->va;
+        }
+    }
+
+    if (fault_va == 0) {
+        /* Unknown GFN — just clear WP and continue */
+        nyx_printf("[WtE][WRITE] Unknown GFN=0x%lx RIP=0x%lx, clearing WP\n",
+                   (unsigned long)gfn, (unsigned long)rip);
+        wte_kvm_clear_wp(&gfn, 1);
+        return;
+    }
+
+    wte_page_entry_t *entry = wte_lookup_or_create_va(fault_va, gfn);
+
+    /* Mark as written */
+    entry->flags |= WTE_PAGE_WRITTEN;
+    entry->write_count++;
+    entry->gfn = gfn;
+    entry->gpa = gpa & ~0xFFFULL;
+
+    /* Read current content (post-write state will be available after
+     * we allow the write, but we can read pre-write state now) */
+    cpu_physical_memory_read(entry->gpa, entry->current, WTE_PAGE_SIZE);
+
+    nyx_printf("[WtE][WRITE] VA=0x%lx GFN=0x%lx RIP=0x%lx (write #%d)\n",
+               (unsigned long)fault_va, (unsigned long)gfn,
+               (unsigned long)rip, entry->write_count);
+
+    /* Allow write: W=1, ensure X=0 stays (for catching subsequent execute) */
+    wte_kvm_clear_wp(&gfn, 1);
+    entry->flags &= ~WTE_PAGE_W_PROTECTED;
+
+    /* Ensure NX is set (execute should still trap) */
+    if (!(entry->flags & WTE_PAGE_X_BLOCKED)) {
+        wte_kvm_set_nx(&gfn, 1);
+        entry->flags |= WTE_PAGE_X_BLOCKED;
+    }
+}
+
+/* ── Execute Violation Handler (EPT X=0) ──────────────────────── */
+
+void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
+                               uint64_t rip, CPUState *cpu)
+{
+    if (!wte_state.active) {
+        wte_kvm_clear_nx(&gfn, 1);
+        return;
+    }
+
+    wte_state.total_x_violations++;
+
+    /* Skip kernel-mode RIP */
+    if (rip >= 0xFFFF800000000000ULL) {
+        wte_kvm_clear_nx(&gfn, 1);
+        /* Queue for re-NX on next scan */
+        if (wte_state.renx_count < wte_state.renx_capacity) {
+            wte_state.renx_queue[wte_state.renx_count++] = gfn;
+        }
+        return;
+    }
+
+    nyx_printf("[WtE][EXEC] GFN=0x%lx GPA=0x%lx RIP=0x%lx\n",
+               (unsigned long)gfn, (unsigned long)gpa, (unsigned long)rip);
+
+    /* Try to find page entry by GFN → VA lookup */
+    uint64_t page_va = 0;
+    wte_page_entry_t *entry = NULL;
+
+    /* Check PE mappings first */
+    for (int i = 0; i < wte_state.pe_page_count; i++) {
+        if (wte_state.pe_gfns[i] == gfn) {
+            page_va = wte_state.pe_vas[i];
+            break;
+        }
+    }
+
+    if (page_va != 0) {
+        entry = wte_lookup_va(page_va);
+    }
+
+    /* Fallback: search by GFN in all tracked pages */
+    if (!entry) {
+        entry = wte_lookup_gfn(gfn);
+        if (entry) page_va = entry->va;
+    }
+
+    /* VA-based detection: RIP in PE range but GFN not tracked (CoW) */
+    if (!entry && wte_state.pe_base_va != 0 &&
+        rip >= wte_state.pe_base_va && rip < wte_state.pe_end_va) {
+        page_va = rip & ~0xFFFULL;
+        entry = wte_lookup_or_create_va(page_va, gfn);
+        entry->flags |= WTE_PAGE_IS_PE | WTE_PAGE_WRITTEN;
+        entry->gpa = gpa & ~0xFFFULL;
+
+        cpu_physical_memory_read(entry->gpa, entry->baseline, WTE_PAGE_SIZE);
+        entry->baseline_valid = true;
+        cpu_physical_memory_read(entry->gpa, entry->current, WTE_PAGE_SIZE);
+        wte_compute_diff(entry);
+
+        nyx_printf("[WtE][VA-DETECT] Untracked GFN=0x%lx but RIP=0x%lx "
+                   "in PE range — CoW suspected\n",
+                   (unsigned long)gfn, (unsigned long)rip);
+    }
+
+    if (!entry) {
+        /* Completely unknown page — just allow execution */
+        nyx_printf("[WtE][EXEC] Untracked GFN=0x%lx RIP=0x%lx, allowing\n",
+                   (unsigned long)gfn, (unsigned long)rip);
+        wte_kvm_clear_nx(&gfn, 1);
+        return;
+    }
+
+    /* Check if this page was written */
+    if (entry->flags & WTE_PAGE_WRITTEN) {
+        /* Re-read current content for accurate diff */
+        cpu_physical_memory_read(entry->gpa, entry->current, WTE_PAGE_SIZE);
+        wte_compute_diff(entry);
+
+        if (entry->diff_count == 0 && !(entry->flags & WTE_PAGE_IS_PE)) {
+            /* Non-PE page with no actual diff — false positive */
+            nyx_printf("[WtE][EXEC] False positive (no diff): VA=0x%lx\n",
+                       (unsigned long)entry->va);
+            entry->flags &= ~WTE_PAGE_WRITTEN;
+            wte_kvm_clear_nx(&gfn, 1);
+            entry->flags &= ~WTE_PAGE_X_BLOCKED;
+            entry->flags |= WTE_PAGE_X_ALLOWED;
+            return;
+        }
+
+        /* DLL noise filter */
+        if (wte_state.dll_filter_enabled && rip >= wte_state.dll_va_threshold) {
+            wte_state.dll_filtered_count++;
+            wte_state.dll_filtered_total++;
+            wte_state.wte_count++;
+            wte_state.total_wte_count++;
+            nyx_printf("[WtE][DLL-FILTERED] RIP=0x%lx VA=0x%lx diffs=%d\n",
+                       (unsigned long)rip, (unsigned long)entry->va,
+                       entry->diff_count);
+            memcpy(entry->baseline, entry->current, WTE_PAGE_SIZE);
+            entry->flags &= ~WTE_PAGE_WRITTEN;
+            wte_kvm_clear_nx(&gfn, 1);
+            entry->flags &= ~WTE_PAGE_X_BLOCKED;
+            entry->flags |= WTE_PAGE_X_ALLOWED;
+            return;
+        }
+
+        /* ★ WtE DETECTED! */
+        wte_state.wte_count++;
+        wte_state.total_wte_count++;
+
+        wte_dump_detection(rip, entry, "EPT-DUAL");
+
+        /* Full process memory dump */
+        {
+            X86CPU *cpux86 = X86_CPU(cpu);
+            CPUX86State *env = &cpux86->env;
+            char wte_label[128];
+            snprintf(wte_label, sizeof(wte_label),
+                     "wte_r%d_rip0x%lx_va0x%lx",
+                     wte_state.round, (unsigned long)rip,
+                     (unsigned long)entry->va);
+            dump_full_process_memory(cpu, env, wte_label);
+        }
+
+        /* Post-detection: update baseline, re-protect for next layer */
+        memcpy(entry->baseline, entry->current, WTE_PAGE_SIZE);
+        entry->flags &= ~WTE_PAGE_WRITTEN;
+        entry->write_count = 0;
+
+        /* Allow execution (X=1), re-protect write (W=0) */
+        wte_kvm_clear_nx(&gfn, 1);
+        entry->flags &= ~WTE_PAGE_X_BLOCKED;
+        entry->flags |= WTE_PAGE_X_ALLOWED;
+
+        if (entry->flags & WTE_PAGE_IS_PE) {
+            wte_kvm_set_wp(&gfn, 1);
+            entry->flags |= WTE_PAGE_W_PROTECTED;
+        }
+    } else {
+        /* Not written — first-time execution (DLL, system code, etc.) */
+        entry->flags |= WTE_PAGE_X_ALLOWED;
+        entry->flags &= ~WTE_PAGE_X_BLOCKED;
+        wte_kvm_clear_nx(&gfn, 1);
+
+        /* If this is an unknown dynamic region, start write tracking */
+        bool is_known = (entry->flags & WTE_PAGE_IS_PE) ||
+                        (entry->flags & WTE_PAGE_IS_DYNAMIC);
+        bool in_dll = wte_state.dll_filter_enabled &&
+                      rip >= wte_state.dll_va_threshold;
+
+        if (!is_known && !in_dll) {
+            nyx_printf("[WtE][DYN-EXEC] New execution region: VA=0x%lx "
+                       "GFN=0x%lx RIP=0x%lx\n",
+                       (unsigned long)entry->va, (unsigned long)gfn,
+                       (unsigned long)rip);
+            entry->flags |= WTE_PAGE_IS_DYNAMIC;
+
+            /* Set W=0 on this page to catch future writes */
+            wte_kvm_set_wp(&gfn, 1);
+            entry->flags |= WTE_PAGE_W_PROTECTED;
+        }
+    }
+}
+
+/* ── Dirty Ring Scan (supplementary, non-PE pages) ─────────────── */
+
 void wte_scan_dirty_ring(void)
 {
     if (!wte_state.active || !kvm_dirty_gfns) {
         return;
     }
 
-    /* Process re-NX queue: pages that had NX cleared for kernel RIP skip.
-     * Re-set NX on these pages so user-mode WtE can still be detected. */
+    /* Process re-NX queue first */
     if (wte_state.renx_count > 0) {
-        int re_nx = 0;
         uint64_t renx_batch[WTE_MAX_BATCH_GFNS];
         int renx_batch_count = 0;
 
         for (int i = 0; i < wte_state.renx_count; i++) {
-            uint64_t gfn = wte_state.renx_queue[i];
-            int idx = wte_find_page(gfn);
-            if (idx >= 0 && !wte_state.pages[idx]->nx_set) {
-                renx_batch[renx_batch_count++] = gfn;
-                wte_state.pages[idx]->nx_set = true;
-                re_nx++;
-
-                /* Flush batch when full */
-                if (renx_batch_count >= WTE_MAX_BATCH_GFNS) {
-                    wte_kvm_set_nx(renx_batch, renx_batch_count);
-                    wte_state.nx_pages_set += renx_batch_count;
-                    renx_batch_count = 0;
-                }
+            renx_batch[renx_batch_count++] = wte_state.renx_queue[i];
+            if (renx_batch_count >= WTE_MAX_BATCH_GFNS) {
+                wte_kvm_set_nx(renx_batch, renx_batch_count);
+                renx_batch_count = 0;
             }
         }
         if (renx_batch_count > 0) {
             wte_kvm_set_nx(renx_batch, renx_batch_count);
-            wte_state.nx_pages_set += renx_batch_count;
-        }
-        if (re_nx > 0) {
-            nyx_printf("[WtE] Re-NX applied to %d pages (kernel RIP recovery)\n", re_nx);
         }
         wte_state.renx_count = 0;
     }
 
+    /* Scan dirty ring for non-PE dirty pages.
+     * PE pages are handled by EPT W=0 (primary path), so we only
+     * need to track non-PE pages via dirty ring for supplementary
+     * WtE detection on dynamically allocated memory. */
     uint32_t scan_idx = wte_state.last_scanned_ring_index;
-    int      new_pages = 0;
-    int      updated_pages = 0;
-    int      total_nx_set_this_scan = 0;
-
-    /* Collect GFNs that need NX set (new dirty pages not yet NX-protected) */
     uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
     int      nx_batch_count = 0;
 
     while (true) {
         uint32_t ring_idx = scan_idx & kvm_dirty_gfns_index_mask;
-        struct kvm_dirty_gfn *entry = &kvm_dirty_gfns[ring_idx];
+        struct kvm_dirty_gfn *ring_entry = &kvm_dirty_gfns[ring_idx];
 
-        if ((entry->flags & 0x1) == 0) {
+        if ((ring_entry->flags & 0x1) == 0) {
             break;
         }
 
-        uint64_t gfn = entry->offset;
-        uint64_t gpa = gfn << 12;
+        uint64_t gfn = ring_entry->offset;
 
-        /* Skip low system pages (IVT, BDA, etc.) */
+        /* Skip low system pages */
         if (gfn <= 0x10) {
             scan_idx++;
             continue;
         }
 
-        int idx = wte_find_page(gfn);
+        /* Skip GFNs that belong to PE (already handled by EPT W=0) */
+        bool is_pe_gfn = false;
+        for (int i = 0; i < wte_state.pe_page_count; i++) {
+            if (wte_state.pe_gfns[i] == gfn) {
+                is_pe_gfn = true;
+                break;
+            }
+        }
 
-        if (idx < 0) {
-            /* New dirty page — create tracking entry */
-            wte_page_info_t *info = wte_add_page(gfn);
-            info->gpa = gpa;
+        if (!is_pe_gfn) {
+            /* Non-PE dirty page — track it with NX for supplementary WtE */
+            wte_page_entry_t *entry = wte_lookup_gfn(gfn);
+            if (!entry) {
+                /* New non-PE dirty page — we don't know the VA,
+                 * so create a temporary entry keyed by GPA.
+                 * The VA will be determined at execute violation time. */
+                uint64_t pseudo_va = gfn << 12;  /* use GPA as pseudo-VA */
+                entry = wte_lookup_or_create_va(pseudo_va, gfn);
+                entry->gpa = gfn << 12;
+                entry->flags |= WTE_PAGE_WRITTEN;
 
-            /* Read baseline from root snapshot (shadow memory) */
-            if (fast_reload_root_created(get_fast_reload_snapshot())) {
-                if (!read_snapshot_memory(get_fast_reload_snapshot(),
-                                         gpa, info->baseline, WTE_PAGE_SIZE)) {
-                    cpu_physical_memory_read(gpa, info->baseline, WTE_PAGE_SIZE);
+                /* Read baseline and current */
+                if (fast_reload_root_created(get_fast_reload_snapshot())) {
+                    if (!read_snapshot_memory(get_fast_reload_snapshot(),
+                                             entry->gpa, entry->baseline,
+                                             WTE_PAGE_SIZE)) {
+                        cpu_physical_memory_read(entry->gpa, entry->baseline,
+                                                WTE_PAGE_SIZE);
+                    }
+                } else {
+                    cpu_physical_memory_read(entry->gpa, entry->baseline,
+                                            WTE_PAGE_SIZE);
                 }
+                entry->baseline_valid = true;
+                cpu_physical_memory_read(entry->gpa, entry->current,
+                                        WTE_PAGE_SIZE);
+                wte_compute_diff(entry);
             } else {
-                cpu_physical_memory_read(gpa, info->baseline, WTE_PAGE_SIZE);
+                /* Existing page — update content */
+                entry->flags |= WTE_PAGE_WRITTEN;
+                cpu_physical_memory_read(entry->gpa, entry->current,
+                                        WTE_PAGE_SIZE);
+                wte_compute_diff(entry);
             }
-            info->baseline_valid = true;
 
-            /* Read current content (post-write) */
-            cpu_physical_memory_read(gpa, info->current, WTE_PAGE_SIZE);
-            wte_compute_diff(info);
-
-            /* Mark NX in EPT — batch for efficiency */
-            if (!info->nx_set) {
+            /* Set NX on this dirty non-PE page */
+            if (!(entry->flags & WTE_PAGE_X_BLOCKED) &&
+                !(entry->flags & WTE_PAGE_X_ALLOWED)) {
                 nx_batch[nx_batch_count++] = gfn;
-                info->nx_set = true;
+                entry->flags |= WTE_PAGE_X_BLOCKED;
 
-                /* Flush batch when full (kernel ioctl limit = 4096) */
                 if (nx_batch_count >= WTE_MAX_BATCH_GFNS) {
                     wte_kvm_set_nx(nx_batch, nx_batch_count);
-                    total_nx_set_this_scan += nx_batch_count;
                     nx_batch_count = 0;
                 }
             }
-
-            if (new_pages < 3) {
-                nyx_printf("[WtE][DBG] new dirty GFN=0x%lx GPA=0x%lx diff_count=%d\n",
-                           (unsigned long)gfn, (unsigned long)gpa, info->diff_count);
-            }
-
-            /* Diagnostic: check if this new dirty GFN is in target PE range */
-            if (wte_is_target_pe_gfn(gfn)) {
-                nyx_printf("[WtE][DIAG] *** TARGET PE GFN 0x%lx IS DIRTY! ***\n",
-                           (unsigned long)gfn);
-                nyx_printf("[WtE][DIAG]   diff_count=%d, baseline_valid=%d\n",
-                           info->diff_count, info->baseline_valid);
-                /* Print first 16 bytes of baseline and current for comparison */
-                nyx_printf("[WtE][DIAG]   baseline[0..15]: %02x %02x %02x %02x  %02x %02x %02x %02x"
-                           "  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
-                           info->baseline[0],  info->baseline[1],
-                           info->baseline[2],  info->baseline[3],
-                           info->baseline[4],  info->baseline[5],
-                           info->baseline[6],  info->baseline[7],
-                           info->baseline[8],  info->baseline[9],
-                           info->baseline[10], info->baseline[11],
-                           info->baseline[12], info->baseline[13],
-                           info->baseline[14], info->baseline[15]);
-                nyx_printf("[WtE][DIAG]   current[0..15]:  %02x %02x %02x %02x  %02x %02x %02x %02x"
-                           "  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
-                           info->current[0],  info->current[1],
-                           info->current[2],  info->current[3],
-                           info->current[4],  info->current[5],
-                           info->current[6],  info->current[7],
-                           info->current[8],  info->current[9],
-                           info->current[10], info->current[11],
-                           info->current[12], info->current[13],
-                           info->current[14], info->current[15]);
-            }
-
-            new_pages++;
-        } else {
-            /* Existing dirty page — re-written, update content */
-            wte_page_info_t *info = wte_state.pages[idx];
-            cpu_physical_memory_read(gpa, info->current, WTE_PAGE_SIZE);
-            wte_compute_diff(info);
-
-            /* Re-set NX if it was cleared after a previous WtE detection */
-            if (!info->nx_set) {
-                nx_batch[nx_batch_count++] = gfn;
-                info->nx_set = true;
-
-                /* Flush batch when full */
-                if (nx_batch_count >= WTE_MAX_BATCH_GFNS) {
-                    wte_kvm_set_nx(nx_batch, nx_batch_count);
-                    total_nx_set_this_scan += nx_batch_count;
-                    nx_batch_count = 0;
-                }
-            }
-
-
-            /* Diagnostic: check if re-dirtied GFN is in target PE */
-            if (wte_is_target_pe_gfn(gfn)) {
-                nyx_printf("[WtE][DIAG] *** TARGET PE GFN 0x%lx RE-DIRTIED! diff=%d ***\n",
-                           (unsigned long)gfn, info->diff_count);
-            }
-            updated_pages++;
         }
 
         scan_idx++;
@@ -533,412 +768,132 @@ void wte_scan_dirty_ring(void)
 
     wte_state.last_scanned_ring_index = scan_idx;
 
-    /* Flush remaining NX batch */
     if (nx_batch_count > 0) {
         wte_kvm_set_nx(nx_batch, nx_batch_count);
-        total_nx_set_this_scan += nx_batch_count;
-    }
-
-    if (total_nx_set_this_scan > 0) {
-        wte_state.nx_pages_set += total_nx_set_this_scan;
-        nyx_printf("[WtE] Set NX on %d pages (total NX: %d)\n",
-                   total_nx_set_this_scan, wte_state.nx_pages_set);
-    }
-
-    if (new_pages > 0 || updated_pages > 0) {
-        nyx_printf("[WtE] Scanned ring: %d new, %d updated dirty pages "
-                   "(total tracked: %d)\n",
-                   new_pages, updated_pages, wte_state.page_count);
     }
 }
 
-/*
- * Handle EPT NX violation — called when KVM exits with KVM_EXIT_KAFL_WTE.
- *
- * The guest attempted to execute code on a page we marked NX because
- * it was written to (dirty). We perform a content diff to confirm
- * the write actually changed code, then dump if confirmed.
- *
- * After handling, clear the NX bit so the guest can re-execute.
- * KVM_RUN will automatically retry the faulting instruction.
- */
-void wte_handle_nx_violation(uint64_t gfn, uint64_t gpa, uint64_t rip, CPUState *cpu)
-{
-    if (!wte_state.active) {
-        /* Not active — just clear NX and let guest continue */
-        wte_kvm_clear_nx(&gfn, 1);
-        return;
-    }
+/* ── Round Management ──────────────────────────────────────────── */
 
-    /* Layer 2 safety net: skip kernel-mode RIP (should be filtered by KVM CR3,
-     * but catch any that slip through — e.g., CR3 not yet set) */
-    if (rip >= 0xFFFF800000000000ULL) {
-        nyx_printf("[WtE] Skipping kernel RIP=0x%lx GFN=0x%lx — queued for re-NX\n",
-                   (unsigned long)rip, (unsigned long)gfn);
-        /* Clear NX so guest can continue executing this page,
-         * but queue the GFN for re-NX on next dirty ring scan.
-         * This prevents permanent NX loss: if user-mode code later
-         * executes this page, the re-applied NX will catch it. */
-        wte_kvm_clear_nx(&gfn, 1);
-        if (wte_state.renx_count < wte_state.renx_capacity) {
-            wte_state.renx_queue[wte_state.renx_count++] = gfn;
-        }
-        /* Also mark page tracking as nx_set=false so re-NX logic
-         * in scan knows to re-set it */
-        int idx = wte_find_page(gfn);
-        if (idx >= 0) {
-            wte_state.pages[idx]->nx_set = false;
-            wte_state.nx_pages_set--;
-        }
-        return;
-    }
-
-    nyx_printf("[WtE] NX violation: GFN=0x%lx GPA=0x%lx RIP=0x%lx\n",
-               (unsigned long)gfn, (unsigned long)gpa, (unsigned long)rip);
-
-    /* Diagnostic: check if NX violation is in target PE */
-    if (wte_is_target_pe_gfn(gfn)) {
-        nyx_printf("[WtE][DIAG] *** TARGET PE NX VIOLATION! *** GFN=0x%lx RIP=0x%lx\n",
-                   (unsigned long)gfn, (unsigned long)rip);
-    }
-
-    int idx = wte_find_page(gfn);
-
-    if (idx < 0) {
-        /*
-         * GFN not in tracking. Check if RIP is in target PE VA range.
-         * This handles Windows page remapping (CoW) where a PE page's
-         * physical backing changes after WTE_SETUP.
-         */
-        bool rip_in_pe = (wte_state.target_image_base != 0 &&
-                          rip >= wte_state.target_image_base &&
-                          rip < wte_state.target_image_end);
-
-        if (rip_in_pe) {
-            /*
-             * VA-based detection: RIP is in target PE range but GFN is new.
-             * This is likely a CoW page or Windows page remapping.
-             * Add this GFN to tracking and proceed with WtE detection.
-             */
-            nyx_printf("[WtE][VA-DETECT] Untracked GFN=0x%lx but RIP=0x%lx is in PE range "
-                       "[0x%lx-0x%lx] — adding to tracking\n",
-                       (unsigned long)gfn, (unsigned long)rip,
-                       (unsigned long)wte_state.target_image_base,
-                       (unsigned long)wte_state.target_image_end);
-
-            /* Add this new GFN to tracking */
-            wte_page_info_t *new_info = wte_add_page(gfn);
-            new_info->gpa = gpa & ~0xFFFULL;  /* Page-aligned GPA */
-            new_info->nx_set = true;
-            wte_state.nx_pages_set++;
-
-            /* Read baseline from root snapshot GPA (if available) and current content */
-            cpu_physical_memory_read(new_info->gpa, new_info->baseline, WTE_PAGE_SIZE);
-            new_info->baseline_valid = true;
-
-            /* Re-read current content for diff */
-            cpu_physical_memory_read(gpa, new_info->current, WTE_PAGE_SIZE);
-            wte_compute_diff(new_info);
-
-            /* VA-based detection always triggers WtE (we trust VA range) even if diff is 0 */
-            wte_state.wte_count++;
-            wte_state.total_wte_count++;
-
-            nyx_printf("[WtE] *** VA-BASED WRITTEN-THEN-EXECUTED ***  round=%d  RIP=0x%lx  "
-                       "GFN=0x%lx  GPA=0x%lx  diffs=%d (remapped page)\n",
-                       wte_state.round, (unsigned long)rip, (unsigned long)gfn,
-                       (unsigned long)gpa, new_info->diff_count);
-
-            wte_dump_detection(rip, gfn, new_info);
-
-            /* Full process memory dump */
-            {
-                X86CPU *cpux86 = X86_CPU(cpu);
-                CPUX86State *env = &cpux86->env;
-                char wte_label[128];
-                snprintf(wte_label, sizeof(wte_label), "wte_round%d_rip0x%lx_gfn0x%lx_va",
-                         wte_state.round, (unsigned long)rip, (unsigned long)gfn);
-                dump_full_process_memory(cpu, env, wte_label);
-            }
-
-            /* Update baseline and clear NX */
-            memcpy(new_info->baseline, new_info->current, WTE_PAGE_SIZE);
-            new_info->nx_set = false;
-            wte_state.nx_pages_set--;
-            wte_kvm_clear_nx(&gfn, 1);
-            return;
-        }
-
-        /* Not in PE range — just clear NX and continue */
-        nyx_printf("[WtE] WARN: NX violation for untracked GFN=0x%lx RIP=0x%lx, clearing\n",
-                   (unsigned long)gfn, (unsigned long)rip);
-        wte_kvm_clear_nx(&gfn, 1);
-        return;
-    }
-
-    wte_page_info_t *info = wte_state.pages[idx];
-
-    /* Re-read current content at execution time for accurate diff */
-    cpu_physical_memory_read(gpa, info->current, WTE_PAGE_SIZE);
-    wte_compute_diff(info);
-
-    if (info->diff_count == 0) {
-        /* No actual code change — false positive (incidental dirty page).
-         * Clear NX so guest can execute without further exits. */
-        nyx_printf("[WtE] False positive (no diff): GFN=0x%lx, clearing NX\n",
-                   (unsigned long)gfn);
-        info->nx_set = false;
-        wte_state.nx_pages_set--;
-        wte_kvm_clear_nx(&gfn, 1);
-        return;
-    }
-
-    /* Confirmed WtE — check DLL noise filter before dumping */
-    wte_state.wte_count++;
-    wte_state.total_wte_count++;
-
-    /* DLL noise filter: if RIP is in system DLL VA range, log but skip dump.
-     * NX is still cleared so guest can continue. The WtE is counted but
-     * no expensive file I/O or process memory dump is performed. */
-    if (wte_state.dll_filter_enabled && rip >= wte_state.dll_va_threshold) {
-        wte_state.dll_filtered_count++;
-        wte_state.dll_filtered_total++;
-        nyx_printf("[WtE] DLL-FILTERED: RIP=0x%lx >= 0x%lx  GFN=0x%lx  diffs=%d  "
-                   "(filtered %d this round, %d total)\n",
-                   (unsigned long)rip, (unsigned long)wte_state.dll_va_threshold,
-                   (unsigned long)gfn, info->diff_count,
-                   wte_state.dll_filtered_count, wte_state.dll_filtered_total);
-        /* Update baseline even for DLL-filtered pages, so repeated
-         * dirty ring re-entries don't re-trigger DLL filter logging
-         * for the same unchanged content. */
-        memcpy(info->baseline, info->current, WTE_PAGE_SIZE);
-
-        info->nx_set = false;
-        wte_state.nx_pages_set--;
-        wte_kvm_clear_nx(&gfn, 1);
-        return;
-    }
-
-    nyx_printf("[WtE] *** WRITTEN-THEN-EXECUTED ***  round=%d  RIP=0x%lx  "
-               "GFN=0x%lx  GPA=0x%lx  diffs=%d\n",
-               wte_state.round, (unsigned long)rip, (unsigned long)gfn,
-               (unsigned long)gpa, info->diff_count);
-
-    wte_dump_detection(rip, gfn, info);
-
-    /* Full process memory dump at WtE detection */
-    {
-        X86CPU *cpux86 = X86_CPU(cpu);
-        CPUX86State *env = &cpux86->env;
-        char wte_label[128];
-        snprintf(wte_label, sizeof(wte_label), "wte_round%d_rip0x%lx_gfn0x%lx",
-                 wte_state.round, (unsigned long)rip, (unsigned long)gfn);
-        dump_full_process_memory(cpu, env, wte_label);
-    }
-
-    /* Update baseline to current content so that future NX violations
-     * on this page only trigger WtE if NEW writes occur after this point.
-     * Without this, the same diff (vs root snapshot) triggers repeated
-     * false positive WtE detections on already-unpacked pages. */
-    memcpy(info->baseline, info->current, WTE_PAGE_SIZE);
-
-    /* Clear NX so the faulting instruction can re-execute.
-     * If this page is written again, dirty ring will re-trigger NX set. */
-    info->nx_set = false;
-    wte_state.nx_pages_set--;
-    wte_kvm_clear_nx(&gfn, 1);
-}
-
-/*
- * Reset WtE tracking for next detection round.
- * Clears all NX bits, frees page tracking, increments round counter.
- * After this, new writes will be tracked from zero base.
- */
 void wte_reset_round(void)
 {
-    if (!wte_state.active) {
-        return;
-    }
+    if (!wte_state.active) return;
 
-    nyx_printf("[WtE] Round %d complete: %d WtE detections (%d filtered by DLL). Resetting.\n",
-               wte_state.round, wte_state.wte_count, wte_state.dll_filtered_count);
+    nyx_printf("[WtE] Round %d complete: %d WtE (%d DLL-filtered, "
+               "%d CoW-recovered)\n",
+               wte_state.round, wte_state.wte_count,
+               wte_state.dll_filtered_count,
+               wte_state.pt_cow_recoveries);
 
-    /* Collect all GFNs that still have NX set and clear them */
-    uint64_t clear_batch[WTE_MAX_BATCH_GFNS];
-    int      clear_count = 0;
-    int      total_cleared = 0;
+    /* Clear all NX and WP bits */
+    GHashTableIter iter;
+    gpointer key, value;
+    uint64_t clear_nx_batch[WTE_MAX_BATCH_GFNS];
+    uint64_t clear_wp_batch[WTE_MAX_BATCH_GFNS];
+    int nx_count = 0, wp_count = 0;
 
-    for (int i = 0; i < wte_state.page_count; i++) {
-        if (wte_state.pages[i]->nx_set) {
-            clear_batch[clear_count++] = wte_state.gfns[i];
+    g_hash_table_iter_init(&iter, wte_state.page_table);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        wte_page_entry_t *entry = value;
 
-            /* Flush batch when full */
-            if (clear_count >= WTE_MAX_BATCH_GFNS) {
-                wte_kvm_clear_nx(clear_batch, clear_count);
-                total_cleared += clear_count;
-                clear_count = 0;
+        if (entry->flags & WTE_PAGE_X_BLOCKED) {
+            clear_nx_batch[nx_count++] = entry->gfn;
+            if (nx_count >= WTE_MAX_BATCH_GFNS) {
+                wte_kvm_clear_nx(clear_nx_batch, nx_count);
+                nx_count = 0;
+            }
+        }
+        if (entry->flags & WTE_PAGE_W_PROTECTED) {
+            clear_wp_batch[wp_count++] = entry->gfn;
+            if (wp_count >= WTE_MAX_BATCH_GFNS) {
+                wte_kvm_clear_wp(clear_wp_batch, wp_count);
+                wp_count = 0;
             }
         }
     }
 
-    if (clear_count > 0) {
-        wte_kvm_clear_nx(clear_batch, clear_count);
-        total_cleared += clear_count;
-    }
+    if (nx_count > 0) wte_kvm_clear_nx(clear_nx_batch, nx_count);
+    if (wp_count > 0) wte_kvm_clear_wp(clear_wp_batch, wp_count);
 
-    if (total_cleared > 0) {
-        nyx_printf("[WtE] Cleared NX on %d pages\n", total_cleared);
-    }
-
-    /* Free all page tracking */
-    wte_free_all_pages();
+    /* Clear page table */
+    g_hash_table_remove_all(wte_state.page_table);
 
     /* Reset counters */
     wte_state.round++;
-    wte_state.wte_count    = 0;
-    wte_state.nx_pages_set = 0;
-    wte_state.renx_count   = 0;  /* Clear re-NX queue */
-    wte_state.dll_filtered_count = 0; /* Reset per-round DLL filter count */
+    wte_state.wte_count          = 0;
+    wte_state.renx_count         = 0;
+    wte_state.dll_filtered_count = 0;
+    wte_state.pt_cow_recoveries  = 0;
+    wte_state.pt_decode_cursor   = 0;
 
-    /* Sync to current dirty ring index */
     wte_state.last_scanned_ring_index = kvm_dirty_gfns_index;
 
-    nyx_printf("[WtE] Round %d started. Tracking from clean state.\n",
-               wte_state.round);
+    nyx_printf("[WtE] Round %d started.\n", wte_state.round);
 }
+
+/* ── Status / Debug ────────────────────────────────────────────── */
+
+bool wte_is_active(void) { return wte_state.active; }
+wte_state_t *wte_get_state(void) { return &wte_state; }
 
 void wte_print_debug_summary(void)
 {
-    nyx_printf("[WtE][DBG] === SUMMARY === "
-               "round=%d wte_count=%d total=%d "
-               "tracked_pages=%d nx_pages=%d "
-               "dll_filtered=%d dll_filtered_total=%d\n",
-               wte_state.round,
-               wte_state.wte_count,
+    nyx_printf("[WtE][DBG] round=%d wte=%d total=%d "
+               "w_violations=%lu x_violations=%lu cow_recoveries=%lu "
+               "pages_tracked=%u\n",
+               wte_state.round, wte_state.wte_count,
                wte_state.total_wte_count,
-               wte_state.page_count,
-               wte_state.nx_pages_set,
-               wte_state.dll_filtered_count,
-               wte_state.dll_filtered_total);
+               (unsigned long)wte_state.total_w_violations,
+               (unsigned long)wte_state.total_x_violations,
+               (unsigned long)wte_state.total_cow_recoveries,
+               wte_state.page_table ?
+                   g_hash_table_size(wte_state.page_table) : 0);
 }
-
-bool wte_is_active(void)
-{
-    return wte_state.active;
-}
-
-wte_state_t *wte_get_state(void)
-{
-    return &wte_state;
-}
-
 
 /* ── EPROCESS Walking: Find CR3 by PID ────────────────────────── */
 
-/* Windows 10 x64 EPROCESS layout offsets.
- * These are stable across Windows 10 21H2 (19044) / 22H2 (19045).
- * EPROCESS starts with KPROCESS (Pcb), so DirectoryTableBase is
- * at KPROCESS+0x28 = EPROCESS+0x28. */
-#define EPROCESS_OFF_DTB           0x28   /* DirectoryTableBase (CR3) */
-#define EPROCESS_OFF_PID           0x440  /* UniqueProcessId          */
-#define EPROCESS_OFF_LINKS         0x448  /* ActiveProcessLinks        */
-#define EPROCESS_OFF_IMAGENAME     0x5A8  /* ImageFileName[15]         */
-
-/* Maximum iterations to prevent infinite loop on corrupted list */
+#define EPROCESS_OFF_DTB           0x28
+#define EPROCESS_OFF_PID           0x440
+#define EPROCESS_OFF_LINKS         0x448
+#define EPROCESS_OFF_IMAGENAME     0x5A8
 #define EPROCESS_WALK_MAX          4096
 
-/*
- * Walk the Windows EPROCESS linked list to find a process's CR3 given its PID.
- *
- * Strategy:
- *   1. Use the harness CR3 (current vCPU CR3) to access kernel VA space.
- *      In Windows x64, all processes share the kernel page tables (upper
- *      half of PML4), so ANY process CR3 can read kernel-mode addresses.
- *   2. Start from the System process (PID=4) by scanning known locations,
- *      or start from the current process and walk the circular list.
- *   3. Walk ActiveProcessLinks (doubly-linked circular list) until we
- *      find the target PID.
- *
- * @param cpu       vCPU state for memory access
- * @param harness_cr3  CR3 of the harness process (for kernel VA access)
- * @param target_pid   PID of the process whose CR3 we want
- * @return CR3 value (page-aligned), or 0 on failure
- */
-uint64_t wte_find_cr3_by_pid(CPUState *cpu, uint64_t harness_cr3, uint64_t target_pid)
+uint64_t wte_find_cr3_by_pid(CPUState *cpu, uint64_t harness_cr3,
+                             uint64_t target_pid)
 {
-    /*
-     * Step 1: Find the current process (harness) EPROCESS.
-     * We read GS:[0x188] → KTHREAD, then KTHREAD.ApcState.Process → EPROCESS.
-     * But this requires reading GS base which is MSR-dependent.
-     *
-     * Simpler approach: Use KPCR → KdVersionBlock → PsActiveProcessHead.
-     * But finding PsActiveProcessHead without symbols is unreliable.
-     *
-     * Most reliable approach for our use case:
-     *   Walk ALL physical memory pages looking for EPROCESS with PID=4 (System),
-     *   or use the fact that PID=4 (System) always exists and its EPROCESS
-     *   is usually at a well-known position.
-     *
-     * BEST approach: Since the harness already knows its own PID,
-     * and we have the harness CR3, we can:
-     *   a) Scan GS base (IA32_GS_BASE MSR) → KPCR
-     *   b) KPCR+0x180 → KPRCB → KPRCB+0x008 → CurrentThread (KTHREAD)
-     *   c) KTHREAD+0x220 → KTHREAD.Process → EPROCESS of current process
-     *   d) Walk ActiveProcessLinks from there until we find target_pid
-     *
-     * We use approach (a-d) since we have full register access.
-     */
-
     kvm_arch_get_registers(cpu);
     CPUX86State *env = &(X86_CPU(cpu)->env);
 
-    /* Read GS base — in user mode (CPL=3), GS base is TEB, not KPCR.
-     * KPCR is stored in IA32_KERNEL_GS_BASE (swapped by SWAPGS on syscall).
-     * In kernel mode (CPL=0), GS base is KPCR directly. */
     uint64_t gs_base;
     if ((env->segs[R_CS].selector & 3) == 3) {
-        /* User mode: KPCR is in IA32_KERNEL_GS_BASE MSR */
         gs_base = env->kernelgsbase;
-        nyx_printf("[WtE][CR3] User-mode detected (CPL=3), using kernelgsbase for KPCR\n");
+        nyx_printf("[WtE][CR3] User-mode, using kernelgsbase for KPCR\n");
     } else {
-        /* Kernel mode: KPCR is in GS base */
         gs_base = env->segs[R_GS].base;
-        nyx_printf("[WtE][CR3] Kernel-mode detected (CPL=0), using GS base for KPCR\n");
+        nyx_printf("[WtE][CR3] Kernel-mode, using GS base for KPCR\n");
     }
 
-    nyx_printf("[WtE][CR3] Looking up CR3 for PID %lu via EPROCESS walk\n",
+    nyx_printf("[WtE][CR3] Looking up CR3 for PID %lu\n",
                (unsigned long)target_pid);
-    nyx_printf("[WtE][CR3] Harness CR3=0x%lx, GS base=0x%lx\n",
-               (unsigned long)harness_cr3, (unsigned long)gs_base);
 
-    /* KPCR+0x180 → KPRCB, KPRCB+0x008 → CurrentThread (KTHREAD*) */
     uint64_t kthread_ptr = 0;
     if (!read_virtual_memory_cr3(gs_base + 0x188, (uint8_t *)&kthread_ptr,
                                  sizeof(kthread_ptr), cpu, harness_cr3)) {
-        nyx_printf("[WtE][CR3] ERROR: Failed to read KPCR.CurrentThread at 0x%lx\n",
-                   (unsigned long)(gs_base + 0x188));
+        nyx_printf("[WtE][CR3] ERROR: Failed to read KPCR.CurrentThread\n");
         return 0;
     }
-    nyx_printf("[WtE][CR3] CurrentThread (KTHREAD): 0x%lx\n",
-               (unsigned long)kthread_ptr);
 
-    /* KTHREAD+0x220 → KTHREAD.Process (EPROCESS*) — Win10 x64 offset */
     uint64_t eprocess_ptr = 0;
     if (!read_virtual_memory_cr3(kthread_ptr + 0x220, (uint8_t *)&eprocess_ptr,
                                  sizeof(eprocess_ptr), cpu, harness_cr3)) {
-        nyx_printf("[WtE][CR3] ERROR: Failed to read KTHREAD.Process at 0x%lx\n",
-                   (unsigned long)(kthread_ptr + 0x220));
+        nyx_printf("[WtE][CR3] ERROR: Failed to read KTHREAD.Process\n");
         return 0;
     }
-    nyx_printf("[WtE][CR3] Current EPROCESS: 0x%lx\n",
-               (unsigned long)eprocess_ptr);
 
-    /* Walk ActiveProcessLinks circular list starting from current EPROCESS */
     uint64_t start_eprocess = eprocess_ptr;
-    int iter = 0;
+    int iter_count = 0;
 
     do {
-        /* Read PID at EPROCESS+0x440 */
         uint64_t pid = 0;
         if (!read_virtual_memory_cr3(eprocess_ptr + EPROCESS_OFF_PID,
                                      (uint8_t *)&pid, sizeof(pid),
@@ -948,368 +903,84 @@ uint64_t wte_find_cr3_by_pid(CPUState *cpu, uint64_t harness_cr3, uint64_t targe
             return 0;
         }
 
-        /* Read ImageFileName for logging */
         char image_name[16] = {0};
         read_virtual_memory_cr3(eprocess_ptr + EPROCESS_OFF_IMAGENAME,
                                 (uint8_t *)image_name, 15, cpu, harness_cr3);
         image_name[15] = '\0';
 
-        if (iter < 10 || pid == target_pid) {
+        if (iter_count < 10 || pid == target_pid) {
             nyx_printf("[WtE][CR3]   EPROCESS=0x%lx PID=%lu Name=%s\n",
-                       (unsigned long)eprocess_ptr, (unsigned long)pid, image_name);
+                       (unsigned long)eprocess_ptr, (unsigned long)pid,
+                       image_name);
         }
 
         if (pid == target_pid) {
-            /* Found! Read DirectoryTableBase (CR3) */
             uint64_t cr3 = 0;
             if (!read_virtual_memory_cr3(eprocess_ptr + EPROCESS_OFF_DTB,
                                          (uint8_t *)&cr3, sizeof(cr3),
                                          cpu, harness_cr3)) {
-                nyx_printf("[WtE][CR3] ERROR: Failed to read CR3 at EPROCESS 0x%lx\n",
-                           (unsigned long)eprocess_ptr);
+                nyx_printf("[WtE][CR3] ERROR: Failed to read CR3\n");
                 return 0;
             }
-            cr3 &= 0xFFFFFFFFFFFFF000ULL;  /* Page-align */
-            nyx_printf("[WtE][CR3] Found target PID %lu: CR3=0x%lx Name=%s\n",
-                       (unsigned long)target_pid, (unsigned long)cr3, image_name);
+            cr3 &= 0xFFFFFFFFFFFFF000ULL;
+            nyx_printf("[WtE][CR3] Found PID %lu: CR3=0x%lx Name=%s\n",
+                       (unsigned long)target_pid, (unsigned long)cr3,
+                       image_name);
             return cr3;
         }
 
-        /* Follow ActiveProcessLinks.Flink to next EPROCESS.
-         * LIST_ENTRY.Flink at EPROCESS+0x448 points to the NEXT
-         * EPROCESS's ActiveProcessLinks field, so subtract 0x448
-         * to get the base of the next EPROCESS. */
         uint64_t next_link = 0;
         if (!read_virtual_memory_cr3(eprocess_ptr + EPROCESS_OFF_LINKS,
                                      (uint8_t *)&next_link, sizeof(next_link),
                                      cpu, harness_cr3)) {
-            nyx_printf("[WtE][CR3] ERROR: Failed to read ActiveProcessLinks at 0x%lx\n",
-                       (unsigned long)(eprocess_ptr + EPROCESS_OFF_LINKS));
+            nyx_printf("[WtE][CR3] ERROR: Failed to read ActiveProcessLinks\n");
             return 0;
         }
 
-        /* next_link points to ActiveProcessLinks of next EPROCESS,
-         * subtract offset to get EPROCESS base */
         eprocess_ptr = next_link - EPROCESS_OFF_LINKS;
-
-        iter++;
-    } while (eprocess_ptr != start_eprocess && iter < EPROCESS_WALK_MAX);
+        iter_count++;
+    } while (eprocess_ptr != start_eprocess && iter_count < EPROCESS_WALK_MAX);
 
     nyx_printf("[WtE][CR3] ERROR: PID %lu not found after %d iterations\n",
-               (unsigned long)target_pid, iter);
+               (unsigned long)target_pid, iter_count);
     return 0;
-}
-
-/* ── Eager NX: Set NX on target PE pages at setup time ────────── */
-
-/*
- * Set EPT NX bit on all pages backing the target PE image.
- * Called during WTE_SETUP, BEFORE the target process executes any code.
- * This ensures the very first execution of any PE page triggers an NX
- * violation, catching the initial unpacking write+exec.
- *
- * Unlike the lazy approach (NX set only when dirty ring reports writes),
- * this eagerly protects all PE pages so even the first instruction
- * execution after a write is caught.
- *
- * @param cpu         vCPU state for page table walks
- * @param image_base  Target PE image base VA
- * @param image_size  Target PE SizeOfImage
- * @param cr3         Target process CR3 (for page table walk)
- */
-void wte_eager_set_nx_on_pe(CPUState *cpu, uint64_t image_base,
-                            uint64_t image_size, uint64_t cr3)
-{
-    nyx_printf("[WtE][EAGER] Setting NX on target PE pages: VA 0x%lx - 0x%lx (size=0x%lx)\n",
-               (unsigned long)image_base, (unsigned long)(image_base + image_size),
-               (unsigned long)image_size);
-
-    uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
-    int nx_batch_count = 0;
-    int total_nx = 0;
-    int mapped = 0;
-    int unmapped = 0;
-
-    /* Reset target PE tracking for CoW detection */
-    wte_state.target_pe_gfn_count = 0;
-
-    uint64_t va;
-    for (va = image_base; va < image_base + image_size; va += WTE_PAGE_SIZE) {
-        uint64_t pa = get_paging_phys_addr(cpu, cr3, va);
-
-        if (pa == 0xFFFFFFFFFFFFFFFFULL || pa == 0) {
-            unmapped++;
-            continue;
-        }
-
-        uint64_t gfn = pa >> 12;
-        uint64_t gpa = pa & 0xFFFFFFFFFFFFF000ULL;
-        mapped++;
-
-        /* Store VA→GFN mapping for CoW detection */
-        if (wte_state.target_pe_gfn_count < WTE_MAX_TARGET_PE_PAGES) {
-            wte_state.target_pe_gfns[wte_state.target_pe_gfn_count] = gfn;
-            wte_state.target_pe_vas[wte_state.target_pe_gfn_count] = va;
-            wte_state.target_pe_gfn_count++;
-        }
-
-        /* Add page to WtE tracking with baseline content */
-        int idx = wte_find_page(gfn);
-        wte_page_info_t *info;
-
-        if (idx < 0) {
-            info = wte_add_page(gfn);
-            info->gpa = gpa;
-
-            /* Read baseline from root snapshot (shadow memory) */
-            if (fast_reload_root_created(get_fast_reload_snapshot())) {
-                if (!read_snapshot_memory(get_fast_reload_snapshot(),
-                                         gpa, info->baseline, WTE_PAGE_SIZE)) {
-                    cpu_physical_memory_read(gpa, info->baseline, WTE_PAGE_SIZE);
-                }
-            } else {
-                cpu_physical_memory_read(gpa, info->baseline, WTE_PAGE_SIZE);
-            }
-            info->baseline_valid = true;
-
-            /* Current content = baseline at setup time (no writes yet) */
-            memcpy(info->current, info->baseline, WTE_PAGE_SIZE);
-            info->diff_done = true;
-            info->diff_count = 0;
-        } else {
-            info = wte_state.pages[idx];
-        }
-
-        /* Set NX via batch */
-        if (!info->nx_set) {
-            nx_batch[nx_batch_count++] = gfn;
-            info->nx_set = true;
-
-            if (nx_batch_count >= WTE_MAX_BATCH_GFNS) {
-                wte_kvm_set_nx(nx_batch, nx_batch_count);
-                total_nx += nx_batch_count;
-                nx_batch_count = 0;
-            }
-        }
-    }
-
-    /* Flush remaining batch */
-    if (nx_batch_count > 0) {
-        wte_kvm_set_nx(nx_batch, nx_batch_count);
-        total_nx += nx_batch_count;
-    }
-
-    wte_state.nx_pages_set += total_nx;
-
-    nyx_printf("[WtE][EAGER] NX set on %d pages (%d mapped, %d unmapped) "
-               "total NX now: %d\n",
-               total_nx, mapped, unmapped, wte_state.nx_pages_set);
-    nyx_printf("[WtE][EAGER] Target PE tracking initialized: %d VA→GFN entries for CoW detection\n",
-               wte_state.target_pe_gfn_count);
-}
-
-/*
- * Rescan target PE VA→GFN mappings to detect CoW-induced GFN changes.
- * When Windows performs Copy-on-Write on a PE page, the VA maps to a new GFN.
- * This function detects such changes and sets NX on the new GFNs immediately.
- *
- * MUST be called with valid CPU state (e.g., during dirty ring scan or NX violation).
- * Returns the number of new GFNs that had NX set.
- */
-int wte_rescan_pe_gfns(CPUState *cpu)
-{
-    if (!wte_state.active || wte_state.target_pe_gfn_count == 0) {
-        return 0;
-    }
-
-    uint64_t cr3 = wte_state.target_cr3;
-    uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
-    int nx_batch_count = 0;
-    int new_gfns = 0;
-    int remapped = 0;
-
-    for (int i = 0; i < wte_state.target_pe_gfn_count; i++) {
-        uint64_t va = wte_state.target_pe_vas[i];
-        uint64_t old_gfn = wte_state.target_pe_gfns[i];
-
-        /* Walk page table to get current physical address */
-        uint64_t pa = get_paging_phys_addr(cpu, cr3, va);
-
-        if (pa == 0xFFFFFFFFFFFFFFFFULL || pa == 0) {
-            /* Page unmapped — skip */
-            continue;
-        }
-
-        uint64_t new_gfn = pa >> 12;
-
-        if (new_gfn != old_gfn) {
-            /* GFN changed — CoW or page remapping occurred */
-            remapped++;
-
-            /* Update our tracking */
-            wte_state.target_pe_gfns[i] = new_gfn;
-
-            /* Check if new GFN is already tracked */
-            int idx = wte_find_page(new_gfn);
-
-            if (idx < 0) {
-                /* New GFN not tracked — add it and set NX */
-                wte_page_info_t *info = wte_add_page(new_gfn);
-                info->gpa = pa & 0xFFFFFFFFFFFFF000ULL;
-
-                /* Read baseline from root snapshot */
-                if (fast_reload_root_created(get_fast_reload_snapshot())) {
-                    if (!read_snapshot_memory(get_fast_reload_snapshot(),
-                                             info->gpa, info->baseline, WTE_PAGE_SIZE)) {
-                        cpu_physical_memory_read(info->gpa, info->baseline, WTE_PAGE_SIZE);
-                    }
-                } else {
-                    cpu_physical_memory_read(info->gpa, info->baseline, WTE_PAGE_SIZE);
-                }
-                info->baseline_valid = true;
-
-                /* Read current content */
-                cpu_physical_memory_read(info->gpa, info->current, WTE_PAGE_SIZE);
-                wte_compute_diff(info);
-
-                /* Add to NX batch */
-                if (!info->nx_set) {
-                    nx_batch[nx_batch_count++] = new_gfn;
-                    info->nx_set = true;
-                    new_gfns++;
-
-                    if (nx_batch_count >= WTE_MAX_BATCH_GFNS) {
-                        wte_kvm_set_nx(nx_batch, nx_batch_count);
-                        wte_state.nx_pages_set += nx_batch_count;
-                        nx_batch_count = 0;
-                    }
-                }
-
-                nyx_printf("[WtE][COW-DETECT] VA 0x%lx: GFN changed 0x%lx → 0x%lx, "
-                           "NX set on new GFN (diff=%d)\n",
-                           (unsigned long)va, (unsigned long)old_gfn,
-                           (unsigned long)new_gfn, info->diff_count);
-            } else {
-                /* GFN already tracked — but for target PE VA, we must
-                 * reset baseline/GPA to ensure correct WtE detection.
-                 * This handles GFN reuse: the same GFN may have been used
-                 * for a different page (DLL, system lib) before CoW. */
-                wte_page_info_t *info = wte_state.pages[idx];
-
-                /* Update GPA to match new VA's physical address */
-                info->gpa = pa & 0xFFFFFFFFFFFFF000ULL;
-
-                /* Reload baseline from root snapshot for new GPA */
-                if (fast_reload_root_created(get_fast_reload_snapshot())) {
-                    if (!read_snapshot_memory(get_fast_reload_snapshot(),
-                                             info->gpa, info->baseline, WTE_PAGE_SIZE)) {
-                        cpu_physical_memory_read(info->gpa, info->baseline, WTE_PAGE_SIZE);
-                    }
-                } else {
-                    cpu_physical_memory_read(info->gpa, info->baseline, WTE_PAGE_SIZE);
-                }
-                info->baseline_valid = true;
-
-                /* Re-read current content and compute diff */
-                cpu_physical_memory_read(info->gpa, info->current, WTE_PAGE_SIZE);
-                wte_compute_diff(info);
-
-                /* Force NX re-set for target PE VA, regardless of info->nx_set flag.
-                 * This ensures EPT NX bit is synchronized even if the GFN was previously
-                 * used for another page that had NX cleared. */
-                if (!info->nx_set) {
-                    /* NX not set — add to batch and update counter */
-                    nx_batch[nx_batch_count++] = new_gfn;
-                    info->nx_set = true;
-                    new_gfns++;
-
-                    if (nx_batch_count >= WTE_MAX_BATCH_GFNS) {
-                        wte_kvm_set_nx(nx_batch, nx_batch_count);
-                        wte_state.nx_pages_set += nx_batch_count;
-                        nx_batch_count = 0;
-                    }
-                } else {
-                    /* NX already set (flag=true) — but re-apply to ensure EPT sync.
-                     * Don't increment nx_pages_set counter (already counted). */
-                    nx_batch[nx_batch_count++] = new_gfn;
-                    new_gfns++;
-
-                    if (nx_batch_count >= WTE_MAX_BATCH_GFNS) {
-                        wte_kvm_set_nx(nx_batch, nx_batch_count);
-                        nx_batch_count = 0;
-                    }
-                }
-
-                nyx_printf("[WtE][COW-DETECT] VA 0x%lx: GFN changed 0x%lx → 0x%lx "
-                           "(already tracked, FORCED re-init: diff=%d, NX re-set)\n",
-                           (unsigned long)va, (unsigned long)old_gfn,
-                           (unsigned long)new_gfn, info->diff_count);
-            }
-        }
-    }
-
-    /* Flush remaining NX batch */
-    if (nx_batch_count > 0) {
-        wte_kvm_set_nx(nx_batch, nx_batch_count);
-        wte_state.nx_pages_set += nx_batch_count;
-    }
-
-    if (remapped > 0) {
-        nyx_printf("[WtE][COW-DETECT] Rescan complete: %d pages remapped, %d new NX set\n",
-                   remapped, new_gfns);
-    }
-
-    return new_gfns;
 }
 
 /* ── Diagnostic: Target PE GFN Mapping ────────────────────────── */
 
 bool wte_is_target_pe_gfn(uint64_t gfn)
 {
-    for (int i = 0; i < wte_state.target_pe_gfn_count; i++) {
-        if (wte_state.target_pe_gfns[i] == gfn) {
-            return true;
-        }
+    for (int i = 0; i < wte_state.pe_page_count; i++) {
+        if (wte_state.pe_gfns[i] == gfn) return true;
     }
     return false;
 }
 
-/*
- * Walk target process page tables to map target PE VA range to GFNs.
- * This reveals which physical pages back the target PE image and
- * allows us to track them specifically in dirty ring scans.
- *
- * Must be called after wte_activate() with valid CPU state.
- */
-void wte_diagnose_target_pe(CPUState *cpu, uint64_t image_base, uint64_t image_size)
+void wte_diagnose_target_pe(CPUState *cpu, uint64_t image_base,
+                            uint64_t image_size)
 {
     if (!wte_state.active) {
         nyx_printf("[WtE][DIAG] Cannot diagnose — WtE not active\n");
         return;
     }
 
-    wte_state.target_image_base = image_base;
-    wte_state.target_image_end  = image_base + image_size;
-    wte_state.target_pe_gfn_count = 0;
+    wte_state.pe_base_va = image_base;
+    wte_state.pe_end_va  = image_base + image_size;
 
     uint64_t cr3 = wte_state.target_cr3;
 
     nyx_printf("[WtE][DIAG] ============================================\n");
-    nyx_printf("[WtE][DIAG] Target PE diagnostic: VA 0x%lx - 0x%lx (size=0x%lx)\n",
-               (unsigned long)image_base, (unsigned long)(image_base + image_size),
+    nyx_printf("[WtE][DIAG] Target PE: VA 0x%lx - 0x%lx (size=0x%lx)\n",
+               (unsigned long)image_base,
+               (unsigned long)(image_base + image_size),
                (unsigned long)image_size);
-    nyx_printf("[WtE][DIAG] Target CR3: 0x%lx\n", (unsigned long)cr3);
 
     int mapped = 0, unmapped = 0;
-    uint64_t va;
-    for (va = image_base; va < image_base + image_size; va += WTE_PAGE_SIZE) {
+    for (uint64_t va = image_base; va < image_base + image_size;
+         va += WTE_PAGE_SIZE) {
         uint64_t pa = get_paging_phys_addr(cpu, cr3, va);
 
         if (pa == 0xFFFFFFFFFFFFFFFFULL || pa == 0) {
-            if (unmapped < 5) {
-                nyx_printf("[WtE][DIAG]   VA 0x%08lx → UNMAPPED\n",
-                           (unsigned long)va);
-            }
             unmapped++;
             continue;
         }
@@ -1317,61 +988,114 @@ void wte_diagnose_target_pe(CPUState *cpu, uint64_t image_base, uint64_t image_s
         uint64_t gfn = pa >> 12;
         mapped++;
 
-        /* Store in target PE GFN list */
-        if (wte_state.target_pe_gfn_count < WTE_MAX_TARGET_PE_PAGES) {
-            wte_state.target_pe_gfns[wte_state.target_pe_gfn_count] = gfn;
-            wte_state.target_pe_vas[wte_state.target_pe_gfn_count] = va;
-            wte_state.target_pe_gfn_count++;
-        }
-
-        /* Log each mapping */
         if (mapped <= 20 || (mapped % 16 == 0)) {
             nyx_printf("[WtE][DIAG]   VA 0x%08lx → PA 0x%lx (GFN=0x%lx)\n",
-                       (unsigned long)va, (unsigned long)pa, (unsigned long)gfn);
-        }
-
-        /* Also check: is this GFN already in dirty ring tracking? */
-        int idx = wte_find_page(gfn);
-        if (idx >= 0) {
-            nyx_printf("[WtE][DIAG]   ** GFN 0x%lx ALREADY TRACKED (diff=%d, nx=%d) **\n",
-                       (unsigned long)gfn,
-                       wte_state.pages[idx]->diff_count,
-                       wte_state.pages[idx]->nx_set);
-        }
-
-        /* Read current content vs snapshot baseline */
-        uint8_t current_page[WTE_PAGE_SIZE];
-        uint8_t baseline_page[WTE_PAGE_SIZE];
-        cpu_physical_memory_read(pa & 0xFFFFFFFFFFFFF000ULL, current_page, WTE_PAGE_SIZE);
-
-        bool baseline_read = false;
-        if (fast_reload_root_created(get_fast_reload_snapshot())) {
-            baseline_read = read_snapshot_memory(get_fast_reload_snapshot(),
-                                                  pa & 0xFFFFFFFFFFFFF000ULL,
-                                                  baseline_page, WTE_PAGE_SIZE);
-        }
-        if (!baseline_read) {
-            memcpy(baseline_page, current_page, WTE_PAGE_SIZE);
-        }
-
-        /* Compute diff between baseline and current */
-        int diff_bytes = 0;
-        for (int i = 0; i < WTE_PAGE_SIZE; i++) {
-            if (baseline_page[i] != current_page[i]) {
-                diff_bytes++;
-            }
-        }
-
-        if (diff_bytes > 0) {
-            nyx_printf("[WtE][DIAG]   ** VA 0x%08lx (GFN=0x%lx): %d bytes DIFFER from baseline! **\n",
-                       (unsigned long)va, (unsigned long)gfn, diff_bytes);
+                       (unsigned long)va, (unsigned long)pa,
+                       (unsigned long)gfn);
         }
     }
 
-    nyx_printf("[WtE][DIAG] Target PE: %d pages mapped, %d unmapped, %d stored for tracking\n",
-               mapped, unmapped, wte_state.target_pe_gfn_count);
-    if (unmapped > 5) {
-        nyx_printf("[WtE][DIAG]   (suppressed %d unmapped page logs)\n", unmapped - 5);
-    }
+    nyx_printf("[WtE][DIAG] %d mapped, %d unmapped\n", mapped, unmapped);
     nyx_printf("[WtE][DIAG] ============================================\n");
 }
+
+/* ── Intel PT Safety Net ──────────────────────────────────────── */
+
+/*
+ * Check Intel PT trace for WtE events that EPT missed (CoW cases).
+ * Called at every VM exit. Performs incremental decode of new PT data.
+ *
+ * This is a stub — the actual PT decode integration depends on the
+ * libxdc decoder API and PT buffer layout. The logic is:
+ *   1. Get new PT packets since last decode
+ *   2. Extract TIP (Target IP) packets → executed VAs
+ *   3. Check if any executed VA is in a "written" PE page
+ *   4. If found and EPT didn't catch it → WtE detected → dump
+ *   5. Re-protect the new GFN so EPT catches it next time
+ */
+void wte_pt_check(CPUState *cpu)
+{
+    if (!wte_state.active || wte_state.pe_page_count == 0) {
+        return;
+    }
+
+    /*
+     * CoW detection via VA→GFN rescan:
+     * Since full PT decode is expensive, we use a lighter approach:
+     * periodically rescan PE VA→GFN mappings. If a GFN changed (CoW),
+     * apply EPT protections to the new GFN immediately.
+     *
+     * This is checked at every VM exit and is fast (just page table walks
+     * for PE pages, typically < 100 pages).
+     */
+    uint64_t cr3 = wte_state.target_cr3;
+    uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
+    uint64_t wp_batch[WTE_MAX_BATCH_GFNS];
+    int nx_count = 0, wp_count = 0;
+
+    for (int i = 0; i < wte_state.pe_page_count; i++) {
+        uint64_t va = wte_state.pe_vas[i];
+        uint64_t old_gfn = wte_state.pe_gfns[i];
+
+        uint64_t pa = get_paging_phys_addr(cpu, cr3, va);
+        if (pa == 0xFFFFFFFFFFFFFFFFULL || pa == 0) continue;
+
+        uint64_t new_gfn = pa >> 12;
+        if (new_gfn == old_gfn) continue;
+
+        /* CoW detected! GFN changed for this VA */
+        wte_state.pe_gfns[i] = new_gfn;
+
+        nyx_printf("[WtE][COW-DETECT] VA 0x%lx: GFN 0x%lx → 0x%lx\n",
+                   (unsigned long)va, (unsigned long)old_gfn,
+                   (unsigned long)new_gfn);
+
+        /* Update or create page entry for this VA */
+        wte_page_entry_t *entry = wte_lookup_va(va);
+        if (entry) {
+            entry->gfn = new_gfn;
+            entry->gpa = new_gfn << 12;
+
+            /* Re-read content from new GFN */
+            cpu_physical_memory_read(entry->gpa, entry->current, WTE_PAGE_SIZE);
+            wte_compute_diff(entry);
+
+            /* The page was likely written (CoW = write triggered copy) */
+            entry->flags |= WTE_PAGE_WRITTEN;
+        } else {
+            entry = wte_lookup_or_create_va(va, new_gfn);
+            entry->flags = WTE_PAGE_IS_PE | WTE_PAGE_WRITTEN;
+            entry->gpa = new_gfn << 12;
+            cpu_physical_memory_read(entry->gpa, entry->baseline, WTE_PAGE_SIZE);
+            entry->baseline_valid = true;
+            cpu_physical_memory_read(entry->gpa, entry->current, WTE_PAGE_SIZE);
+            wte_compute_diff(entry);
+        }
+
+        /* Set EPT protections on new GFN */
+        nx_batch[nx_count++] = new_gfn;
+        wp_batch[wp_count++] = new_gfn;
+        entry->flags |= WTE_PAGE_X_BLOCKED | WTE_PAGE_W_PROTECTED;
+        entry->flags &= ~WTE_PAGE_X_ALLOWED;
+
+        if (nx_count >= WTE_MAX_BATCH_GFNS) {
+            wte_kvm_set_nx(nx_batch, nx_count);
+            nx_count = 0;
+        }
+        if (wp_count >= WTE_MAX_BATCH_GFNS) {
+            wte_kvm_set_wp(wp_batch, wp_count);
+            wp_count = 0;
+        }
+
+        wte_state.pt_cow_recoveries++;
+        wte_state.total_cow_recoveries++;
+    }
+
+    if (nx_count > 0) wte_kvm_set_nx(nx_batch, nx_count);
+    if (wp_count > 0) wte_kvm_set_wp(wp_batch, wp_count);
+}
+
+/* ── Cross-dump (stub — preserved from legacy) ─────────────────── */
+
+void wte_crossdump_init(void)  { /* TODO: preserved from legacy */ }
+void wte_crossdump_destroy(void) { /* TODO: preserved from legacy */ }

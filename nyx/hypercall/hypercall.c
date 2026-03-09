@@ -354,10 +354,9 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
             }
 
             if (wte_is_active()) {
-                /* WtE (EPT NX): final dirty ring scan to catch any
-                 * last-moment writes and mark them NX. */
-                wte_rescan_pe_gfns(cpu);  /* CoW detection */
-                wte_scan_dirty_ring();
+                /* WtE: final CoW detection + dirty ring scan */
+                wte_pt_check(cpu);      /* CoW detection */
+                wte_scan_dirty_ring();  /* non-PE dirty pages */
 
                 /* Temporarily disable reload mode to prevent perform_reload()
                  * from restoring the snapshot. The harness will call habort()
@@ -1751,17 +1750,24 @@ int handle_kafl_hypercall(struct kvm_run *run,
     }
     case KVM_EXIT_KAFL_WTE:
     {
-        /* EPT NX violation — guest executed a page marked NX.
-         * Sync registers for page table walk, then handle. */
+        /* EPT violation — write (W=0) or execute (X=0).
+         * Dispatch based on violation type. */
         kvm_arch_get_registers(cpu);
-        uint64_t wte_gfn = run->kafl_wte.gfn;
-        uint64_t wte_gpa = run->kafl_wte.gpa;
-        uint64_t wte_rip = run->kafl_wte.rip;
-        uint64_t wte_cr3 = run->kafl_wte.cr3;
-        nyx_printf("[WtE] KVM exit: GFN=0x%lx RIP=0x%lx CR3=0x%lx\n",
-                   (unsigned long)wte_gfn, (unsigned long)wte_rip,
-                   (unsigned long)wte_cr3);
-        wte_handle_nx_violation(wte_gfn, wte_gpa, wte_rip, cpu);
+        uint64_t wte_gfn  = run->kafl_wte.gfn;
+        uint64_t wte_gpa  = run->kafl_wte.gpa;
+        uint64_t wte_rip  = run->kafl_wte.rip;
+        uint64_t wte_cr3  = run->kafl_wte.cr3;
+        uint32_t wte_type = run->kafl_wte.type;
+
+        if (wte_type == WTE_VIOLATION_WRITE) {
+            nyx_printf("[WtE] KVM exit (WRITE): GFN=0x%lx RIP=0x%lx\n",
+                       (unsigned long)wte_gfn, (unsigned long)wte_rip);
+            wte_handle_write_violation(wte_gfn, wte_gpa, wte_rip, cpu);
+        } else {
+            nyx_printf("[WtE] KVM exit (EXEC): GFN=0x%lx RIP=0x%lx\n",
+                       (unsigned long)wte_gfn, (unsigned long)wte_rip);
+            wte_handle_exec_violation(wte_gfn, wte_gpa, wte_rip, cpu);
+        }
         ret = 0;
         break;
     }
@@ -1874,11 +1880,11 @@ int handle_kafl_hypercall(struct kvm_run *run,
         nyx_printf("[WtE] WTE_SETUP: WtE activated (cr3=0x%lx, %s)\n",
                    (unsigned long)child_cr3, is_32bit ? "32-bit" : "64-bit");
 
-        /* Step 4: Eagerly set NX on target PE pages (if requested) */
-        if (eager_nx && setup.image_base != 0 && setup.image_size != 0) {
-            wte_eager_set_nx_on_pe(cpu, setup.image_base,
-                                   setup.image_size, child_cr3);
-            nyx_printf("[WtE] WTE_SETUP: Eager NX set on PE pages "
+        /* Step 4: Protect target PE pages with W=0 + X=0 (Dual-Watch) */
+        if (setup.image_base != 0 && setup.image_size != 0) {
+            wte_protect_pe_range(cpu, setup.image_base,
+                                setup.image_size, child_cr3);
+            nyx_printf("[WtE] WTE_SETUP: Dual-Watch protection set on PE "
                        "[0x%lx - 0x%lx]\n",
                        (unsigned long)setup.image_base,
                        (unsigned long)(setup.image_base + setup.image_size));

@@ -2527,12 +2527,12 @@ int kvm_cpu_exec(CPUState *cpu)
 
 #ifdef QEMU_NYX
         // clang-format on
-        /* WtE: scan dirty ring on every KVM exit for deterministic
-         * NX marking. This ensures pages dirtied since the last exit
-         * get NX-protected before the guest can execute them. */
+        /* WtE Dual-Watch: on every KVM exit:
+         * 1. PT safety net: rescan PE VA→GFN for CoW detection
+         * 2. Dirty ring scan: NX on non-PE dirty pages (supplementary) */
         if (wte_is_active()) {
-            wte_rescan_pe_gfns(cpu);  /* CoW detection */
-            wte_scan_dirty_ring();
+            wte_pt_check(cpu);         /* CoW detection via VA→GFN rescan */
+            wte_scan_dirty_ring();     /* non-PE dirty pages → NX */
         }
 // clang-format off
 #endif

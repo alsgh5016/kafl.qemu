@@ -563,9 +563,9 @@ void fast_reload_qemu_user_fdl_set_dirty(fast_reload_t *self,
 void fast_reload_handle_dirty_ring_full(fast_reload_t *self)
 {
 
-    /* WtE: scan dirty ring for new writes before flushing */
+    /* WtE: CoW detection + dirty ring scan before flushing */
     if (wte_is_active()) {
-        wte_rescan_pe_gfns(current_cpu);  /* CoW detection */
+        wte_pt_check(current_cpu);  /* CoW detection via VA→GFN rescan */
         wte_scan_dirty_ring();
     }
     if (self->dirty_ring_state) {

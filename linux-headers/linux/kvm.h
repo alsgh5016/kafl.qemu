@@ -479,6 +479,8 @@ struct kvm_run {
 			__u64 gpa;
 			__u64 rip;
 			__u64 cr3;
+			__u32 type;  /* 0=execute violation, 1=write violation */
+			__u32 pad;
 		} kafl_wte;
 		/* Fix the size of the union. */
 		char padding[256];
@@ -1750,12 +1752,14 @@ struct kvm_hyperv_eventfd {
 #define KVM_VMX_PT_ENABLE_MTF			_IO(KVMIO,	0xf0)	
 #define KVM_VMX_PT_DISABLE_MTF		_IO(KVMIO,	0xf1)	
 
-/* WtE (Written-then-Executed) EPT NX tracking */
+/* WtE (Written-then-Executed) Dual-Watch EPT tracking */
 #define KVM_NYX_WTE_ENABLE					_IO(KVMIO,	0xf2)
 #define KVM_NYX_WTE_DISABLE					_IO(KVMIO,	0xf3)
 #define KVM_NYX_WTE_SET_NX					_IOW(KVMIO,	0xf4, struct kvm_nyx_wte_gfns)
 #define KVM_NYX_WTE_CLEAR_NX				_IOW(KVMIO,	0xf5, struct kvm_nyx_wte_gfns)
 #define KVM_NYX_WTE_SET_CR3					_IOW(KVMIO,	0xf6, __u64)
+#define KVM_NYX_WTE_SET_WP					_IOW(KVMIO,	0xf7, struct kvm_nyx_wte_gfns)
+#define KVM_NYX_WTE_CLEAR_WP				_IOW(KVMIO,	0xf8, struct kvm_nyx_wte_gfns)
 
 struct kvm_nyx_wte_gfns {
 	__u32 count;

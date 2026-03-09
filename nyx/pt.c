@@ -431,8 +431,8 @@ void pt_handle_overflow(CPUState *cpu)
         /* WtE: populate dirty_map BEFORE pt_dump so bb_callback
          * can find freshly written pages during overflow decoding. */
         if (wte_is_active()) {
-            wte_rescan_pe_gfns(cpu);  /* CoW detection: rescan PE GFNs before dirty ring */
-            wte_scan_dirty_ring();
+            wte_pt_check(cpu);      /* CoW detection via VA→GFN rescan */
+            wte_scan_dirty_ring();  /* non-PE dirty pages */
             wte_get_state()->overflow_count++;
             nyx_printf("[WtE][OVF] PT overflow #%lu, %d bytes, scanning dirty ring first\n",
                        (unsigned long)wte_get_state()->overflow_count, overflow);
