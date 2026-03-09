@@ -1190,9 +1190,35 @@ int wte_rescan_pe_gfns(CPUState *cpu)
                            (unsigned long)va, (unsigned long)old_gfn,
                            (unsigned long)new_gfn, info->diff_count);
             } else {
-                /* GFN already tracked — ensure NX is set */
+                /* GFN already tracked — but for target PE VA, we must
+                 * reset baseline/GPA to ensure correct WtE detection.
+                 * This handles GFN reuse: the same GFN may have been used
+                 * for a different page (DLL, system lib) before CoW. */
                 wte_page_info_t *info = wte_state.pages[idx];
+
+                /* Update GPA to match new VA's physical address */
+                info->gpa = pa & 0xFFFFFFFFFFFFF000ULL;
+
+                /* Reload baseline from root snapshot for new GPA */
+                if (fast_reload_root_created(get_fast_reload_snapshot())) {
+                    if (!read_snapshot_memory(get_fast_reload_snapshot(),
+                                             info->gpa, info->baseline, WTE_PAGE_SIZE)) {
+                        cpu_physical_memory_read(info->gpa, info->baseline, WTE_PAGE_SIZE);
+                    }
+                } else {
+                    cpu_physical_memory_read(info->gpa, info->baseline, WTE_PAGE_SIZE);
+                }
+                info->baseline_valid = true;
+
+                /* Re-read current content and compute diff */
+                cpu_physical_memory_read(info->gpa, info->current, WTE_PAGE_SIZE);
+                wte_compute_diff(info);
+
+                /* Force NX re-set for target PE VA, regardless of info->nx_set flag.
+                 * This ensures EPT NX bit is synchronized even if the GFN was previously
+                 * used for another page that had NX cleared. */
                 if (!info->nx_set) {
+                    /* NX not set — add to batch and update counter */
                     nx_batch[nx_batch_count++] = new_gfn;
                     info->nx_set = true;
                     new_gfns++;
@@ -1202,12 +1228,22 @@ int wte_rescan_pe_gfns(CPUState *cpu)
                         wte_state.nx_pages_set += nx_batch_count;
                         nx_batch_count = 0;
                     }
+                } else {
+                    /* NX already set (flag=true) — but re-apply to ensure EPT sync.
+                     * Don't increment nx_pages_set counter (already counted). */
+                    nx_batch[nx_batch_count++] = new_gfn;
+                    new_gfns++;
+
+                    if (nx_batch_count >= WTE_MAX_BATCH_GFNS) {
+                        wte_kvm_set_nx(nx_batch, nx_batch_count);
+                        nx_batch_count = 0;
+                    }
                 }
 
                 nyx_printf("[WtE][COW-DETECT] VA 0x%lx: GFN changed 0x%lx → 0x%lx "
-                           "(already tracked, NX=%d)\n",
+                           "(already tracked, FORCED re-init: diff=%d, NX re-set)\n",
                            (unsigned long)va, (unsigned long)old_gfn,
-                           (unsigned long)new_gfn, info->nx_set);
+                           (unsigned long)new_gfn, info->diff_count);
             }
         }
     }
