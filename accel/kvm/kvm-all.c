@@ -2531,6 +2531,7 @@ int kvm_cpu_exec(CPUState *cpu)
          * NX marking. This ensures pages dirtied since the last exit
          * get NX-protected before the guest can execute them. */
         if (wte_is_active()) {
+            wte_rescan_pe_gfns(cpu);  /* CoW detection */
             wte_scan_dirty_ring();
         }
 // clang-format off

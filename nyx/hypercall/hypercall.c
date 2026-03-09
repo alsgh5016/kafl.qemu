@@ -356,6 +356,7 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
             if (wte_is_active()) {
                 /* WtE (EPT NX): final dirty ring scan to catch any
                  * last-moment writes and mark them NX. */
+                wte_rescan_pe_gfns(cpu);  /* CoW detection */
                 wte_scan_dirty_ring();
 
                 /* Temporarily disable reload mode to prevent perform_reload()

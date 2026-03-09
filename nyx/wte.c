@@ -1095,6 +1095,125 @@ void wte_eager_set_nx_on_pe(CPUState *cpu, uint64_t image_base,
                "total NX now: %d\n",
                total_nx, mapped, unmapped, wte_state.nx_pages_set);
 }
+
+/*
+ * Rescan target PE VA→GFN mappings to detect CoW-induced GFN changes.
+ * When Windows performs Copy-on-Write on a PE page, the VA maps to a new GFN.
+ * This function detects such changes and sets NX on the new GFNs immediately.
+ *
+ * MUST be called with valid CPU state (e.g., during dirty ring scan or NX violation).
+ * Returns the number of new GFNs that had NX set.
+ */
+int wte_rescan_pe_gfns(CPUState *cpu)
+{
+    if (!wte_state.active || wte_state.target_pe_gfn_count == 0) {
+        return 0;
+    }
+
+    uint64_t cr3 = wte_state.target_cr3;
+    uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
+    int nx_batch_count = 0;
+    int new_gfns = 0;
+    int remapped = 0;
+
+    for (int i = 0; i < wte_state.target_pe_gfn_count; i++) {
+        uint64_t va = wte_state.target_pe_vas[i];
+        uint64_t old_gfn = wte_state.target_pe_gfns[i];
+
+        /* Walk page table to get current physical address */
+        uint64_t pa = get_paging_phys_addr(cpu, cr3, va);
+
+        if (pa == 0xFFFFFFFFFFFFFFFFULL || pa == 0) {
+            /* Page unmapped — skip */
+            continue;
+        }
+
+        uint64_t new_gfn = pa >> 12;
+
+        if (new_gfn != old_gfn) {
+            /* GFN changed — CoW or page remapping occurred */
+            remapped++;
+
+            /* Update our tracking */
+            wte_state.target_pe_gfns[i] = new_gfn;
+
+            /* Check if new GFN is already tracked */
+            int idx = wte_find_page(new_gfn);
+
+            if (idx < 0) {
+                /* New GFN not tracked — add it and set NX */
+                wte_page_info_t *info = wte_add_page(new_gfn);
+                info->gpa = pa & 0xFFFFFFFFFFFFF000ULL;
+
+                /* Read baseline from root snapshot */
+                if (fast_reload_root_created(get_fast_reload_snapshot())) {
+                    if (!read_snapshot_memory(get_fast_reload_snapshot(),
+                                             info->gpa, info->baseline, WTE_PAGE_SIZE)) {
+                        cpu_physical_memory_read(info->gpa, info->baseline, WTE_PAGE_SIZE);
+                    }
+                } else {
+                    cpu_physical_memory_read(info->gpa, info->baseline, WTE_PAGE_SIZE);
+                }
+                info->baseline_valid = true;
+
+                /* Read current content */
+                cpu_physical_memory_read(info->gpa, info->current, WTE_PAGE_SIZE);
+                wte_compute_diff(info);
+
+                /* Add to NX batch */
+                if (!info->nx_set) {
+                    nx_batch[nx_batch_count++] = new_gfn;
+                    info->nx_set = true;
+                    new_gfns++;
+
+                    if (nx_batch_count >= WTE_MAX_BATCH_GFNS) {
+                        wte_kvm_set_nx(nx_batch, nx_batch_count);
+                        wte_state.nx_pages_set += nx_batch_count;
+                        nx_batch_count = 0;
+                    }
+                }
+
+                nyx_printf("[WtE][COW-DETECT] VA 0x%lx: GFN changed 0x%lx → 0x%lx, "
+                           "NX set on new GFN (diff=%d)\n",
+                           (unsigned long)va, (unsigned long)old_gfn,
+                           (unsigned long)new_gfn, info->diff_count);
+            } else {
+                /* GFN already tracked — ensure NX is set */
+                wte_page_info_t *info = wte_state.pages[idx];
+                if (!info->nx_set) {
+                    nx_batch[nx_batch_count++] = new_gfn;
+                    info->nx_set = true;
+                    new_gfns++;
+
+                    if (nx_batch_count >= WTE_MAX_BATCH_GFNS) {
+                        wte_kvm_set_nx(nx_batch, nx_batch_count);
+                        wte_state.nx_pages_set += nx_batch_count;
+                        nx_batch_count = 0;
+                    }
+                }
+
+                nyx_printf("[WtE][COW-DETECT] VA 0x%lx: GFN changed 0x%lx → 0x%lx "
+                           "(already tracked, NX=%d)\n",
+                           (unsigned long)va, (unsigned long)old_gfn,
+                           (unsigned long)new_gfn, info->nx_set);
+            }
+        }
+    }
+
+    /* Flush remaining NX batch */
+    if (nx_batch_count > 0) {
+        wte_kvm_set_nx(nx_batch, nx_batch_count);
+        wte_state.nx_pages_set += nx_batch_count;
+    }
+
+    if (remapped > 0) {
+        nyx_printf("[WtE][COW-DETECT] Rescan complete: %d pages remapped, %d new NX set\n",
+                   remapped, new_gfns);
+    }
+
+    return new_gfns;
+}
+
 /* ── Diagnostic: Target PE GFN Mapping ────────────────────────── */
 
 bool wte_is_target_pe_gfn(uint64_t gfn)

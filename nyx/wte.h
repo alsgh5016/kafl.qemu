@@ -152,6 +152,11 @@ uint64_t wte_find_cr3_by_pid(CPUState *cpu, uint64_t harness_cr3, uint64_t targe
 void wte_eager_set_nx_on_pe(CPUState *cpu, uint64_t image_base,
                             uint64_t image_size, uint64_t cr3);
 
+/* Rescan target PE VA→GFN mappings to detect CoW-induced GFN changes.
+ * Call periodically (e.g., before dirty ring scan) to catch page remapping.
+ * Returns number of new GFNs that had NX set. */
+int wte_rescan_pe_gfns(CPUState *cpu);
+
 /* Cross-dump byte diff: compare consecutive full process memory dumps.
  * Maintains a previous snapshot in memory (~8MB) and generates a
  * diff_report.txt alongside each dump directory showing exactly which
