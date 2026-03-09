@@ -62,6 +62,8 @@ typedef struct {
     uint64_t gpa;                            /* GFN << 12                 */
     uint32_t flags;                          /* WTE_PAGE_* flags          */
     uint32_t write_count;                    /* writes this round         */
+    uint64_t last_write_rip;                 /* RIP of first SAME-PAGE write
+                                              * (saved at DEFERRED setup)  */
 
     /* Content tracking for diff */
     uint8_t  baseline[WTE_PAGE_SIZE];        /* content at snapshot/setup */

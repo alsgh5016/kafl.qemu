@@ -501,6 +501,7 @@ void wte_handle_write_violation(uint64_t gfn, uint64_t gpa,
             entry->flags &= ~WTE_PAGE_X_BLOCKED;
         }
         entry->flags |= WTE_PAGE_DEFERRED;
+        entry->last_write_rip = rip;
     } else {
         /* Different page: standard path. Set X=0 to catch subsequent
          * execution on the written page. */
@@ -538,9 +539,11 @@ void wte_check_deferred_pages(CPUState *cpu)
             wte_state.wte_count++;
             wte_state.total_wte_count++;
 
-            nyx_printf("[WtE][DEFERRED-DETECT] VA=0x%lx GFN=0x%lx diffs=%d\n",
+            nyx_printf("[WtE][DEFERRED-DETECT] VA=0x%lx GFN=0x%lx diffs=%d "
+                       "write_rip=0x%lx\n",
                        (unsigned long)entry->va, (unsigned long)entry->gfn,
-                       entry->diff_count);
+                       entry->diff_count,
+                       (unsigned long)entry->last_write_rip);
 
             /* Full process memory dump (incremental — only changed pages) */
             {
@@ -548,11 +551,13 @@ void wte_check_deferred_pages(CPUState *cpu)
                 CPUX86State *env = &cpux86->env;
                 char wte_label[128];
                 snprintf(wte_label, sizeof(wte_label),
-                         "wte_r%d_deferred_va0x%lx",
-                         wte_state.round, (unsigned long)entry->va);
+                         "wte_r%d_deferred_rip0x%lx_va0x%lx",
+                         wte_state.round,
+                         (unsigned long)entry->last_write_rip,
+                         (unsigned long)entry->va);
                 wte_dump_event_t evt = {
                     .type            = "DEFERRED",
-                    .rip             = 0,
+                    .rip             = entry->last_write_rip,
                     .va              = entry->va,
                     .gfn             = entry->gfn,
                     .diff_count      = entry->diff_count,
