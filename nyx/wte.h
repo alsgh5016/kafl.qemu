@@ -50,6 +50,9 @@
 #define WTE_PAGE_X_ALLOWED     (1 << 3)  /* execution explicitly allowed */
 #define WTE_PAGE_IS_PE         (1 << 4)  /* belongs to target PE image   */
 #define WTE_PAGE_IS_DYNAMIC    (1 << 5)  /* dynamically detected region  */
+#define WTE_PAGE_DEFERRED      (1 << 6)  /* same-page write: W=1+X=1,
+                                          * pending verification at next
+                                          * EPT violation on other page  */
 
 /* ── Per-page tracking entry ───────────────────────────────────── */
 
@@ -145,6 +148,10 @@ void wte_handle_write_violation(uint64_t gfn, uint64_t gpa,
                                 uint64_t rip, CPUState *cpu);
 void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
                                uint64_t rip, CPUState *cpu);
+
+/* Deferred verification: check same-page writes that were left open
+ * (W=1+X=1). Called at the start of each EPT violation handler. */
+void wte_check_deferred_pages(CPUState *cpu);
 
 /* PE range protection: W=0 + X=0 on target PE pages.
  * Called during WTE_SETUP, BEFORE target process executes. */

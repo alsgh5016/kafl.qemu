@@ -471,22 +471,104 @@ void wte_handle_write_violation(uint64_t gfn, uint64_t gpa,
     entry->gfn = gfn;
     entry->gpa = gpa & ~0xFFFULL;
 
-    /* Read current content (post-write state will be available after
-     * we allow the write, but we can read pre-write state now) */
+    /* Read pre-write content (write hasn't happened yet — EPT trapped
+     * BEFORE the instruction completed) */
     cpu_physical_memory_read(entry->gpa, entry->current, WTE_PAGE_SIZE);
 
-    nyx_printf("[WtE][WRITE] VA=0x%lx GFN=0x%lx RIP=0x%lx (write #%d)\n",
-               (unsigned long)fault_va, (unsigned long)gfn,
-               (unsigned long)rip, entry->write_count);
+    uint64_t rip_page = rip & ~0xFFFULL;
+    bool same_page = (rip_page == fault_va);
 
-    /* Allow write: W=1, ensure X=0 stays (for catching subsequent execute) */
+    nyx_printf("[WtE][WRITE] VA=0x%lx GFN=0x%lx RIP=0x%lx (write #%d%s)\n",
+               (unsigned long)fault_va, (unsigned long)gfn,
+               (unsigned long)rip, entry->write_count,
+               same_page ? " SAME-PAGE" : "");
+
+    /* Allow write: W=1 */
     wte_kvm_clear_wp(&gfn, 1);
     entry->flags &= ~WTE_PAGE_W_PROTECTED;
 
-    /* Ensure NX is set (execute should still trap) */
-    if (!(entry->flags & WTE_PAGE_X_BLOCKED)) {
+    if (same_page) {
+        /* Same-page self-modifying code: the writing instruction is on
+         * the same page it's writing to. Setting X=0 would prevent the
+         * instruction from executing, so the write never completes.
+         *
+         * Solution: allow both W=1 and X=1 temporarily. Mark as
+         * DEFERRED — verification will happen at the next EPT violation
+         * on a different page (see wte_check_deferred_pages). */
+        if (entry->flags & WTE_PAGE_X_BLOCKED) {
+            wte_kvm_clear_nx(&gfn, 1);
+            entry->flags &= ~WTE_PAGE_X_BLOCKED;
+        }
+        entry->flags |= WTE_PAGE_DEFERRED;
+    } else {
+        /* Different page: standard path. Set X=0 to catch subsequent
+         * execution on the written page. */
+        if (!(entry->flags & WTE_PAGE_X_BLOCKED)) {
+            wte_kvm_set_nx(&gfn, 1);
+            entry->flags |= WTE_PAGE_X_BLOCKED;
+        }
+    }
+}
+
+/* ── Deferred Verification (same-page self-modifying code) ────── */
+
+void wte_check_deferred_pages(CPUState *cpu)
+{
+    if (!wte_state.active || !wte_state.page_table) return;
+
+    GHashTableIter iter;
+    gpointer key, value;
+    g_hash_table_iter_init(&iter, wte_state.page_table);
+
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        wte_page_entry_t *entry = value;
+
+        if (!(entry->flags & WTE_PAGE_DEFERRED)) continue;
+
+        /* Page was left open (W=1+X=1) for same-page self-modifying code.
+         * Now re-read content and check if anything actually changed. */
+        entry->flags &= ~WTE_PAGE_DEFERRED;
+
+        cpu_physical_memory_read(entry->gpa, entry->current, WTE_PAGE_SIZE);
+        wte_compute_diff(entry);
+
+        if (entry->diff_count > 0) {
+            /* Real change detected — WtE on same-page self-modifying code */
+            wte_state.wte_count++;
+            wte_state.total_wte_count++;
+
+            nyx_printf("[WtE][DEFERRED-DETECT] VA=0x%lx GFN=0x%lx diffs=%d\n",
+                       (unsigned long)entry->va, (unsigned long)entry->gfn,
+                       entry->diff_count);
+
+            wte_dump_detection(0 /* RIP unknown at this point */, entry,
+                               "EPT-DEFERRED");
+
+            /* Full process memory dump */
+            {
+                X86CPU *cpux86 = X86_CPU(cpu);
+                CPUX86State *env = &cpux86->env;
+                char wte_label[128];
+                snprintf(wte_label, sizeof(wte_label),
+                         "wte_r%d_deferred_va0x%lx",
+                         wte_state.round, (unsigned long)entry->va);
+                dump_full_process_memory(cpu, env, wte_label);
+            }
+
+            /* Update baseline for next change detection */
+            memcpy(entry->baseline, entry->current, WTE_PAGE_SIZE);
+        }
+
+        /* Re-protect: W=0 + X=0 for next cycle */
+        entry->flags &= ~WTE_PAGE_WRITTEN;
+        entry->write_count = 0;
+
+        uint64_t gfn = entry->gfn;
+        wte_kvm_set_wp(&gfn, 1);
+        entry->flags |= WTE_PAGE_W_PROTECTED;
         wte_kvm_set_nx(&gfn, 1);
         entry->flags |= WTE_PAGE_X_BLOCKED;
+        entry->flags &= ~WTE_PAGE_X_ALLOWED;
     }
 }
 
@@ -565,8 +647,9 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
         cpu_physical_memory_read(entry->gpa, entry->current, WTE_PAGE_SIZE);
         wte_compute_diff(entry);
 
-        if (entry->diff_count == 0 && !(entry->flags & WTE_PAGE_IS_PE)) {
-            /* Non-PE page with no actual diff — false positive */
+        if (entry->diff_count == 0) {
+            /* No actual content change — false positive (EPT trapped
+             * the write BEFORE it completed, or same value written) */
             nyx_printf("[WtE][EXEC] False positive (no diff): VA=0x%lx\n",
                        (unsigned long)entry->va);
             entry->flags &= ~WTE_PAGE_WRITTEN;

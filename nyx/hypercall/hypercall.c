@@ -1763,6 +1763,10 @@ int handle_kafl_hypercall(struct kvm_run *run,
         /* CoW detection: rescan PE VA→GFN only on EPT violation exits */
         wte_pt_check(cpu);
 
+        /* Verify deferred same-page writes: re-read pages that were
+         * left open (W=1+X=1), check for actual diffs, re-protect */
+        wte_check_deferred_pages(cpu);
+
         if (wte_type == WTE_VIOLATION_WRITE) {
             nyx_printf("[WtE] KVM exit (WRITE): GFN=0x%lx RIP=0x%lx\n",
                        (unsigned long)wte_gfn, (unsigned long)wte_rip);
