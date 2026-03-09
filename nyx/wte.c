@@ -541,10 +541,9 @@ void wte_check_deferred_pages(CPUState *cpu)
                        (unsigned long)entry->va, (unsigned long)entry->gfn,
                        entry->diff_count);
 
-            wte_dump_detection(0 /* RIP unknown at this point */, entry,
-                               "EPT-DEFERRED");
+            /* wte_dump_detection(0, entry, "EPT-DEFERRED"); */
 
-            /* Full process memory dump */
+            /* Full process memory dump (incremental — only changed pages) */
             {
                 X86CPU *cpux86 = X86_CPU(cpu);
                 CPUX86State *env = &cpux86->env;
@@ -687,9 +686,9 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
         wte_state.wte_count++;
         wte_state.total_wte_count++;
 
-        wte_dump_detection(rip, entry, "EPT-DUAL");
+        /* wte_dump_detection(rip, entry, "EPT-DUAL"); */
 
-        /* Full process memory dump */
+        /* Full process memory dump (incremental — only changed pages) */
         {
             X86CPU *cpux86 = X86_CPU(cpu);
             CPUX86State *env = &cpux86->env;

@@ -1019,95 +1019,158 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
     nyx_printf("    [FULLDUMP] PT walk done: %d mapped pages in user space\n",
                pg_count);
 
-    /* --- 6. Merge contiguous pages into regions & dump via phys read --- */
+    /* --- 6. Read all pages into memory snapshot, then write only changes --- */
     /*
-     * Pages are already in VA order (PT walk is ordered).
-     * Merge adjacent pages with same permissions into regions.
-     * Read each page directly by physical address (no VA→PA re-translation).
+     * Phase 1: Read all pages by physical address into cur_snap (memory-only).
+     * Phase 2: Compare with previous snapshot; write only changed/new pages
+     *          to disk.  First dump (no previous) writes everything.
      */
-    uint8_t *page_buf = malloc(0x1000);
     int region_count = 0;
     uint64_t total_bytes = 0;
-    int i = 0;
 
-    /* Cross-dump: allocate current snapshot array */
-    crossdump_page_t *cur_snap = NULL;
+    /* Always allocate current snapshot */
+    crossdump_page_t *cur_snap = malloc(pg_count * sizeof(crossdump_page_t));
     int cur_snap_count = 0;
-    if (crossdump_prev.pages) {
-        cur_snap = malloc(pg_count * sizeof(crossdump_page_t));
+
+    /* Phase 1: Read all pages into cur_snap (fast — physical memory reads) */
+    for (int p = 0; p < pg_count; p++) {
+        cur_snap[cur_snap_count].va = pages[p].va;
+        cpu_physical_memory_read(pages[p].phys,
+                                 cur_snap[cur_snap_count].content, 0x1000);
+        cur_snap_count++;
     }
 
-    while (i < pg_count) {
-        uint32_t region_start = pages[i].va;
-        uint8_t  region_perm  = pages[i].perm;
-        int      region_first = i;
+    /* Phase 2: Determine which pages to write to disk */
+    bool is_incremental = crossdump_prev.valid && crossdump_prev.count > 0;
+    int written_pages = 0;
+    int skipped_pages = 0;
 
-        /* Extend region while VA is contiguous and permissions match */
-        while (i + 1 < pg_count &&
-               pages[i + 1].va == pages[i].va + 0x1000 &&
-               pages[i + 1].perm == region_perm) {
-            i++;
-        }
-        int region_last = i;
-        i++;
+    if (!is_incremental) {
+        /* First dump: write all regions (full baseline) */
+        int i = 0;
+        while (i < pg_count) {
+            uint32_t region_start = pages[i].va;
+            uint8_t  region_perm  = pages[i].perm;
+            int      region_first = i;
 
-        uint32_t region_size = (uint32_t)(region_last - region_first + 1) * 0x1000;
-
-        /* Build permission string: r--/rw-/r-x/rwx */
-        char perm_str[4];
-        perm_str[0] = 'r';
-        perm_str[1] = (region_perm & 0x02) ? 'w' : '-';
-        perm_str[2] = (region_perm & 0x04) ? 'x' : '-';
-        perm_str[3] = '\0';
-
-        /* Identify module for this region */
-        const char *mod_name = NULL;
-        for (int m = 0; m < num_modules; m++) {
-            if (region_start >= modules[m].base &&
-                region_start < modules[m].base + modules[m].size) {
-                mod_name = modules[m].name;
-                break;
+            while (i + 1 < pg_count &&
+                   pages[i + 1].va == pages[i].va + 0x1000 &&
+                   pages[i + 1].perm == region_perm) {
+                i++;
             }
-        }
+            int region_last = i;
+            i++;
 
-        /* Write region file: read each page by physical address directly */
-        char *reg_path = NULL;
-        assert(asprintf(&reg_path, "%s/region_%08x_%x_%s.bin",
-                        dump_dir, region_start, region_size, perm_str) != -1);
-        FILE *rf = fopen(reg_path, "w");
-        if (rf) {
-            for (int p = region_first; p <= region_last; p++) {
-                cpu_physical_memory_read(pages[p].phys, page_buf, 0x1000);
-                fwrite(page_buf, 1, 0x1000, rf);
+            uint32_t region_size = (uint32_t)(region_last - region_first + 1) * 0x1000;
 
-                /* Save page content to current snapshot for cross-dump diff */
-                if (cur_snap && cur_snap_count < pg_count) {
-                    cur_snap[cur_snap_count].va = pages[p].va;
-                    memcpy(cur_snap[cur_snap_count].content, page_buf, 0x1000);
-                    cur_snap_count++;
+            char perm_str[4];
+            perm_str[0] = 'r';
+            perm_str[1] = (region_perm & 0x02) ? 'w' : '-';
+            perm_str[2] = (region_perm & 0x04) ? 'x' : '-';
+            perm_str[3] = '\0';
+
+            const char *mod_name = NULL;
+            for (int m = 0; m < num_modules; m++) {
+                if (region_start >= modules[m].base &&
+                    region_start < modules[m].base + modules[m].size) {
+                    mod_name = modules[m].name;
+                    break;
                 }
             }
-            fclose(rf);
+
+            char *reg_path = NULL;
+            assert(asprintf(&reg_path, "%s/region_%08x_%x_%s.bin",
+                            dump_dir, region_start, region_size, perm_str) != -1);
+            FILE *rf = fopen(reg_path, "w");
+            if (rf) {
+                for (int p = region_first; p <= region_last; p++) {
+                    fwrite(cur_snap[p].content, 1, 0x1000, rf);
+                }
+                fclose(rf);
+            }
+
+            fprintf(map_f, "  0x%08x  0x%08x  0x%08x  %-5s  region_%08x_%x_%s.bin  %s\n",
+                    region_start, region_start + region_size, region_size,
+                    perm_str, region_start, region_size, perm_str,
+                    mod_name ? mod_name : "");
+
+            region_count++;
+            total_bytes += region_size;
+            written_pages += (region_last - region_first + 1);
+            free(reg_path);
         }
+    } else {
+        /* Incremental dump: only write changed/new pages */
+        fprintf(map_f, "# INCREMENTAL (base: dump #%03d)\n\n",
+                crossdump_prev.prev_seq);
 
-        fprintf(map_f, "  0x%08x  0x%08x  0x%08x  %-5s  region_%08x_%x_%s.bin  %s\n",
-                region_start, region_start + region_size, region_size,
-                perm_str, region_start, region_size, perm_str,
-                mod_name ? mod_name : "");
+        for (int p = 0; p < cur_snap_count; p++) {
+            uint32_t va = cur_snap[p].va;
+            int prev_idx = crossdump_find_va(va);
 
-        region_count++;
-        total_bytes += region_size;
-        free(reg_path);
+            bool page_changed;
+            if (prev_idx < 0) {
+                page_changed = true;  /* New page */
+            } else {
+                page_changed = (memcmp(cur_snap[p].content,
+                                       crossdump_prev.pages[prev_idx].content,
+                                       WTE_PAGE_SIZE) != 0);
+            }
+
+            if (!page_changed) {
+                skipped_pages++;
+                continue;
+            }
+
+            /* Write individual changed page */
+            uint8_t perm = pages[p].perm;
+            char perm_str[4];
+            perm_str[0] = 'r';
+            perm_str[1] = (perm & 0x02) ? 'w' : '-';
+            perm_str[2] = (perm & 0x04) ? 'x' : '-';
+            perm_str[3] = '\0';
+
+            const char *mod_name = NULL;
+            for (int m = 0; m < num_modules; m++) {
+                if (va >= modules[m].base &&
+                    va < modules[m].base + modules[m].size) {
+                    mod_name = modules[m].name;
+                    break;
+                }
+            }
+
+            char *pg_path = NULL;
+            assert(asprintf(&pg_path, "%s/page_%08x_%s.bin",
+                            dump_dir, va, perm_str) != -1);
+            FILE *pf = fopen(pg_path, "w");
+            if (pf) {
+                fwrite(cur_snap[p].content, 1, 0x1000, pf);
+                fclose(pf);
+            }
+
+            fprintf(map_f, "  0x%08x  0x%08x  0x00001000  %-5s  page_%08x_%s.bin  %-7s  %s\n",
+                    va, va + 0x1000,
+                    perm_str, va, perm_str,
+                    prev_idx < 0 ? "NEW" : "CHANGED",
+                    mod_name ? mod_name : "");
+
+            region_count++;
+            total_bytes += 0x1000;
+            written_pages++;
+            free(pg_path);
+        }
     }
 
-    free(page_buf);
     free(pages);
-    fprintf(map_f, "\n# Total: %d regions, %lu bytes (%d pages)\n",
-            region_count, (unsigned long)total_bytes, pg_count);
+    fprintf(map_f, "\n# Total: %d %s, %lu bytes written (%d pages total, %d skipped)\n",
+            region_count, is_incremental ? "changed pages" : "regions",
+            (unsigned long)total_bytes, pg_count, skipped_pages);
     fclose(map_f);
 
-    nyx_printf("    [FULLDUMP] Saved %d regions (%lu bytes, %d pages) -> %s/\n",
-               region_count, (unsigned long)total_bytes, pg_count, dump_dir);
+    nyx_printf("    [FULLDUMP] %s: wrote %d %s (%lu bytes, %d/%d pages) -> %s/\n",
+               is_incremental ? "INCREMENTAL" : "FULL",
+               region_count, is_incremental ? "changed pages" : "regions",
+               (unsigned long)total_bytes, written_pages, pg_count, dump_dir);
 
     /* --- 7. Cross-dump byte diff: compare with previous snapshot --- */
     if (cur_snap && crossdump_prev.valid && crossdump_prev.count > 0) {
