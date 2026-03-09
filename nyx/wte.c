@@ -551,7 +551,7 @@ void wte_check_deferred_pages(CPUState *cpu)
                 CPUX86State *env = &cpux86->env;
                 char wte_label[128];
                 snprintf(wte_label, sizeof(wte_label),
-                         "wte_r%d_deferred_rip0x%lx_va0x%lx",
+                         "wte_r%d_rip0x%lx_va0x%lx",
                          wte_state.round,
                          (unsigned long)entry->last_write_rip,
                          (unsigned long)entry->va);
