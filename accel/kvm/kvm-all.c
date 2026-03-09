@@ -2527,13 +2527,10 @@ int kvm_cpu_exec(CPUState *cpu)
 
 #ifdef QEMU_NYX
         // clang-format on
-        /* WtE Dual-Watch: on every KVM exit:
-         * 1. PT safety net: rescan PE VA→GFN for CoW detection
-         * 2. Dirty ring scan: NX on non-PE dirty pages (supplementary) */
-        if (wte_is_active()) {
-            wte_pt_check(cpu);         /* CoW detection via VA→GFN rescan */
-            wte_scan_dirty_ring();     /* non-PE dirty pages → NX */
-        }
+        /* WtE Dual-Watch: CoW detection + dirty ring scan.
+         * Only run on EPT violation exits (KVM_EXIT_KAFL_WTE) to avoid
+         * massive overhead on unrelated VM exits (timer, I/O, etc.).
+         * Dirty ring scan disabled — EPT W=0 is the primary write path. */
 // clang-format off
 #endif
 

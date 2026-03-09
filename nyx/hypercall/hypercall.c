@@ -1751,13 +1751,17 @@ int handle_kafl_hypercall(struct kvm_run *run,
     case KVM_EXIT_KAFL_WTE:
     {
         /* EPT violation — write (W=0) or execute (X=0).
-         * Dispatch based on violation type. */
+         * Dispatch based on violation type.
+         * Also run CoW detection here (not on every VM exit). */
         kvm_arch_get_registers(cpu);
         uint64_t wte_gfn  = run->kafl_wte.gfn;
         uint64_t wte_gpa  = run->kafl_wte.gpa;
         uint64_t wte_rip  = run->kafl_wte.rip;
         uint64_t wte_cr3  = run->kafl_wte.cr3;
         uint32_t wte_type = run->kafl_wte.type;
+
+        /* CoW detection: rescan PE VA→GFN only on EPT violation exits */
+        wte_pt_check(cpu);
 
         if (wte_type == WTE_VIOLATION_WRITE) {
             nyx_printf("[WtE] KVM exit (WRITE): GFN=0x%lx RIP=0x%lx\n",
