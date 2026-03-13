@@ -489,18 +489,19 @@ static void handle_hypercall_kafl_cr3(struct kvm_run *run,
         }
         nyx_debug_p(CORE_PREFIX, "Setting CR3 filter: %lx\n", cr3_val);
         GET_GLOBAL_STATE()->parent_cr3 = cr3_val;
-        pt_set_cr3(cpu, cr3_val, false);
 
-        /* WtE target CR3 was already set by WTE_SETUP —
-         * SUBMIT_CR3 must NOT overwrite it.
-         * Intel PT CR3 filter (parent_cr3/pt_set_cr3) uses harness CR3,
-         * which is correct for PT tracing. But WtE EPT NX filter must
-         * keep using the child process CR3 discovered by EPROCESS walk. */
+        /* WtE active: use target (child) CR3 for PT so Intel PT traces
+         * the packed binary's execution, not the harness.  parent_cr3
+         * is kept as harness CR3 for API hook filtering. */
         if (wte_is_active()) {
-            nyx_printf("[WtE] SUBMIT_CR3: keeping target_cr3=0x%lx "
-                       "(ignoring harness cr3=0x%lx)\n",
-                       (unsigned long)wte_get_state()->target_cr3,
+            uint64_t target_cr3 = wte_get_state()->target_cr3;
+            pt_set_cr3(cpu, target_cr3, false);
+            nyx_printf("[WtE] SUBMIT_CR3: PT CR3 set to target_cr3=0x%lx "
+                       "(harness cr3=0x%lx stored in parent_cr3)\n",
+                       (unsigned long)target_cr3,
                        (unsigned long)cr3_val);
+        } else {
+            pt_set_cr3(cpu, cr3_val, false);
         }
         if (GET_GLOBAL_STATE()->dump_page) {
             set_page_dump_bp(cpu, cr3_val,
