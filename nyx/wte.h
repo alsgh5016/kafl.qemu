@@ -31,9 +31,9 @@
 #define WTE_MAX_BATCH_GFNS  4096
 #define WTE_MAX_TARGET_PE_PAGES 512
 
-/* DLL noise filter VA thresholds */
-#define WTE_DLL_VA_THRESHOLD_32  0x70000000ULL
-#define WTE_DLL_VA_THRESHOLD_64  0x00007FF000000000ULL
+/* DLL noise filter: module-list based */
+#define WTE_MAX_DLL_MODULES  128
+#define WTE_DLL_NAME_LEN      64
 
 /* Cross-dump max pages */
 #define WTE_CROSSDUMP_MAX_PAGES  8192
@@ -53,6 +53,14 @@
 #define WTE_PAGE_DEFERRED      (1 << 6)  /* same-page write: W=1+X=1,
                                           * pending verification at next
                                           * EPT violation on other page  */
+
+/* ── DLL module entry (for noise filtering) ───────────────────── */
+
+typedef struct {
+    uint64_t base;                           /* module base VA            */
+    uint64_t end;                            /* base + size               */
+    char     name[WTE_DLL_NAME_LEN];         /* module name (ASCII)       */
+} wte_dll_entry_t;
 
 /* ── Per-page tracking entry ───────────────────────────────────── */
 
@@ -103,11 +111,12 @@ typedef struct {
     int      wte_count;            /* WtE detections this round        */
     int      total_wte_count;      /* WtE detections across all rounds */
 
-    /* DLL noise filter */
-    bool     dll_filter_enabled;
-    uint64_t dll_va_threshold;
-    int      dll_filtered_count;
-    int      dll_filtered_total;
+    /* DLL noise filter (module-list based) */
+    bool            dll_filter_enabled;
+    wte_dll_entry_t dll_modules[WTE_MAX_DLL_MODULES];
+    int             dll_module_count;
+    int             dll_filtered_count;
+    int             dll_filtered_total;
 
     /* Dirty ring for non-PE pages (legacy supplementary path) */
     uint32_t last_scanned_ring_index;
@@ -187,6 +196,10 @@ bool wte_is_target_pe_gfn(uint64_t gfn);
 /* Intel PT safety net: check PT trace for CoW-missed WtE.
  * Call at every VM exit after dirty ring scan. */
 void wte_pt_check(CPUState *cpu);
+
+/* DLL module enumeration (PEB→Ldr walk) and RIP filtering */
+void wte_enumerate_dlls(CPUState *cpu);
+bool wte_is_dll_rip(uint64_t rip, CPUState *cpu);
 
 /* Cross-dump byte diff */
 void wte_crossdump_init(void);

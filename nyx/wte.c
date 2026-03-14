@@ -313,8 +313,7 @@ void wte_activate(uint64_t cr3, bool is_64bit)
     wte_state.renx_count = 0;
 
     wte_state.dll_filter_enabled  = true;
-    wte_state.dll_va_threshold    = is_64bit ? WTE_DLL_VA_THRESHOLD_64
-                                             : WTE_DLL_VA_THRESHOLD_32;
+    wte_state.dll_module_count    = 0;
     wte_state.dll_filtered_count  = 0;
     wte_state.dll_filtered_total  = 0;
 
@@ -326,9 +325,8 @@ void wte_activate(uint64_t cr3, bool is_64bit)
     wte_state.last_scanned_ring_index = kvm_dirty_gfns_index;
     wte_state.pt_decode_cursor = 0;
 
-    nyx_printf("[WtE] Activated: CR3=0x%lx, 64bit=%d, DLL filter=0x%lx\n",
-               (unsigned long)cr3, is_64bit,
-               (unsigned long)wte_state.dll_va_threshold);
+    nyx_printf("[WtE] Activated: CR3=0x%lx, 64bit=%d, DLL filter=module-list\n",
+               (unsigned long)cr3, is_64bit);
 }
 
 void wte_deactivate(void)
@@ -583,6 +581,146 @@ void wte_check_deferred_pages(CPUState *cpu)
     }
 }
 
+/* ── DLL Module Enumeration (PEB→Ldr walk) ─────────────────────── */
+
+void wte_enumerate_dlls(CPUState *cpu)
+{
+    X86CPU *cpux86 = X86_CPU(cpu);
+    CPUX86State *env = &cpux86->env;
+
+    wte_state.dll_module_count = 0;
+
+    /* 32-bit WOW64: TEB at FS base, PEB at TEB+0x30 */
+    uint32_t fs_base = (uint32_t)(env->segs[R_FS].base);
+    uint32_t peb_ptr = 0;
+    if (!read_virtual_memory((uint64_t)(fs_base + 0x30),
+                             (uint8_t *)&peb_ptr, 4, cpu) || peb_ptr == 0) {
+        nyx_printf("[WtE][DLL] Failed to read PEB (FS=0x%x)\n", fs_base);
+        return;
+    }
+
+    /* PEB+0x0C → Ldr (PEB_LDR_DATA) */
+    uint32_t ldr_ptr = 0;
+    if (!read_virtual_memory((uint64_t)(peb_ptr + 0x0C),
+                             (uint8_t *)&ldr_ptr, 4, cpu) || ldr_ptr == 0) {
+        nyx_printf("[WtE][DLL] Failed to read PEB->Ldr\n");
+        return;
+    }
+
+    /* InLoadOrderModuleList at Ldr+0x14 */
+    uint32_t list_head = ldr_ptr + 0x14;
+    uint32_t flink = 0;
+    read_virtual_memory((uint64_t)list_head, (uint8_t *)&flink, 4, cpu);
+
+    uint32_t cur = flink;
+    int count = 0;
+    while (cur != 0 && cur != list_head &&
+           count < WTE_MAX_DLL_MODULES) {
+        uint32_t dll_base = 0, dll_size = 0;
+        read_virtual_memory((uint64_t)(cur + 0x10), (uint8_t *)&dll_base, 4, cpu);
+        read_virtual_memory((uint64_t)(cur + 0x18), (uint8_t *)&dll_size, 4, cpu);
+
+        /* Read module name (UNICODE_STRING at cur+0x24) */
+        uint16_t name_len = 0;
+        uint32_t name_buf = 0;
+        read_virtual_memory((uint64_t)(cur + 0x24), (uint8_t *)&name_len, 2, cpu);
+        read_virtual_memory((uint64_t)(cur + 0x24 + 4), (uint8_t *)&name_buf, 4, cpu);
+
+        char name[WTE_DLL_NAME_LEN];
+        memset(name, 0, sizeof(name));
+        if (name_len > 0 && name_buf != 0) {
+            uint16_t wbuf[WTE_DLL_NAME_LEN];
+            memset(wbuf, 0, sizeof(wbuf));
+            int nchars = (name_len / 2 < WTE_DLL_NAME_LEN - 1)
+                             ? name_len / 2 : WTE_DLL_NAME_LEN - 1;
+            read_virtual_memory((uint64_t)name_buf,
+                                (uint8_t *)wbuf, nchars * 2, cpu);
+            for (int c = 0; c < nchars; c++)
+                name[c] = (char)(wbuf[c] & 0xFF);
+        }
+
+        /* Skip the target PE itself — never filter it */
+        bool is_target = (dll_base >= wte_state.pe_base_va &&
+                          dll_base < wte_state.pe_end_va);
+
+        if (dll_base != 0 && dll_size != 0 && !is_target) {
+            wte_dll_entry_t *entry =
+                &wte_state.dll_modules[wte_state.dll_module_count];
+            entry->base = dll_base;
+            entry->end  = (uint64_t)dll_base + dll_size;
+            memcpy(entry->name, name, WTE_DLL_NAME_LEN);
+            wte_state.dll_module_count++;
+        }
+
+        count++;
+        uint32_t next = 0;
+        if (!read_virtual_memory((uint64_t)cur, (uint8_t *)&next, 4, cpu))
+            break;
+        if (next == cur) break;
+        cur = next;
+    }
+
+    nyx_printf("[WtE][DLL] Enumerated %d modules (excluding target PE)\n",
+               wte_state.dll_module_count);
+    for (int i = 0; i < wte_state.dll_module_count; i++) {
+        nyx_printf("[WtE][DLL]   %-30s 0x%08lx - 0x%08lx\n",
+                   wte_state.dll_modules[i].name,
+                   (unsigned long)wte_state.dll_modules[i].base,
+                   (unsigned long)wte_state.dll_modules[i].end);
+    }
+}
+
+/*
+ * Check if RIP falls within a known DLL module.
+ * On first call (empty list) or when RIP is in an unknown region,
+ * re-scans PEB→Ldr to pick up dynamically loaded DLLs.
+ */
+bool wte_is_dll_rip(uint64_t rip, CPUState *cpu)
+{
+    /* Quick check against current module list */
+    for (int i = 0; i < wte_state.dll_module_count; i++) {
+        if (rip >= wte_state.dll_modules[i].base &&
+            rip < wte_state.dll_modules[i].end) {
+            return true;
+        }
+    }
+
+    /* RIP not in any known DLL. If it's in the target PE, it's not a DLL. */
+    if (rip >= wte_state.pe_base_va && rip < wte_state.pe_end_va) {
+        return false;
+    }
+
+    /* Unknown region — re-scan PEB→Ldr to catch newly loaded DLLs.
+     * Rate-limit: skip re-scan if we already re-scanned recently
+     * (within last 100 wte_is_dll_rip calls with unknown RIP). */
+    static int unknown_rip_since_rescan = 0;
+    unknown_rip_since_rescan++;
+    if (unknown_rip_since_rescan > 1 && unknown_rip_since_rescan < 100) {
+        return false;
+    }
+    unknown_rip_since_rescan = 0;
+
+    int old_count = wte_state.dll_module_count;
+    wte_enumerate_dlls(cpu);
+
+    if (wte_state.dll_module_count != old_count) {
+        nyx_printf("[WtE][DLL] Re-scan: module count %d → %d\n",
+                   old_count, wte_state.dll_module_count);
+
+        /* wte_enumerate_dlls rebuilds the full list from scratch,
+         * so re-check the entire list (not just new entries). */
+        for (int i = 0; i < wte_state.dll_module_count; i++) {
+            if (rip >= wte_state.dll_modules[i].base &&
+                rip < wte_state.dll_modules[i].end) {
+                return true;
+            }
+        }
+    }
+
+    /* Still not in any DLL — dynamic allocation, not a DLL */
+    return false;
+}
+
 /* ── Execute Violation Handler (EPT X=0) ──────────────────────── */
 
 void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
@@ -677,8 +815,8 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
             return;
         }
 
-        /* DLL noise filter */
-        if (wte_state.dll_filter_enabled && rip >= wte_state.dll_va_threshold) {
+        /* DLL noise filter (module-list based) */
+        if (wte_state.dll_filter_enabled && wte_is_dll_rip(rip, cpu)) {
             wte_state.dll_filtered_count++;
             wte_state.dll_filtered_total++;
             wte_state.wte_count++;
@@ -743,7 +881,7 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
         bool is_known = (entry->flags & WTE_PAGE_IS_PE) ||
                         (entry->flags & WTE_PAGE_IS_DYNAMIC);
         bool in_dll = wte_state.dll_filter_enabled &&
-                      rip >= wte_state.dll_va_threshold;
+                      wte_is_dll_rip(rip, cpu);
 
         if (!is_known && !in_dll) {
             nyx_printf("[WtE][DYN-EXEC] New execution region: VA=0x%lx "
