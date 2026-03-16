@@ -912,6 +912,48 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
         fprintf(map_f, "#   WtE#:       %d (total)\n",
                 event->total_wte_count);
     }
+
+    /* --- Guest register snapshot at dump time --- */
+    {
+        uint32_t cs_flags = env->segs[R_CS].flags;
+        bool cs_l = !!(cs_flags & (1 << 21));  /* Long mode (64-bit) */
+        bool cs_d = !!(cs_flags & (1 << 22));  /* Default size (32-bit) */
+        const char *mode = cs_l ? "64-bit" : (cs_d ? "32-bit (compat)" : "16-bit");
+
+        fprintf(map_f, "#\n");
+        fprintf(map_f, "# Guest Registers (mode: %s, CS.L=%d CS.D=%d):\n",
+                mode, cs_l, cs_d);
+        fprintf(map_f, "#   RAX: 0x%016lx  RBX: 0x%016lx\n",
+                (unsigned long)env->regs[R_EAX],
+                (unsigned long)env->regs[R_EBX]);
+        fprintf(map_f, "#   RCX: 0x%016lx  RDX: 0x%016lx\n",
+                (unsigned long)env->regs[R_ECX],
+                (unsigned long)env->regs[R_EDX]);
+        fprintf(map_f, "#   RSI: 0x%016lx  RDI: 0x%016lx\n",
+                (unsigned long)env->regs[R_ESI],
+                (unsigned long)env->regs[R_EDI]);
+        fprintf(map_f, "#   RBP: 0x%016lx  RSP: 0x%016lx\n",
+                (unsigned long)env->regs[R_EBP],
+                (unsigned long)env->regs[R_ESP]);
+        fprintf(map_f, "#   R8:  0x%016lx  R9:  0x%016lx\n",
+                (unsigned long)env->regs[8],
+                (unsigned long)env->regs[9]);
+        fprintf(map_f, "#   R10: 0x%016lx  R11: 0x%016lx\n",
+                (unsigned long)env->regs[10],
+                (unsigned long)env->regs[11]);
+        fprintf(map_f, "#   R12: 0x%016lx  R13: 0x%016lx\n",
+                (unsigned long)env->regs[12],
+                (unsigned long)env->regs[13]);
+        fprintf(map_f, "#   R14: 0x%016lx  R15: 0x%016lx\n",
+                (unsigned long)env->regs[14],
+                (unsigned long)env->regs[15]);
+        fprintf(map_f, "#   RIP: 0x%016lx  RFLAGS: 0x%016lx\n",
+                (unsigned long)env->eip,
+                (unsigned long)env->eflags);
+        fprintf(map_f, "#   CR3: 0x%016lx\n",
+                (unsigned long)env->cr[3]);
+    }
+
     fprintf(map_f, "\n");
     fprintf(map_f, "# %-10s  %-10s  %-10s  %-5s  %-40s  %s\n",
             "START", "END", "SIZE", "PERM", "FILE", "MODULE");
