@@ -317,6 +317,13 @@ void wte_activate(uint64_t cr3, bool is_64bit)
     wte_state.dll_filtered_count  = 0;
     wte_state.dll_filtered_total  = 0;
 
+    wte_state.mtf_active          = false;
+    wte_state.mtf_target_va       = 0;
+    wte_state.mtf_target_gfn      = 0;
+    wte_state.mtf_write_rip       = 0;
+    wte_state.mtf_retry_count     = 0;
+    wte_state.mtf_same_page_count = 0;
+
     if (!wte_state.kvm_wte_enabled) {
         wte_kvm_enable();
     }
@@ -491,15 +498,37 @@ void wte_handle_write_violation(uint64_t gfn, uint64_t gpa,
          * the same page it's writing to. Setting X=0 would prevent the
          * instruction from executing, so the write never completes.
          *
-         * Solution: allow both W=1 and X=1 temporarily. Mark as
-         * DEFERRED — verification will happen at the next EPT violation
-         * on a different page (see wte_check_deferred_pages). */
+         * Solution: allow W=1+X=1 temporarily, arm MTF (Monitor Trap
+         * Flag) single-step. After 1 instruction (the write), MTF fires
+         * a VM exit → we set X=0 to catch subsequent execution. */
         if (entry->flags & WTE_PAGE_X_BLOCKED) {
             wte_kvm_clear_nx(&gfn, 1);
             entry->flags &= ~WTE_PAGE_X_BLOCKED;
         }
-        entry->flags |= WTE_PAGE_DEFERRED;
         entry->last_write_rip = rip;
+
+        /* Check MTF conflict with API hook single-step */
+        if (GET_GLOBAL_STATE()->api_hook_step_idx >= 0) {
+            nyx_printf("[WtE][MTF-CONFLICT] API hook using MTF, "
+                       "re-protecting VA=0x%lx\n",
+                       (unsigned long)fault_va);
+            /* Can't arm MTF — re-protect page for next write cycle */
+            wte_kvm_set_nx(&gfn, 1);
+            entry->flags |= WTE_PAGE_X_BLOCKED;
+        } else {
+            entry->flags |= WTE_PAGE_MTF_PENDING;
+            wte_state.mtf_active      = true;
+            wte_state.mtf_target_va   = fault_va;
+            wte_state.mtf_target_gfn  = gfn;
+            wte_state.mtf_write_rip   = rip;
+            wte_state.mtf_retry_count = 0;
+
+            kvm_vcpu_ioctl(cpu, KVM_VMX_PT_ENABLE_MTF);
+
+            nyx_printf("[WtE][MTF-ARM] VA=0x%lx GFN=0x%lx RIP=0x%lx\n",
+                       (unsigned long)fault_va, (unsigned long)gfn,
+                       (unsigned long)rip);
+        }
     } else {
         /* Different page: standard path. Set X=0 to catch subsequent
          * execution on the written page. */
@@ -510,75 +539,57 @@ void wte_handle_write_violation(uint64_t gfn, uint64_t gpa,
     }
 }
 
-/* ── Deferred Verification (same-page self-modifying code) ────── */
+/* ── MTF Single-Step Handler (same-page self-modifying code) ──── */
 
-void wte_check_deferred_pages(CPUState *cpu)
+#define WTE_MTF_MAX_RETRIES 16
+
+void wte_handle_mtf(CPUState *cpu)
 {
-    if (!wte_state.active || !wte_state.page_table) return;
+    if (!wte_state.active || !wte_state.mtf_active) return;
 
-    GHashTableIter iter;
-    gpointer key, value;
-    g_hash_table_iter_init(&iter, wte_state.page_table);
+    uint64_t va  = wte_state.mtf_target_va;
+    uint64_t gfn = wte_state.mtf_target_gfn;
 
-    while (g_hash_table_iter_next(&iter, &key, &value)) {
-        wte_page_entry_t *entry = value;
-
-        if (!(entry->flags & WTE_PAGE_DEFERRED)) continue;
-
-        /* Page was left open (W=1+X=1) for same-page self-modifying code.
-         * Now re-read content and check if anything actually changed. */
-        entry->flags &= ~WTE_PAGE_DEFERRED;
-
-        cpu_physical_memory_read(entry->gpa, entry->current, WTE_PAGE_SIZE);
-        wte_compute_diff(entry);
-
-        if (entry->diff_count > 0) {
-            /* Real change detected — WtE on same-page self-modifying code */
-            wte_state.wte_count++;
-            wte_state.total_wte_count++;
-
-            nyx_printf("[WtE][DEFERRED-DETECT] VA=0x%lx GFN=0x%lx diffs=%d "
-                       "write_rip=0x%lx\n",
-                       (unsigned long)entry->va, (unsigned long)entry->gfn,
-                       entry->diff_count,
-                       (unsigned long)entry->last_write_rip);
-
-            /* Full process memory dump (incremental — only changed pages) */
-            {
-                X86CPU *cpux86 = X86_CPU(cpu);
-                CPUX86State *env = &cpux86->env;
-                char wte_label[128];
-                snprintf(wte_label, sizeof(wte_label),
-                         "wte_rip0x%lx_va0x%lx",
-                         (unsigned long)entry->last_write_rip,
-                         (unsigned long)entry->va);
-                wte_dump_event_t evt = {
-                    .type            = "DEFERRED",
-                    .rip             = entry->last_write_rip,
-                    .va              = entry->va,
-                    .gfn             = entry->gfn,
-                    .diff_count      = entry->diff_count,
-                    .wte_count       = wte_state.wte_count,
-                    .total_wte_count = wte_state.total_wte_count,
-                };
-                dump_full_process_memory(cpu, env, wte_label, &evt);
-            }
-
-            /* Update baseline for next change detection */
-            memcpy(entry->baseline, entry->current, WTE_PAGE_SIZE);
-        }
-
-        /* Re-protect: W=0 + X=0 for next cycle */
-        entry->flags &= ~WTE_PAGE_WRITTEN;
-        entry->write_count = 0;
-
-        uint64_t gfn = entry->gfn;
-        wte_kvm_set_wp(&gfn, 1);
-        entry->flags |= WTE_PAGE_W_PROTECTED;
-        wte_kvm_set_nx(&gfn, 1);
-        entry->flags |= WTE_PAGE_X_BLOCKED;
-        entry->flags &= ~WTE_PAGE_X_ALLOWED;
+    wte_page_entry_t *entry = wte_lookup_va(va);
+    if (!entry) {
+        nyx_printf("[WtE][MTF] WARNING: no entry for VA=0x%lx\n",
+                   (unsigned long)va);
+        wte_state.mtf_active = false;
+        return;
     }
+
+    /* Check if the write instruction actually executed. If an interrupt
+     * fired between MTF arm and the write, RIP will still be at the
+     * write instruction (interrupt returns to it). Re-arm MTF to retry.
+     * RIP check is cheap and handles idempotent writes correctly. */
+    X86CPU *cpux86 = X86_CPU(cpu);
+    CPUX86State *env = &cpux86->env;
+    uint64_t current_rip = env->eip;
+
+    if (current_rip == wte_state.mtf_write_rip &&
+        wte_state.mtf_retry_count < WTE_MTF_MAX_RETRIES) {
+        wte_state.mtf_retry_count++;
+        kvm_vcpu_ioctl(cpu, KVM_VMX_PT_ENABLE_MTF);
+        nyx_printf("[WtE][MTF] Write not executed yet (RIP=0x%lx, retry %d)\n",
+                   (unsigned long)current_rip, wte_state.mtf_retry_count);
+        return;
+    }
+
+    /* MTF complete — write instruction has executed. Clear state. */
+    wte_state.mtf_active = false;
+    wte_state.mtf_same_page_count++;
+    entry->flags &= ~WTE_PAGE_MTF_PENDING;
+
+    nyx_printf("[WtE][MTF-FIRE] VA=0x%lx GFN=0x%lx "
+               "write_rip=0x%lx current_rip=0x%lx → X=0 armed\n",
+               (unsigned long)va, (unsigned long)gfn,
+               (unsigned long)wte_state.mtf_write_rip,
+               (unsigned long)current_rip);
+
+    /* Set X=0 to catch subsequent execution on the written page */
+    wte_kvm_set_nx(&gfn, 1);
+    entry->flags |= WTE_PAGE_X_BLOCKED;
+    entry->flags &= ~WTE_PAGE_X_ALLOWED;
 }
 
 /* ── DLL Module Enumeration (PEB→Ldr walk) ─────────────────────── */
@@ -1059,6 +1070,16 @@ void wte_reset_round(void)
 
     /* Clear page table */
     g_hash_table_remove_all(wte_state.page_table);
+
+    /* Clear in-flight MTF state */
+    if (wte_state.mtf_active) {
+        nyx_printf("[WtE] WARNING: MTF active at round reset — clearing\n");
+        wte_state.mtf_active = false;
+    }
+    wte_state.mtf_retry_count = 0;
+    wte_state.mtf_target_va   = 0;
+    wte_state.mtf_target_gfn  = 0;
+    wte_state.mtf_write_rip   = 0;
 
     /* Reset counters */
     wte_state.round++;
