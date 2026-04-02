@@ -819,10 +819,9 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
             entry->flags &= ~WTE_PAGE_X_BLOCKED;
             entry->flags |= WTE_PAGE_X_ALLOWED;
 
-            if (entry->flags & WTE_PAGE_IS_PE) {
-                wte_kvm_set_wp(&gfn, 1);
-                entry->flags |= WTE_PAGE_W_PROTECTED;
-            }
+            /* Re-protect W=0 for next write cycle */
+            wte_kvm_set_wp(&gfn, 1);
+            entry->flags |= WTE_PAGE_W_PROTECTED;
             return;
         }
 
@@ -840,6 +839,10 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
             wte_kvm_clear_nx(&gfn, 1);
             entry->flags &= ~WTE_PAGE_X_BLOCKED;
             entry->flags |= WTE_PAGE_X_ALLOWED;
+
+            /* Re-protect W=0 for next write cycle */
+            wte_kvm_set_wp(&gfn, 1);
+            entry->flags |= WTE_PAGE_W_PROTECTED;
             return;
         }
 
@@ -873,15 +876,13 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
         entry->flags &= ~WTE_PAGE_WRITTEN;
         entry->write_count = 0;
 
-        /* Allow execution (X=1), re-protect write (W=0) */
+        /* Allow execution (X=1), re-protect write (W=0) for next cycle */
         wte_kvm_clear_nx(&gfn, 1);
         entry->flags &= ~WTE_PAGE_X_BLOCKED;
         entry->flags |= WTE_PAGE_X_ALLOWED;
 
-        if (entry->flags & WTE_PAGE_IS_PE) {
-            wte_kvm_set_wp(&gfn, 1);
-            entry->flags |= WTE_PAGE_W_PROTECTED;
-        }
+        wte_kvm_set_wp(&gfn, 1);
+        entry->flags |= WTE_PAGE_W_PROTECTED;
     } else {
         /* Not written — first-time execution (DLL, system code, etc.) */
         entry->flags |= WTE_PAGE_X_ALLOWED;
