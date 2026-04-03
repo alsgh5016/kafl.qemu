@@ -118,6 +118,11 @@ typedef struct {
     int             dll_filtered_count;
     int             dll_filtered_total;
 
+    /* MTF state for same-page write confirmation */
+    bool     mtf_active;           /* MTF armed for a same-page write    */
+    uint64_t mtf_target_va;        /* VA of the page being written       */
+    uint64_t mtf_target_gfn;       /* GFN of the page being written      */
+
     /* Dirty ring for non-PE pages (legacy supplementary path) */
     uint32_t last_scanned_ring_index;
 
@@ -161,8 +166,12 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
                                uint64_t rip, CPUState *cpu);
 
 /* Deferred verification: check same-page writes that were left open
- * (W=1+X=1). Called at the start of each EPT violation handler. */
+ * (W=1+X=1). Called at every VM exit to ensure timely detection. */
 void wte_check_deferred_pages(CPUState *cpu);
+
+/* MTF handler: confirm same-page write completed, re-arm W=0.
+ * Called from handle_hypercall_kafl_mtf when mtf_active is set. */
+void wte_handle_mtf(CPUState *cpu);
 
 /* PE range protection: W=0 + X=0 on target PE pages.
  * Called during WTE_SETUP, BEFORE target process executes. */

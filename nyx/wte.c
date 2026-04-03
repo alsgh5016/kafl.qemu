@@ -317,6 +317,10 @@ void wte_activate(uint64_t cr3, bool is_64bit)
     wte_state.dll_filtered_count  = 0;
     wte_state.dll_filtered_total  = 0;
 
+    wte_state.mtf_active     = false;
+    wte_state.mtf_target_va  = 0;
+    wte_state.mtf_target_gfn = 0;
+
     if (!wte_state.kvm_wte_enabled) {
         wte_kvm_enable();
     }
@@ -491,15 +495,25 @@ void wte_handle_write_violation(uint64_t gfn, uint64_t gpa,
          * the same page it's writing to. Setting X=0 would prevent the
          * instruction from executing, so the write never completes.
          *
-         * Solution: allow both W=1 and X=1 temporarily. Mark as
-         * DEFERRED — verification will happen at the next EPT violation
-         * on a different page (see wte_check_deferred_pages). */
+         * Solution: W=1+X=1 temporarily, arm MTF to confirm write
+         * completion, then re-arm W=0. X=0 is NOT set — allows
+         * multiple writes before execute. DEFERRED flag enables
+         * diff-based WtE detection at the next VM exit. */
         if (entry->flags & WTE_PAGE_X_BLOCKED) {
             wte_kvm_clear_nx(&gfn, 1);
             entry->flags &= ~WTE_PAGE_X_BLOCKED;
         }
         entry->flags |= WTE_PAGE_DEFERRED;
         entry->last_write_rip = rip;
+
+        /* Arm MTF to confirm write and re-arm W=0 after completion.
+         * Skip if API hook is already using MTF. */
+        if (GET_GLOBAL_STATE()->api_hook_step_idx < 0) {
+            wte_state.mtf_active     = true;
+            wte_state.mtf_target_va  = fault_va;
+            wte_state.mtf_target_gfn = gfn;
+            kvm_vcpu_ioctl(cpu, KVM_VMX_PT_ENABLE_MTF);
+        }
     } else {
         /* Different page: standard path. Set X=0 to catch subsequent
          * execution on the written page. */
@@ -508,6 +522,31 @@ void wte_handle_write_violation(uint64_t gfn, uint64_t gpa,
             entry->flags |= WTE_PAGE_X_BLOCKED;
         }
     }
+}
+
+/* ── MTF Handler (same-page write confirmation) ─────────────── */
+
+void wte_handle_mtf(CPUState *cpu)
+{
+    if (!wte_state.active || !wte_state.mtf_active) return;
+
+    uint64_t gfn = wte_state.mtf_target_gfn;
+    uint64_t va  = wte_state.mtf_target_va;
+
+    wte_state.mtf_active = false;
+
+    wte_page_entry_t *entry = wte_lookup_va(va);
+    if (!entry) return;
+
+    /* Write instruction completed. Re-arm W=0 so the next write to
+     * this page causes another W violation (enabling multi-write
+     * tracking). Do NOT set X=0 — execution must continue on this
+     * page for subsequent write instructions. */
+    wte_kvm_set_wp(&gfn, 1);
+    entry->flags |= WTE_PAGE_W_PROTECTED;
+
+    nyx_printf("[WtE][MTF] Write confirmed VA=0x%lx, W=0 re-armed\n",
+               (unsigned long)va);
 }
 
 /* ── Deferred Verification (same-page self-modifying code) ────── */
@@ -1059,6 +1098,11 @@ void wte_reset_round(void)
 
     /* Clear page table */
     g_hash_table_remove_all(wte_state.page_table);
+
+    /* Clear in-flight MTF state */
+    wte_state.mtf_active     = false;
+    wte_state.mtf_target_va  = 0;
+    wte_state.mtf_target_gfn = 0;
 
     /* Reset counters */
     wte_state.round++;

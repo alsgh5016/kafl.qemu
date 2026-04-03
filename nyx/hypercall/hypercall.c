@@ -395,6 +395,13 @@ void handle_hypercall_kafl_mtf(struct kvm_run *run, CPUState *cpu, uint64_t hype
     kvm_arch_get_registers_fast(cpu);
     nyx_debug_p(CORE_PREFIX, "%s --> %lx\n", __func__, get_rip(cpu));
     kvm_vcpu_ioctl(cpu, KVM_VMX_PT_DISABLE_MTF);
+
+    /* WtE same-page MTF: confirm write and re-arm W=0 */
+    if (wte_is_active() && wte_get_state()->mtf_active) {
+        wte_handle_mtf(cpu);
+        return;
+    }
+
     /* Check if this MTF is for API hook single-step resume */
     if (GET_GLOBAL_STATE()->api_hook_mode &&
         GET_GLOBAL_STATE()->api_hook_step_idx >= 0) {
@@ -1910,9 +1917,8 @@ int handle_kafl_hypercall(struct kvm_run *run,
         /* CoW detection: rescan PE VA→GFN only on EPT violation exits */
         wte_pt_check(cpu);
 
-        /* Verify deferred same-page writes: re-read pages that were
-         * left open (W=1+X=1), check for actual diffs, re-protect */
-        wte_check_deferred_pages(cpu);
+        /* Note: wte_check_deferred_pages() is now called at every VM
+         * exit in kvm-all.c, so no need to call it here separately. */
 
         if (wte_type == WTE_VIOLATION_WRITE) {
             nyx_printf("[WtE] KVM exit (WRITE): GFN=0x%lx RIP=0x%lx\n",

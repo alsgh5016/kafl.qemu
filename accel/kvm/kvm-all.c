@@ -2527,10 +2527,14 @@ int kvm_cpu_exec(CPUState *cpu)
 
 #ifdef QEMU_NYX
         // clang-format on
-        /* WtE Dual-Watch: CoW detection + dirty ring scan.
-         * Only run on EPT violation exits (KVM_EXIT_KAFL_WTE) to avoid
-         * massive overhead on unrelated VM exits (timer, I/O, etc.).
-         * Dirty ring scan disabled — EPT W=0 is the primary write path. */
+        /* WtE: check deferred same-page writes on background VM exits
+         * (timer interrupt, I/O, HLT, etc.) but NOT on our own exits
+         * (WtE EPT violations, MTF) to avoid per-write overhead. */
+        if (wte_is_active() &&
+            run->exit_reason != KVM_EXIT_KAFL_WTE &&
+            run->exit_reason != KVM_EXIT_KAFL_MTF) {
+            wte_check_deferred_pages(cpu);
+        }
 // clang-format off
 #endif
 
