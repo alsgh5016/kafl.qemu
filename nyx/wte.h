@@ -50,9 +50,9 @@
 #define WTE_PAGE_X_ALLOWED     (1 << 3)  /* execution explicitly allowed */
 #define WTE_PAGE_IS_PE         (1 << 4)  /* belongs to target PE image   */
 #define WTE_PAGE_IS_DYNAMIC    (1 << 5)  /* dynamically detected region  */
-#define WTE_PAGE_MTF_PENDING   (1 << 6)  /* same-page write: MTF armed,
-                                          * waiting for single-step to
-                                          * complete before setting X=0  */
+#define WTE_PAGE_DEFERRED      (1 << 6)  /* same-page write: W=1+X=1,
+                                          * pending verification at next
+                                          * EPT violation on other page  */
 
 /* ── DLL module entry (for noise filtering) ───────────────────── */
 
@@ -70,8 +70,8 @@ typedef struct {
     uint64_t gpa;                            /* GFN << 12                 */
     uint32_t flags;                          /* WTE_PAGE_* flags          */
     uint32_t write_count;                    /* writes this round         */
-    uint64_t last_write_rip;                 /* RIP of same-page write
-                                              * (saved at MTF arm)         */
+    uint64_t last_write_rip;                 /* RIP of first SAME-PAGE write
+                                              * (saved at DEFERRED setup)  */
 
     /* Content tracking for diff */
     uint8_t  baseline[WTE_PAGE_SIZE];        /* content at snapshot/setup */
@@ -118,14 +118,6 @@ typedef struct {
     int             dll_filtered_count;
     int             dll_filtered_total;
 
-    /* MTF single-step state (same-page WtE) */
-    bool     mtf_active;           /* MTF is armed for a WtE same-page write */
-    uint64_t mtf_target_va;        /* VA of the page being written           */
-    uint64_t mtf_target_gfn;       /* GFN of the page being written          */
-    uint64_t mtf_write_rip;        /* RIP of the writing instruction         */
-    int      mtf_retry_count;      /* re-arm count for interrupt edge cases  */
-    int      mtf_same_page_count;  /* statistics: total same-page MTF uses   */
-
     /* Dirty ring for non-PE pages (legacy supplementary path) */
     uint32_t last_scanned_ring_index;
 
@@ -168,9 +160,9 @@ void wte_handle_write_violation(uint64_t gfn, uint64_t gpa,
 void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
                                uint64_t rip, CPUState *cpu);
 
-/* MTF single-step handler: called on KVM_EXIT_KAFL_MTF when
- * mtf_active is set. Sets X=0 after the write instruction completes. */
-void wte_handle_mtf(CPUState *cpu);
+/* Deferred verification: check same-page writes that were left open
+ * (W=1+X=1). Called at the start of each EPT violation handler. */
+void wte_check_deferred_pages(CPUState *cpu);
 
 /* PE range protection: W=0 + X=0 on target PE pages.
  * Called during WTE_SETUP, BEFORE target process executes. */
@@ -216,7 +208,7 @@ void wte_crossdump_destroy(void);
 /* ── WtE dump event metadata ──────────────────────────────────── */
 
 typedef struct {
-    const char *type;              /* "MTF" or "EXEC"                */
+    const char *type;              /* "DEFERRED" or "EXEC"           */
     uint64_t    rip;               /* trigger RIP (0 if unknown)     */
     uint64_t    va;                /* target page VA                 */
     uint64_t    gfn;               /* target page GFN                */
