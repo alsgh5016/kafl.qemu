@@ -38,7 +38,8 @@
 /* Defined in hypercall.c */
 extern void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                                      const char *label,
-                                     const wte_dump_event_t *event);
+                                     const wte_dump_event_t *event,
+                                     uint64_t cr3_override);
 
 /* ── Dirty Ring Globals (defined in nyx_dirty_ring.c) ──────────── */
 
@@ -600,7 +601,7 @@ void wte_check_deferred_pages(CPUState *cpu)
                     .wte_count       = wte_state.wte_count,
                     .total_wte_count = wte_state.total_wte_count,
                 };
-                dump_full_process_memory(cpu, env, wte_label, &evt);
+                dump_full_process_memory(cpu, env, wte_label, &evt, 0);
             }
 
             /* Update baseline for next change detection */
@@ -893,7 +894,7 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
                 .wte_count       = wte_state.wte_count,
                 .total_wte_count = wte_state.total_wte_count,
             };
-            dump_full_process_memory(cpu, env, wte_label, &evt);
+            dump_full_process_memory(cpu, env, wte_label, &evt, 0);
         }
 
         /* Post-detection: update baseline, re-protect for next layer */

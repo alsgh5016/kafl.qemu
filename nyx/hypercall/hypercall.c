@@ -821,7 +821,8 @@ static int crossdump_find_va(uint32_t va)
 
 void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                                      const char *label,
-                                     const wte_dump_event_t *event)
+                                     const wte_dump_event_t *event,
+                                     uint64_t cr3_override)
 {
     int seq = dump_seq_counter++;
 
@@ -987,7 +988,7 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
     int pg_count = 0;
     mapped_page_t *pages = malloc(pg_capacity * sizeof(mapped_page_t));
 
-    uint64_t cr3 = env->cr[3];
+    uint64_t cr3 = (cr3_override != 0) ? cr3_override : env->cr[3];
     uint64_t pml4_base = cr3 & 0x000FFFFFFFFFF000ULL;
     uint64_t pml4_table[512];
     cpu_physical_memory_read(pml4_base, pml4_table, 4096);
@@ -1469,7 +1470,7 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
                     /* Full process memory dump */
                     {
                         const char *dump_label = (proc_name[0] != '\0') ? proc_name : "unknown";
-                        dump_full_process_memory(cpu, env, dump_label, NULL);
+                        dump_full_process_memory(cpu, env, dump_label, NULL, 0);
                     }
                 }
 hook_single_step:
@@ -2054,6 +2055,26 @@ int handle_kafl_hypercall(struct kvm_run *run,
         /* Step 5: Diagnostic — map target PE VA→GFN for tracking */
         if (setup.image_base != 0 && setup.image_size != 0) {
             wte_diagnose_target_pe(cpu, setup.image_base, setup.image_size);
+        }
+
+        /* Step 6: Initial dump — packed PE state before any execution.
+         * This becomes fulldump_000 (EP entry point baseline).
+         * WtE dumps will follow as fulldump_001, 002, ... */
+        {
+            nyx_printf("[WtE] WTE_SETUP: Taking initial EP dump "
+                       "(packed baseline) with child CR3=0x%lx\n",
+                       (unsigned long)child_cr3);
+            wte_dump_event_t ep_evt = {
+                .type            = "EP_INIT",
+                .rip             = setup.image_base,
+                .va              = setup.image_base,
+                .gfn             = 0,
+                .diff_count      = 0,
+                .wte_count       = 0,
+                .total_wte_count = 0,
+            };
+            dump_full_process_memory(cpu, env, "ep_initial_packed",
+                                     &ep_evt, child_cr3);
         }
 
         /* Return child CR3 to guest so harness can use it for SUBMIT_CR3 */
