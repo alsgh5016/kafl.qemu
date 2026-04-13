@@ -140,6 +140,14 @@ typedef struct {
     uint64_t *renx_queue;
     int       renx_count;
     int       renx_capacity;
+
+    /* Deferred W=0 re-protect queue (post-WtE detection).
+     * Pages are queued here after WtE detection and re-protected at
+     * the next background VM exit, avoiding tight write→WtE→re-protect
+     * loops on VM-based protectors (Themida). */
+    uint64_t deferred_wp_gfns[WTE_MAX_BATCH_GFNS];
+    uint64_t deferred_wp_vas[WTE_MAX_BATCH_GFNS];
+    int      deferred_wp_count;
 } wte_state_t;
 
 /* ── Public API ────────────────────────────────────────────────── */
@@ -168,6 +176,10 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
 /* Deferred verification: check same-page writes that were left open
  * (W=1+X=1). Called at every VM exit to ensure timely detection. */
 void wte_check_deferred_pages(CPUState *cpu);
+
+/* Flush deferred W=0 re-protect queue.  Called at background VM exits
+ * to re-arm write protection on pages that had WtE detected. */
+void wte_flush_deferred_wp(void);
 
 /* MTF handler: confirm same-page write completed, re-arm W=0.
  * Called from handle_hypercall_kafl_mtf when mtf_active is set. */

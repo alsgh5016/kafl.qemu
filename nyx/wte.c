@@ -550,6 +550,33 @@ void wte_handle_mtf(CPUState *cpu)
                (unsigned long)va);
 }
 
+/* ── Deferred W=0 Re-protect (post-WtE detection) ───────────────
+ *
+ * After WtE detection, W=0 is NOT set immediately to avoid tight
+ * write→WtE→re-protect loops (Themida VM dispatcher).  Instead,
+ * pages are queued and re-protected here at the next VM exit.
+ * This gives the guest time to execute multiple instructions before
+ * the next write trap, matching the old dirty-ring timing behavior.
+ */
+void wte_flush_deferred_wp(void)
+{
+    if (!wte_state.active || wte_state.deferred_wp_count == 0) {
+        return;
+    }
+
+    wte_kvm_set_wp(wte_state.deferred_wp_gfns, wte_state.deferred_wp_count);
+
+    for (int i = 0; i < wte_state.deferred_wp_count; i++) {
+        wte_page_entry_t *entry = wte_lookup_va(wte_state.deferred_wp_vas[i]);
+        if (entry) {
+            entry->flags |= WTE_PAGE_W_PROTECTED;
+        }
+    }
+
+    wte_state.deferred_wp_count = 0;
+}
+
+
 /* ── Deferred Verification (same-page self-modifying code) ────── */
 
 void wte_check_deferred_pages(CPUState *cpu)
@@ -898,19 +925,27 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
         }
 
         /* Post-detection: update baseline, allow execution.
-         * Do NOT re-protect W=0 — the full process dump already captures
-         * all pages.  Re-protecting W=0 causes infinite WtE loops on
-         * VM-based protectors (Themida) whose dispatcher repeatedly
-         * writes+executes the same page.  Multi-layer unpacking is
-         * detected via WtE on OTHER pages that get written next. */
+         * Queue deferred W=0 re-protect instead of setting it immediately.
+         * This avoids tight write→WtE→re-protect loops on VM protectors
+         * (Themida) while still catching multi-layer unpacking at the
+         * next VM exit boundary. */
         memcpy(entry->baseline, entry->current, WTE_PAGE_SIZE);
         entry->flags &= ~WTE_PAGE_WRITTEN;
         entry->write_count = 0;
 
-        /* Allow execution (X=1), keep write allowed (W=1) */
+        /* Allow execution (X=1), keep write allowed (W=1) for now */
         wte_kvm_clear_nx(&gfn, 1);
         entry->flags &= ~WTE_PAGE_X_BLOCKED;
         entry->flags |= WTE_PAGE_X_ALLOWED;
+
+        /* Queue deferred W=0 re-protect for next VM exit */
+        if (entry->flags & WTE_PAGE_IS_PE) {
+            if (wte_state.deferred_wp_count < WTE_MAX_BATCH_GFNS) {
+                wte_state.deferred_wp_gfns[wte_state.deferred_wp_count] = gfn;
+                wte_state.deferred_wp_vas[wte_state.deferred_wp_count] = entry->va;
+                wte_state.deferred_wp_count++;
+            }
+        }
     } else {
         /* Not written — first-time execution (DLL, system code, etc.) */
         entry->flags |= WTE_PAGE_X_ALLOWED;

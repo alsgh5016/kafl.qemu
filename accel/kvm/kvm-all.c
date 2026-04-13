@@ -2534,6 +2534,7 @@ int kvm_cpu_exec(CPUState *cpu)
             run->exit_reason != KVM_EXIT_KAFL_WTE &&
             run->exit_reason != KVM_EXIT_KAFL_MTF) {
             wte_check_deferred_pages(cpu);
+            wte_flush_deferred_wp();
         }
 // clang-format off
 #endif
