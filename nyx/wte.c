@@ -550,33 +550,6 @@ void wte_handle_mtf(CPUState *cpu)
                (unsigned long)va);
 }
 
-/* ── Deferred W=0 Re-protect (post-WtE detection) ───────────────
- *
- * After WtE detection, W=0 is NOT set immediately to avoid tight
- * write→WtE→re-protect loops (Themida VM dispatcher).  Instead,
- * pages are queued and re-protected here at the next VM exit.
- * This gives the guest time to execute multiple instructions before
- * the next write trap, matching the old dirty-ring timing behavior.
- */
-void wte_flush_deferred_wp(void)
-{
-    if (!wte_state.active || wte_state.deferred_wp_count == 0) {
-        return;
-    }
-
-    wte_kvm_set_wp(wte_state.deferred_wp_gfns, wte_state.deferred_wp_count);
-
-    for (int i = 0; i < wte_state.deferred_wp_count; i++) {
-        wte_page_entry_t *entry = wte_lookup_va(wte_state.deferred_wp_vas[i]);
-        if (entry) {
-            entry->flags |= WTE_PAGE_W_PROTECTED;
-        }
-    }
-
-    wte_state.deferred_wp_count = 0;
-}
-
-
 /* ── Deferred Verification (same-page self-modifying code) ────── */
 
 void wte_check_deferred_pages(CPUState *cpu)
@@ -882,6 +855,48 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
             return;
         }
 
+        /* Check if the EXECUTED address was actually modified.
+         * A page may have diffs (e.g., Themida VM writes data at offset A)
+         * but execute at a different offset B that was NOT modified.
+         * Only flag WtE when the instruction being executed is in a
+         * modified range — this is the true "Written-then-Executed". */
+        {
+            uint16_t rip_offset = (uint16_t)(rip & 0xFFF);
+            /* Check if RIP falls within any diff range.
+             * Use a window of 15 bytes (max x86 instruction length). */
+            bool rip_in_diff = false;
+            for (int d = 0; d < entry->diff_count; d++) {
+                uint16_t diff_start = entry->diff_offsets[d];
+                uint16_t diff_end   = diff_start + entry->diff_lengths[d];
+                /* RIP overlaps diff if instruction window intersects */
+                if (rip_offset < diff_end && rip_offset + 15 > diff_start) {
+                    rip_in_diff = true;
+                    break;
+                }
+            }
+
+            if (!rip_in_diff) {
+                /* Page was modified but NOT at the executed address.
+                 * This is NOT WtE — e.g., VM dispatcher writes data
+                 * on the same page as code. Allow execution, keep
+                 * tracking for future writes. */
+                nyx_printf("[WtE][EXEC] Diff exists but RIP=0x%lx (offset 0x%x) "
+                           "not in modified range: VA=0x%lx diffs=%d\n",
+                           (unsigned long)rip, rip_offset,
+                           (unsigned long)entry->va, entry->diff_count);
+                wte_kvm_clear_nx(&gfn, 1);
+                entry->flags &= ~WTE_PAGE_X_BLOCKED;
+                entry->flags |= WTE_PAGE_X_ALLOWED;
+
+                /* Re-protect W=0 to catch next write */
+                if (entry->flags & WTE_PAGE_IS_PE) {
+                    wte_kvm_set_wp(&gfn, 1);
+                    entry->flags |= WTE_PAGE_W_PROTECTED;
+                }
+                return;
+            }
+        }
+
         /* DLL noise filter (module-list based) */
         if (wte_state.dll_filter_enabled && wte_is_dll_rip(rip, cpu)) {
             wte_state.dll_filtered_count++;
@@ -899,7 +914,7 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
             return;
         }
 
-        /* ★ WtE DETECTED! */
+        /* ★ WtE DETECTED — executed address IS in a modified range */
         wte_state.wte_count++;
         wte_state.total_wte_count++;
 
@@ -924,27 +939,21 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
             dump_full_process_memory(cpu, env, wte_label, &evt, 0);
         }
 
-        /* Post-detection: update baseline, allow execution.
-         * Queue deferred W=0 re-protect instead of setting it immediately.
-         * This avoids tight write→WtE→re-protect loops on VM protectors
-         * (Themida) while still catching multi-layer unpacking at the
-         * next VM exit boundary. */
+        /* Post-detection: update baseline, re-protect for next layer.
+         * RIP-in-diff check above prevents tight loops on VM dispatchers,
+         * so immediate W=0 re-protect is safe here. */
         memcpy(entry->baseline, entry->current, WTE_PAGE_SIZE);
         entry->flags &= ~WTE_PAGE_WRITTEN;
         entry->write_count = 0;
 
-        /* Allow execution (X=1), keep write allowed (W=1) for now */
+        /* Allow execution (X=1), re-protect write (W=0) */
         wte_kvm_clear_nx(&gfn, 1);
         entry->flags &= ~WTE_PAGE_X_BLOCKED;
         entry->flags |= WTE_PAGE_X_ALLOWED;
 
-        /* Queue deferred W=0 re-protect for next VM exit */
         if (entry->flags & WTE_PAGE_IS_PE) {
-            if (wte_state.deferred_wp_count < WTE_MAX_BATCH_GFNS) {
-                wte_state.deferred_wp_gfns[wte_state.deferred_wp_count] = gfn;
-                wte_state.deferred_wp_vas[wte_state.deferred_wp_count] = entry->va;
-                wte_state.deferred_wp_count++;
-            }
+            wte_kvm_set_wp(&gfn, 1);
+            entry->flags |= WTE_PAGE_W_PROTECTED;
         }
     } else {
         /* Not written — first-time execution (DLL, system code, etc.) */
