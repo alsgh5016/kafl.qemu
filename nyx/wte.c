@@ -191,73 +191,37 @@ static void wte_dump_detection(uint64_t exec_rip, wte_page_entry_t *entry,
 static int wte_dump_seq = 0;
 
 static void wte_dump_changed_pages(const char *label,
-                                   const wte_dump_event_t *event)
+                                   const wte_dump_event_t *event,
+                                   wte_page_entry_t *trigger_entry)
 {
     int seq = wte_dump_seq++;
 
+    /* Dump only the page that triggered WtE — O(1) instead of O(N).
+     * Full process state = EP initial dump + sequence of per-page dumps. */
     char *dump_dir = NULL;
     assert(asprintf(&dump_dir, "%s/dump/fulldump_%03d_%s",
                     GET_GLOBAL_STATE()->workdir_path,
                     seq, label) != -1);
     mkdir(dump_dir, 0755);
 
-    /* Iterate tracked pages, dump those with actual changes */
-    GHashTableIter iter;
-    gpointer key, value;
-    int written_pages = 0;
-    int total_changed_bytes = 0;
-
-    g_hash_table_iter_init(&iter, wte_state.page_table);
-    while (g_hash_table_iter_next(&iter, &key, &value)) {
-        wte_page_entry_t *entry = value;
-        if (!entry->baseline_valid) continue;
-
-        /* Re-read current content */
-        uint8_t current[WTE_PAGE_SIZE];
-        cpu_physical_memory_read(entry->gpa, current, WTE_PAGE_SIZE);
-
-        if (memcmp(entry->baseline, current, WTE_PAGE_SIZE) == 0) {
-            continue;  /* No change */
-        }
-
-        /* Count changed bytes */
-        int changed = 0;
+    int changed_bytes = 0;
+    if (trigger_entry && trigger_entry->baseline_valid) {
+        /* current content was already read in exec handler */
         for (int i = 0; i < WTE_PAGE_SIZE; i++) {
-            if (entry->baseline[i] != current[i]) changed++;
+            if (trigger_entry->baseline[i] != trigger_entry->current[i])
+                changed_bytes++;
         }
-        total_changed_bytes += changed;
 
-        /* Write page to disk */
         char *pg_path = NULL;
         assert(asprintf(&pg_path, "%s/page_%08lx.bin",
-                        dump_dir, (unsigned long)entry->va) != -1);
+                        dump_dir, (unsigned long)trigger_entry->va) != -1);
         FILE *f = fopen(pg_path, "wb");
         if (f) {
-            fwrite(current, 1, WTE_PAGE_SIZE, f);
+            fwrite(trigger_entry->current, 1, WTE_PAGE_SIZE, f);
             fclose(f);
         }
         free(pg_path);
-        written_pages++;
     }
-
-    /* Write metadata */
-    char *meta_path = NULL;
-    assert(asprintf(&meta_path, "%s/metadata.txt", dump_dir) != -1);
-    FILE *mf = fopen(meta_path, "w");
-    if (mf) {
-        fprintf(mf, "# WtE dump #%03d (%s)\n", seq, label);
-        if (event) {
-            fprintf(mf, "# Type: %s  RIP: 0x%lx  VA: 0x%lx  GFN: 0x%lx\n",
-                    event->type, (unsigned long)event->rip,
-                    (unsigned long)event->va, (unsigned long)event->gfn);
-            fprintf(mf, "# Diffs: %d  WtE#: %d\n",
-                    event->diff_count, event->total_wte_count);
-        }
-        fprintf(mf, "# Changed pages: %d  Changed bytes: %d\n",
-                written_pages, total_changed_bytes);
-        fclose(mf);
-    }
-    free(meta_path);
 
     /* Append to timeline */
     char *tl_path = NULL;
@@ -265,25 +229,27 @@ static void wte_dump_changed_pages(const char *label,
                     GET_GLOBAL_STATE()->workdir_path) != -1);
     FILE *tl_f = fopen(tl_path, "a");
     if (tl_f) {
-        if (seq == 0) {
+        if (seq == 1) {  /* seq 0 is EP dump */
             fprintf(tl_f, "# WtE Detection Timeline\n");
             fprintf(tl_f, "# SEQ  TYPE       RIP         VA          "
-                    "DIFFS  PAGES_CHANGED  BYTES_CHANGED  WTE#  LABEL\n");
+                    "DIFFS  BYTES_CHANGED  WTE#  LABEL\n");
         }
-        fprintf(tl_f, "%03d  %-9s  0x%08lx  0x%08lx  %5d  %13d  %13d  "
+        fprintf(tl_f, "%03d  %-9s  0x%08lx  0x%08lx  %5d  %13d  "
                 "#%-4d  %s\n",
                 seq, event ? event->type : "?",
                 event ? (unsigned long)event->rip : 0,
                 event ? (unsigned long)event->va : 0,
                 event ? event->diff_count : 0,
-                written_pages, total_changed_bytes,
+                changed_bytes,
                 event ? event->total_wte_count : 0, label);
         fclose(tl_f);
     }
     free(tl_path);
 
-    nyx_printf("    [WTE-DUMP] #%03d (%s): %d changed pages, %d bytes -> %s/\n",
-               seq, label, written_pages, total_changed_bytes, dump_dir);
+    nyx_printf("    [WTE-DUMP] #%03d (%s): VA=0x%lx, %d bytes changed\n",
+               seq, label,
+               trigger_entry ? (unsigned long)trigger_entry->va : 0,
+               changed_bytes);
     free(dump_dir);
 }
 
@@ -707,7 +673,7 @@ void wte_check_deferred_pages(CPUState *cpu)
                     .wte_count       = wte_state.wte_count,
                     .total_wte_count = wte_state.total_wte_count,
                 };
-                wte_dump_changed_pages(wte_label, &evt);
+                wte_dump_changed_pages(wte_label, &evt, entry);
             }
 
             /* Update baseline for next change detection */
@@ -1043,7 +1009,7 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
                 .wte_count       = wte_state.wte_count,
                 .total_wte_count = wte_state.total_wte_count,
             };
-            wte_dump_changed_pages(wte_label, &evt);
+            wte_dump_changed_pages(wte_label, &evt, entry);
         }
 
         /* Post-detection: update baseline, re-protect for next layer.
