@@ -878,21 +878,24 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
             if (!rip_in_diff) {
                 /* Page was modified but NOT at the executed address.
                  * This is NOT WtE — e.g., VM dispatcher writes data
-                 * on the same page as code. Allow execution, keep
-                 * tracking for future writes. */
+                 * on the same page as code.
+                 *
+                 * Release this page from tracking: update baseline,
+                 * clear WRITTEN, leave W=1 + X=1.  This avoids
+                 * repeated VM exits on mixed data+code pages (Themida).
+                 * If actual code bytes on this page are modified later,
+                 * a future write violation will re-arm tracking. */
                 nyx_printf("[WtE][EXEC] Diff exists but RIP=0x%lx (offset 0x%x) "
-                           "not in modified range: VA=0x%lx diffs=%d\n",
+                           "not in modified range: VA=0x%lx diffs=%d — releasing page\n",
                            (unsigned long)rip, rip_offset,
                            (unsigned long)entry->va, entry->diff_count);
+                memcpy(entry->baseline, entry->current, WTE_PAGE_SIZE);
+                entry->flags &= ~WTE_PAGE_WRITTEN;
+
                 wte_kvm_clear_nx(&gfn, 1);
                 entry->flags &= ~WTE_PAGE_X_BLOCKED;
                 entry->flags |= WTE_PAGE_X_ALLOWED;
-
-                /* Re-protect W=0 to catch next write */
-                if (entry->flags & WTE_PAGE_IS_PE) {
-                    wte_kvm_set_wp(&gfn, 1);
-                    entry->flags |= WTE_PAGE_W_PROTECTED;
-                }
+                /* W=0 is NOT re-set — page stays W=1, X=1 (released) */
                 return;
             }
         }
