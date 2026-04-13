@@ -66,7 +66,7 @@
 #include "disas/capstone.h"
 
 #ifdef QEMU_NYX
-#define NYX_PT_CPU_MODEL "Intel Core (Haswell)            NYX vCPU (PT)"
+#define NYX_PT_CPU_MODEL "Intel(R) Core(TM) i7-4770 CPU @ 3.40GHz"
 #define NYX_NO_PT_CPU_MODEL "Intel Core (Haswell)            NYX vCPU (NO-PT)"
 #endif
 
