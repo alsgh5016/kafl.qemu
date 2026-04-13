@@ -897,20 +897,20 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
             dump_full_process_memory(cpu, env, wte_label, &evt, 0);
         }
 
-        /* Post-detection: update baseline, re-protect for next layer */
+        /* Post-detection: update baseline, allow execution.
+         * Do NOT re-protect W=0 — the full process dump already captures
+         * all pages.  Re-protecting W=0 causes infinite WtE loops on
+         * VM-based protectors (Themida) whose dispatcher repeatedly
+         * writes+executes the same page.  Multi-layer unpacking is
+         * detected via WtE on OTHER pages that get written next. */
         memcpy(entry->baseline, entry->current, WTE_PAGE_SIZE);
         entry->flags &= ~WTE_PAGE_WRITTEN;
         entry->write_count = 0;
 
-        /* Allow execution (X=1), re-protect write (W=0) */
+        /* Allow execution (X=1), keep write allowed (W=1) */
         wte_kvm_clear_nx(&gfn, 1);
         entry->flags &= ~WTE_PAGE_X_BLOCKED;
         entry->flags |= WTE_PAGE_X_ALLOWED;
-
-        if (entry->flags & WTE_PAGE_IS_PE) {
-            wte_kvm_set_wp(&gfn, 1);
-            entry->flags |= WTE_PAGE_W_PROTECTED;
-        }
     } else {
         /* Not written — first-time execution (DLL, system code, etc.) */
         entry->flags |= WTE_PAGE_X_ALLOWED;
