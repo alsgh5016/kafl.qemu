@@ -588,10 +588,11 @@ void wte_check_deferred_pages(CPUState *cpu)
                 X86CPU *cpux86 = X86_CPU(cpu);
                 CPUX86State *env = &cpux86->env;
                 char wte_label[128];
+                uint32_t _fs = (uint32_t)env->segs[R_FS].base;
                 snprintf(wte_label, sizeof(wte_label),
-                         "wte_rip0x%lx_va0x%lx",
+                         "wte_rip0x%lx_va0x%lx_tid0x%08x",
                          (unsigned long)entry->last_write_rip,
-                         (unsigned long)entry->va);
+                         (unsigned long)entry->va, _fs);
                 wte_dump_event_t evt = {
                     .type            = "DEFERRED",
                     .rip             = entry->last_write_rip,
@@ -927,10 +928,11 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
             X86CPU *cpux86 = X86_CPU(cpu);
             CPUX86State *env = &cpux86->env;
             char wte_label[128];
+            uint32_t _fs = (uint32_t)env->segs[R_FS].base;
             snprintf(wte_label, sizeof(wte_label),
-                     "wte_rip0x%lx_va0x%lx",
+                     "wte_rip0x%lx_va0x%lx_tid0x%08x",
                      (unsigned long)rip,
-                     (unsigned long)entry->va);
+                     (unsigned long)entry->va, _fs);
             wte_dump_event_t evt = {
                 .type            = "EXEC",
                 .rip             = rip,
