@@ -1249,14 +1249,15 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
             if (seq == 0) {
                 fprintf(tl_f, "# WtE Detection Timeline\n");
                 fprintf(tl_f, "# SEQ  TYPE       RIP         VA          "
-                        "GFN        DIFFS  PAGES_WRITTEN  PAGES_TOTAL  "
+                        "GFN        FS_BASE     DIFFS  PAGES_WRITTEN  PAGES_TOTAL  "
                         "WTE#  LABEL\n");
             }
-            fprintf(tl_f, "%03d  %-9s  0x%08lx  0x%08lx  0x%06lx  %5d  %13d  %11d  "
+            fprintf(tl_f, "%03d  %-9s  0x%08lx  0x%08lx  0x%06lx  0x%08lx  %5d  %13d  %11d  "
                     "#%-4d  %s\n",
                     seq, event->type,
                     (unsigned long)event->rip, (unsigned long)event->va,
-                    (unsigned long)event->gfn, event->diff_count,
+                    (unsigned long)event->gfn, (unsigned long)event->fs_base,
+                    event->diff_count,
                     written_pages, pg_count,
                     event->total_wte_count, label);
             fclose(tl_f);
@@ -2069,6 +2070,7 @@ int handle_kafl_hypercall(struct kvm_run *run,
                 .rip             = setup.image_base,
                 .va              = setup.image_base,
                 .gfn             = 0,
+                .fs_base         = (uint64_t)env->segs[R_FS].base,
                 .diff_count      = 0,
                 .wte_count       = 0,
                 .total_wte_count = 0,

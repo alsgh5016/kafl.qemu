@@ -223,6 +223,8 @@ typedef struct {
     uint64_t    rip;               /* trigger RIP (0 if unknown)     */
     uint64_t    va;                /* target page VA                 */
     uint64_t    gfn;               /* target page GFN                */
+    uint64_t    fs_base;           /* guest FS_BASE (= TEB ptr,
+                                    * unique per thread on Win32)    */
     int         diff_count;        /* byte diffs in target page      */
     int         wte_count;         /* WtE count (this detection #)   */
     int         total_wte_count;   /* total WtE count cumulative     */
