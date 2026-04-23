@@ -1127,10 +1127,22 @@ void wte_scan_dirty_ring(void)
         scan_idx++;
     }
 
+    int total_scanned = scan_idx - wte_state.last_scanned_ring_index;
     wte_state.last_scanned_ring_index = scan_idx;
 
     if (nx_batch_count > 0) {
         wte_kvm_set_nx(nx_batch, nx_batch_count);
+    }
+
+    /* Periodic diagnostic: log every 1000th scan with entries */
+    static int scan_call_count = 0;
+    scan_call_count++;
+    if (total_scanned > 0 && (scan_call_count % 1000 == 1)) {
+        nyx_printf("[WtE][DIRTY-DIAG] scan #%d: %d entries, %d NX applied, "
+                   "dll_filter=%d dll_modules=%d\n",
+                   scan_call_count, total_scanned, nx_batch_count,
+                   wte_state.dll_filter_enabled,
+                   wte_state.dll_module_count);
     }
 }
 
