@@ -566,7 +566,7 @@ void fast_reload_handle_dirty_ring_full(fast_reload_t *self)
     /* WtE: CoW detection before flushing */
     if (wte_is_active()) {
         wte_pt_check(current_cpu);  /* CoW detection via VA→GFN rescan */
-        /* wte_scan_dirty_ring() — disabled: EPT W=0 is primary path */
+        wte_scan_dirty_ring();  /* non-PE dynamic regions (DLL-filtered) */
     }
     if (self->dirty_ring_state) {
         nyx_snapshot_nyx_dirty_ring_flush_and_collect(self->dirty_ring_state,

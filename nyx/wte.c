@@ -1048,7 +1048,35 @@ void wte_scan_dirty_ring(void)
         }
 
         if (!is_pe_gfn) {
-            /* Non-PE dirty page — track it with NX for supplementary WtE */
+            /* Non-PE dirty page — track it with NX for supplementary WtE.
+             * Skip known DLL GFN ranges to avoid massive VM exit overhead
+             * from NX on system DLL pages (the reason this was disabled). */
+            uint64_t gpa_check = gfn << 12;
+
+            /* Heuristic: DLL pages are typically mapped at high GPA ranges
+             * corresponding to system DLL VAs (0x70000000+).  We skip these
+             * to avoid the VM exit storm that caused the original disable.
+             * Dynamic alloc by packers (VirtualAlloc) uses lower GPAs.
+             * Note: GPA != GVA, but for user-mode with identity-ish mapping
+             * in early boot, the GFN range is a reasonable heuristic.
+             * Exec violations on these pages will still be caught by the
+             * DLL filter in wte_handle_exec_violation. */
+            bool skip_as_likely_dll = false;
+            if (wte_state.dll_filter_enabled && wte_state.dll_module_count > 0) {
+                /* Check if this GFN's pseudo-VA falls in any known DLL range */
+                for (int d = 0; d < wte_state.dll_module_count; d++) {
+                    if (gpa_check >= wte_state.dll_modules[d].base &&
+                        gpa_check <  wte_state.dll_modules[d].end) {
+                        skip_as_likely_dll = true;
+                        break;
+                    }
+                }
+            }
+            if (skip_as_likely_dll) {
+                scan_idx++;
+                continue;
+            }
+
             wte_page_entry_t *entry = wte_lookup_gfn(gfn);
             if (!entry) {
                 /* New non-PE dirty page — we don't know the VA,

@@ -356,7 +356,7 @@ void handle_hypercall_kafl_release(struct kvm_run *run,
             if (wte_is_active()) {
                 /* WtE: final CoW detection */
                 wte_pt_check(cpu);      /* CoW detection */
-                /* wte_scan_dirty_ring() — disabled: EPT W=0 is primary path */
+                wte_scan_dirty_ring();  /* non-PE dynamic regions (DLL-filtered) */
 
                 /* Temporarily disable reload mode to prevent perform_reload()
                  * from restoring the snapshot. The harness will call habort()

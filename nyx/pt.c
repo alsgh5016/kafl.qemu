@@ -432,9 +432,7 @@ void pt_handle_overflow(CPUState *cpu)
          * can find freshly written pages during overflow decoding. */
         if (wte_is_active()) {
             wte_pt_check(cpu);      /* CoW detection via VA→GFN rescan */
-            /* wte_scan_dirty_ring() — disabled: sets NX on all dirty
-             * pages (including DLLs), causing massive VM exit overhead.
-             * EPT W=0 on PE pages is the primary write detection path. */
+            wte_scan_dirty_ring();  /* non-PE dynamic regions (DLL-filtered) */
             wte_get_state()->overflow_count++;
             nyx_printf("[WtE][OVF] PT overflow #%lu, %d bytes\n",
                        (unsigned long)wte_get_state()->overflow_count, overflow);
