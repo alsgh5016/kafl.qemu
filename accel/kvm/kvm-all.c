@@ -2534,14 +2534,15 @@ int kvm_cpu_exec(CPUState *cpu)
             run->exit_reason != KVM_EXIT_KAFL_WTE &&
             run->exit_reason != KVM_EXIT_KAFL_MTF) {
             wte_check_deferred_pages(cpu);
-            wte_scan_dirty_ring();
+            /* wte_scan_dirty_ring() — disabled: applies NX to ALL
+             * dirty non-PE pages including DLLs (dll_modules=0 at
+             * startup). Causes NX storm → Broken pipe before
+             * Nyx handshake completes. */
 
-            /* Periodic re-scan of target page table to NX newly
-             * allocated pages (e.g., amber VirtualAlloc after resume).
-             * Guest PT walk is ~100 reads — acceptable every 500 exits.
-             * This is the ONLY mechanism for dynamic region NX since
-             * KVM auto-NX (tdp_mmu) can't distinguish user/kernel pages
-             * on non-KPTI Windows (shared CR3). */
+            /* Periodic re-scan: the ONLY mechanism for dynamic
+             * region NX.  Walks guest PT so only user VA pages
+             * are affected.  wte_kvm_set_nx sets both bitmap +
+             * SPTE, so KVM violation handler works correctly. */
             {
                 static uint64_t vm_exit_counter = 0;
                 vm_exit_counter++;
