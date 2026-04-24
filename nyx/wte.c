@@ -592,12 +592,24 @@ void wte_rescan_user_pages(CPUState *cpu)
                     if (va >= wte_state.pe_base_va &&
                         va < wte_state.pe_end_va) continue;
                     uint64_t gfn = (page_phys + ((uint64_t)k << 12)) >> 12;
+                    uint64_t gpa = gfn << 12;
 
                     /* Skip if already tracked */
                     wte_page_entry_t *entry = wte_lookup_gfn(gfn);
                     if (entry && (entry->flags & (WTE_PAGE_X_BLOCKED |
                                                   WTE_PAGE_X_ALLOWED)))
                         continue;
+
+                    /* Create tracking entry so exec handler finds it */
+                    if (!entry) {
+                        entry = wte_lookup_or_create_va((uint64_t)va, gfn);
+                        entry->gpa = gpa;
+                        entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_WRITTEN;
+                        cpu_physical_memory_read(gpa, entry->baseline, WTE_PAGE_SIZE);
+                        entry->baseline_valid = true;
+                        memcpy(entry->current, entry->baseline, WTE_PAGE_SIZE);
+                    }
+                    entry->flags |= WTE_PAGE_X_BLOCKED;
 
                     nx_batch[nx_count++] = gfn;
                     new_nx++;
@@ -622,11 +634,23 @@ void wte_rescan_user_pages(CPUState *cpu)
                     if (va >= wte_state.pe_base_va &&
                         va < wte_state.pe_end_va) continue;
                     uint64_t gfn = (pte & 0x000FFFFFFFFFF000ULL) >> 12;
+                    uint64_t gpa = gfn << 12;
 
                     wte_page_entry_t *entry = wte_lookup_gfn(gfn);
                     if (entry && (entry->flags & (WTE_PAGE_X_BLOCKED |
                                                   WTE_PAGE_X_ALLOWED)))
                         continue;
+
+                    /* Create tracking entry so exec handler finds it */
+                    if (!entry) {
+                        entry = wte_lookup_or_create_va((uint64_t)va, gfn);
+                        entry->gpa = gpa;
+                        entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_WRITTEN;
+                        cpu_physical_memory_read(gpa, entry->baseline, WTE_PAGE_SIZE);
+                        entry->baseline_valid = true;
+                        memcpy(entry->current, entry->baseline, WTE_PAGE_SIZE);
+                    }
+                    entry->flags |= WTE_PAGE_X_BLOCKED;
 
                     nx_batch[nx_count++] = gfn;
                     new_nx++;
