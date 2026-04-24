@@ -430,6 +430,112 @@ void wte_protect_pe_range(CPUState *cpu, uint64_t image_base,
                mapped, unmapped, wte_state.pe_page_count);
 }
 
+/* ── Global NX: set X=0 on ALL mapped user pages (non-PE) ────────
+ *
+ * Walk target CR3 page tables and set NX on every user-space page
+ * that is NOT already PE-protected.  This catches dynamically
+ * allocated regions (e.g., amber packer's VirtualAlloc'd buffer)
+ * without relying on dirty ring timing.
+ *
+ * When exec violation fires on these pages:
+ *   - DLL pages → allowed by DLL filter (wte_is_dll_rip)
+ *   - Dynamic unpack regions → DYN-EXEC path → WtE detection
+ */
+void wte_protect_all_user_pages(CPUState *cpu, uint64_t cr3)
+{
+    uint64_t pml4_base = cr3 & 0x000FFFFFFFFFF000ULL;
+    uint64_t pml4_table[512];
+    cpu_physical_memory_read(pml4_base, pml4_table, 4096);
+
+    uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
+    int nx_count = 0;
+    int total_nx = 0, skipped_pe = 0;
+
+    /* PML4[0] covers user-space VA 0x000000000000 - 0x007FFFFFFFFFFF */
+    uint64_t pml4e = pml4_table[0];
+    if (!(pml4e & 1)) {
+        nyx_printf("[WtE][GLOBAL-NX] PML4[0] not present, skip\n");
+        return;
+    }
+
+    uint64_t pdpt_base = pml4e & 0x000FFFFFFFFFF000ULL;
+    uint64_t pdpt_table[512];
+    cpu_physical_memory_read(pdpt_base, pdpt_table, 4096);
+
+    /* PDPT[0..1] covers VA 0x00000000 - 0x7FFFFFFF (32-bit user space) */
+    for (int pdpte_idx = 0; pdpte_idx < 2; pdpte_idx++) {
+        uint64_t pdpte = pdpt_table[pdpte_idx];
+        if (!(pdpte & 1)) continue;
+        if (pdpte & (1ULL << 7)) continue; /* 1GB huge page */
+
+        uint64_t pd_base = pdpte & 0x000FFFFFFFFFF000ULL;
+        uint64_t pd_table[512];
+        cpu_physical_memory_read(pd_base, pd_table, 4096);
+
+        for (int pde_idx = 0; pde_idx < 512; pde_idx++) {
+            uint64_t pde = pd_table[pde_idx];
+            if (!(pde & 1)) continue;
+
+            if (pde & (1ULL << 7)) {
+                /* 2MB huge page → split into 512 × 4KB for NX */
+                uint64_t page_phys = pde & 0x000FFFFFFFE00000ULL;
+                uint32_t base_va = ((uint32_t)pdpte_idx << 30) |
+                                   ((uint32_t)pde_idx << 21);
+                for (int k = 0; k < 512; k++) {
+                    uint32_t va = base_va + ((uint32_t)k << 12);
+                    if (va < 0x10000 || va >= 0x7FFF0000) continue;
+                    uint64_t gfn = (page_phys + ((uint64_t)k << 12)) >> 12;
+
+                    /* Skip PE pages (already W=0+X=0) */
+                    bool is_pe = (va >= wte_state.pe_base_va &&
+                                  va < wte_state.pe_end_va);
+                    if (is_pe) { skipped_pe++; continue; }
+
+                    nx_batch[nx_count++] = gfn;
+                    total_nx++;
+                    if (nx_count >= WTE_MAX_BATCH_GFNS) {
+                        wte_kvm_set_nx(nx_batch, nx_count);
+                        nx_count = 0;
+                    }
+                }
+            } else {
+                /* 4KB page table */
+                uint64_t pt_base = pde & 0x000FFFFFFFFFF000ULL;
+                uint64_t pt_table[512];
+                cpu_physical_memory_read(pt_base, pt_table, 4096);
+
+                for (int pte_idx = 0; pte_idx < 512; pte_idx++) {
+                    uint64_t pte = pt_table[pte_idx];
+                    if (!(pte & 1)) continue;
+
+                    uint32_t va = ((uint32_t)pdpte_idx << 30) |
+                                  ((uint32_t)pde_idx << 21) |
+                                  ((uint32_t)pte_idx << 12);
+                    if (va < 0x10000 || va >= 0x7FFF0000) continue;
+
+                    uint64_t gfn = (pte & 0x000FFFFFFFFFF000ULL) >> 12;
+
+                    bool is_pe = (va >= wte_state.pe_base_va &&
+                                  va < wte_state.pe_end_va);
+                    if (is_pe) { skipped_pe++; continue; }
+
+                    nx_batch[nx_count++] = gfn;
+                    total_nx++;
+                    if (nx_count >= WTE_MAX_BATCH_GFNS) {
+                        wte_kvm_set_nx(nx_batch, nx_count);
+                        nx_count = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    if (nx_count > 0) wte_kvm_set_nx(nx_batch, nx_count);
+
+    nyx_printf("[WtE][GLOBAL-NX] Set X=0 on %d non-PE user pages "
+               "(%d PE pages skipped)\n", total_nx, skipped_pe);
+}
+
 /* ── Write Violation Handler (EPT W=0) ────────────────────────── */
 
 void wte_handle_write_violation(uint64_t gfn, uint64_t gpa,

@@ -180,6 +180,10 @@ void wte_handle_mtf(CPUState *cpu);
 void wte_protect_pe_range(CPUState *cpu, uint64_t image_base,
                           uint64_t image_size, uint64_t cr3);
 
+/* Global NX: set X=0 on all mapped user pages (non-PE) for
+ * dynamic region detection (amber-style packers) */
+void wte_protect_all_user_pages(CPUState *cpu, uint64_t cr3);
+
 /* Dirty ring scan for non-PE pages (supplementary legacy path) */
 void wte_scan_dirty_ring(void);
 
