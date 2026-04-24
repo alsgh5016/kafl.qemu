@@ -881,6 +881,9 @@ void wte_check_deferred_pages(CPUState *cpu)
                 dump_full_process_memory(cpu, env, wte_label, &evt, 0);
             }
 
+            /* Rescan after deferred WtE dump too */
+            wte_rescan_user_pages(cpu);
+
             /* Update baseline for next change detection */
             memcpy(entry->baseline, entry->current, WTE_PAGE_SIZE);
         }
@@ -1220,6 +1223,12 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
             };
             dump_full_process_memory(cpu, env, wte_label, &evt, 0);
         }
+
+        /* Rescan PT after each WtE dump to NX newly allocated pages.
+         * Amber's stub triggers WtE → at that moment, VirtualAlloc'd
+         * regions are already mapped → rescan catches them → NX set
+         * → next exec (OEP) triggers violation. */
+        wte_rescan_user_pages(cpu);
 
         /* Post-detection: update baseline, re-protect for next layer.
          * RIP-in-diff check above prevents tight loops on VM dispatchers,
