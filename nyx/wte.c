@@ -569,6 +569,9 @@ void wte_rescan_user_pages(CPUState *cpu)
     uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
     int nx_count = 0;
     int new_nx = 0;
+    static int rescan_call_count = 0;
+    static int total_user_pages_seen = 0;
+    rescan_call_count++;
 
     for (int pdpte_idx = 0; pdpte_idx < 2; pdpte_idx++) {
         uint64_t pdpte = pdpt_table[pdpte_idx];
@@ -655,6 +658,15 @@ void wte_rescan_user_pages(CPUState *cpu)
                         memset(entry->baseline, 0, WTE_PAGE_SIZE);
                         entry->baseline_valid = true;
                         cpu_physical_memory_read(gpa, entry->current, WTE_PAGE_SIZE);
+
+                        /* Per-page diagnostic for dynamic region */
+                        if ((va >= 0x7f900000 && va < 0x7fc00000) ||
+                            (va >= 0x7fd00000 && va < 0x7ff00000)) {
+                            nyx_printf("[WtE][RESCAN-PAGE] NEW VA=0x%x "
+                                       "GFN=0x%lx (rescan #%d)\n",
+                                       va, (unsigned long)gfn,
+                                       rescan_call_count);
+                        }
                     }
                     entry->flags |= WTE_PAGE_X_BLOCKED;
 
@@ -671,9 +683,6 @@ void wte_rescan_user_pages(CPUState *cpu)
 
     if (nx_count > 0) wte_kvm_set_nx(nx_batch, nx_count);
 
-    static int rescan_call_count = 0;
-    static int total_user_pages_seen = 0;
-    rescan_call_count++;
     total_user_pages_seen += new_nx;
 
     if (new_nx > 0) {
