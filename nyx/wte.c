@@ -600,14 +600,19 @@ void wte_rescan_user_pages(CPUState *cpu)
                                                   WTE_PAGE_X_ALLOWED)))
                         continue;
 
-                    /* Create tracking entry so exec handler finds it */
+                    /* Create tracking entry so exec handler finds it.
+                     * Baseline is zeroed (not read from memory) because
+                     * the page was dynamically allocated — any non-zero
+                     * content means "written by packer" and should trigger
+                     * WtE detection. Reading baseline = current would make
+                     * diff_count = 0, silently allowing execution. */
                     if (!entry) {
                         entry = wte_lookup_or_create_va((uint64_t)va, gfn);
                         entry->gpa = gpa;
                         entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_WRITTEN;
-                        cpu_physical_memory_read(gpa, entry->baseline, WTE_PAGE_SIZE);
+                        memset(entry->baseline, 0, WTE_PAGE_SIZE);
                         entry->baseline_valid = true;
-                        memcpy(entry->current, entry->baseline, WTE_PAGE_SIZE);
+                        cpu_physical_memory_read(gpa, entry->current, WTE_PAGE_SIZE);
                     }
                     entry->flags |= WTE_PAGE_X_BLOCKED;
 
@@ -641,14 +646,13 @@ void wte_rescan_user_pages(CPUState *cpu)
                                                   WTE_PAGE_X_ALLOWED)))
                         continue;
 
-                    /* Create tracking entry so exec handler finds it */
                     if (!entry) {
                         entry = wte_lookup_or_create_va((uint64_t)va, gfn);
                         entry->gpa = gpa;
                         entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_WRITTEN;
-                        cpu_physical_memory_read(gpa, entry->baseline, WTE_PAGE_SIZE);
+                        memset(entry->baseline, 0, WTE_PAGE_SIZE);
                         entry->baseline_valid = true;
-                        memcpy(entry->current, entry->baseline, WTE_PAGE_SIZE);
+                        cpu_physical_memory_read(gpa, entry->current, WTE_PAGE_SIZE);
                     }
                     entry->flags |= WTE_PAGE_X_BLOCKED;
 
