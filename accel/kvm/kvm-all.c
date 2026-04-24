@@ -2534,11 +2534,18 @@ int kvm_cpu_exec(CPUState *cpu)
             run->exit_reason != KVM_EXIT_KAFL_WTE &&
             run->exit_reason != KVM_EXIT_KAFL_MTF) {
             wte_check_deferred_pages(cpu);
-            /* Scan dirty ring for non-PE writes and apply NX on new
-             * dynamic regions.  This must run at every VM exit so that
-             * NX is set BEFORE the guest can execute newly written pages
-             * (e.g., amber packer's VirtualAlloc'd unpack buffer). */
             wte_scan_dirty_ring();
+
+            /* Periodic re-scan of target page table to NX newly
+             * allocated pages (e.g., amber VirtualAlloc after resume).
+             * Full PT walk is expensive, so only every N VM exits. */
+            {
+                static uint64_t vm_exit_counter = 0;
+                vm_exit_counter++;
+                if ((vm_exit_counter % 5000) == 0) {
+                    wte_rescan_user_pages(cpu);
+                }
+            }
         }
 // clang-format off
 #endif

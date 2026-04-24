@@ -184,6 +184,9 @@ void wte_protect_pe_range(CPUState *cpu, uint64_t image_base,
  * dynamic region detection (amber-style packers) */
 void wte_protect_all_user_pages(CPUState *cpu, uint64_t cr3);
 
+/* Periodic re-scan: NX newly allocated pages since last scan */
+void wte_rescan_user_pages(CPUState *cpu);
+
 /* Dirty ring scan for non-PE pages (supplementary legacy path) */
 void wte_scan_dirty_ring(void);
 
