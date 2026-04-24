@@ -2538,11 +2538,14 @@ int kvm_cpu_exec(CPUState *cpu)
 
             /* Periodic re-scan of target page table to NX newly
              * allocated pages (e.g., amber VirtualAlloc after resume).
-             * Full PT walk is expensive, so only every N VM exits. */
+             * Guest PT walk is ~100 reads — acceptable every 500 exits.
+             * This is the ONLY mechanism for dynamic region NX since
+             * KVM auto-NX (tdp_mmu) can't distinguish user/kernel pages
+             * on non-KPTI Windows (shared CR3). */
             {
                 static uint64_t vm_exit_counter = 0;
                 vm_exit_counter++;
-                if ((vm_exit_counter % 5000) == 0) {
+                if ((vm_exit_counter % 500) == 0) {
                     wte_rescan_user_pages(cpu);
                 }
             }
