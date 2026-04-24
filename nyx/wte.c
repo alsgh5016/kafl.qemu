@@ -682,25 +682,23 @@ void wte_rescan_user_pages(CPUState *cpu)
                    rescan_call_count, new_nx, total_user_pages_seen);
     }
 
-    /* Diagnostic: check if specific VA ranges are in guest PT.
-     * Log every 100th rescan to avoid flooding. */
+    /* Diagnostic: count all dynamic (non-PE) tracked pages */
     if ((rescan_call_count % 100) == 1) {
-        /* Check 0x7fd80000-0x7fda0000 range (amber's typical alloc) */
-        int amber_found = 0, amber_tracked = 0;
-        for (uint32_t va = 0x7fd80000; va < 0x7fda0000; va += WTE_PAGE_SIZE) {
-            uint64_t pa = get_paging_phys_addr(cpu, cr3, va);
-            if (pa != 0xFFFFFFFFFFFFFFFFULL && pa != 0) {
-                amber_found++;
-                uint64_t gfn = pa >> 12;
-                wte_page_entry_t *e = wte_lookup_gfn(gfn);
-                if (e && (e->flags & (WTE_PAGE_X_BLOCKED | WTE_PAGE_X_ALLOWED)))
-                    amber_tracked++;
-            }
+        int dyn_total = 0, dyn_blocked = 0, dyn_allowed = 0;
+        GHashTableIter diag_iter;
+        gpointer dkey, dval;
+        g_hash_table_iter_init(&diag_iter, wte_state.page_table);
+        while (g_hash_table_iter_next(&diag_iter, &dkey, &dval)) {
+            wte_page_entry_t *e = dval;
+            if (!(e->flags & WTE_PAGE_IS_DYNAMIC)) continue;
+            dyn_total++;
+            if (e->flags & WTE_PAGE_X_BLOCKED) dyn_blocked++;
+            if (e->flags & WTE_PAGE_X_ALLOWED) dyn_allowed++;
         }
-        if (amber_found > 0) {
-            nyx_printf("[WtE][RESCAN-DIAG] #%d: 0x7fd80000-0x7fda0000: "
-                       "%d mapped, %d tracked\n",
-                       rescan_call_count, amber_found, amber_tracked);
+        if (dyn_total > 0) {
+            nyx_printf("[WtE][RESCAN-DIAG] #%d: dynamic pages: "
+                       "%d total, %d NX-blocked, %d allowed\n",
+                       rescan_call_count, dyn_total, dyn_blocked, dyn_allowed);
         }
     }
 }
