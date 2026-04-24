@@ -671,11 +671,38 @@ void wte_rescan_user_pages(CPUState *cpu)
 
     if (nx_count > 0) wte_kvm_set_nx(nx_batch, nx_count);
 
+    static int rescan_call_count = 0;
+    static int total_user_pages_seen = 0;
+    rescan_call_count++;
+    total_user_pages_seen += new_nx;
+
     if (new_nx > 0) {
-        nyx_printf("[WtE][RESCAN] NX applied to %d new user pages\n", new_nx);
+        nyx_printf("[WtE][RESCAN] #%d: NX applied to %d new user pages "
+                   "(total tracked: %d)\n",
+                   rescan_call_count, new_nx, total_user_pages_seen);
     }
-    /* PT IP filter is now set to full user VA (0x10000-0x7FFE0000)
-     * by the harness, so no dynamic PT range update needed here. */
+
+    /* Diagnostic: check if specific VA ranges are in guest PT.
+     * Log every 100th rescan to avoid flooding. */
+    if ((rescan_call_count % 100) == 1) {
+        /* Check 0x7fd80000-0x7fda0000 range (amber's typical alloc) */
+        int amber_found = 0, amber_tracked = 0;
+        for (uint32_t va = 0x7fd80000; va < 0x7fda0000; va += WTE_PAGE_SIZE) {
+            uint64_t pa = get_paging_phys_addr(cpu, cr3, va);
+            if (pa != 0xFFFFFFFFFFFFFFFFULL && pa != 0) {
+                amber_found++;
+                uint64_t gfn = pa >> 12;
+                wte_page_entry_t *e = wte_lookup_gfn(gfn);
+                if (e && (e->flags & (WTE_PAGE_X_BLOCKED | WTE_PAGE_X_ALLOWED)))
+                    amber_tracked++;
+            }
+        }
+        if (amber_found > 0) {
+            nyx_printf("[WtE][RESCAN-DIAG] #%d: 0x7fd80000-0x7fda0000: "
+                       "%d mapped, %d tracked\n",
+                       rescan_call_count, amber_found, amber_tracked);
+        }
+    }
 }
 
 /* ── Write Violation Handler (EPT W=0) ────────────────────────── */
