@@ -2053,10 +2053,11 @@ int handle_kafl_hypercall(struct kvm_run *run,
                        (unsigned long)(setup.image_base + setup.image_size));
         }
 
-        /* Step 5: Global NX — set X=0 on all non-PE user pages.
-         * Catches dynamically allocated regions (amber VirtualAlloc)
-         * without relying on dirty ring timing. */
-        wte_protect_all_user_pages(cpu, child_cr3);
+        /* Step 5: Dynamic region NX is handled by periodic rescan
+         * (wte_rescan_user_pages in kvm-all.c VM exit loop) AFTER
+         * the Nyx handshake completes. Setting NX here at WTE_SETUP
+         * causes NX violation storm on DLL pages before handshake,
+         * crashing QEMU with 'Broken pipe'. */
 
         /* Step 6: Diagnostic — map target PE VA→GFN for tracking */
         if (setup.image_base != 0 && setup.image_size != 0) {
