@@ -32,6 +32,8 @@
 
 #include "nyx/snapshot/memory/backend/nyx_dirty_ring.h"
 #include "nyx/fast_vm_reload.h"
+#include "nyx/pt.h"
+#include "nyx/hypercall/hypercall.h"
 
 #include "target/i386/cpu.h"
 
@@ -671,6 +673,46 @@ void wte_rescan_user_pages(CPUState *cpu)
 
     if (new_nx > 0) {
         nyx_printf("[WtE][RESCAN] NX applied to %d new user pages\n", new_nx);
+    }
+
+    /* Update PT IP filter range 1 to cover dynamic (non-PE, non-DLL)
+     * regions discovered by this rescan.  Find min/max VA of dynamic
+     * entries and configure PT ADDR1 to capture them.
+     * DLL pages (VA >= 0x70000000) are excluded to avoid DLL noise. */
+    {
+        uint64_t dyn_min = UINT64_MAX, dyn_max = 0;
+        GHashTableIter iter;
+        gpointer key, value;
+        g_hash_table_iter_init(&iter, wte_state.page_table);
+        while (g_hash_table_iter_next(&iter, &key, &value)) {
+            wte_page_entry_t *e = value;
+            if (!(e->flags & WTE_PAGE_IS_DYNAMIC)) continue;
+            /* Include ALL dynamic pages in PT range — amber allocates
+             * original code at DLL-like addresses (0x7FD8xxxx).
+             * DLL filtering is done at exec handler level, not here. */
+            if (e->va < wte_state.pe_base_va ||
+                e->va >= wte_state.pe_end_va) {
+                if (e->va < dyn_min) dyn_min = e->va;
+                if (e->va + WTE_PAGE_SIZE > dyn_max)
+                    dyn_max = e->va + WTE_PAGE_SIZE;
+            }
+        }
+        if (dyn_min < dyn_max) {
+            static uint64_t last_pt_dyn_a = 0, last_pt_dyn_b = 0;
+            if (dyn_min != last_pt_dyn_a || dyn_max != last_pt_dyn_b) {
+                pt_setup_ip_filters(1, dyn_min, dyn_max);
+                /* Enable range 1 — pt_cmd runs at next KVM_RUN */
+                int r = pt_enable_ip_filtering_live(cpu, 1);
+                if (r == 0) {
+                    last_pt_dyn_a = dyn_min;
+                    last_pt_dyn_b = dyn_max;
+                    nyx_printf("[WtE][PT-RANGE] Dynamic PT filter 1: "
+                               "0x%lx - 0x%lx\n",
+                               (unsigned long)dyn_min,
+                               (unsigned long)dyn_max);
+                }
+            }
+        }
     }
 }
 

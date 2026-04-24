@@ -177,6 +177,30 @@ int pt_set_cr3(CPUState *cpu, uint64_t val, bool hmp_mode)
     return r;
 }
 
+/* Live IP filter update: can be called while PT is already enabled.
+ * Used by WtE rescan to add dynamic region filters mid-trace.
+ * Intel PT ADDR filters can be modified while tracing — the change
+ * takes effect at the next packet boundary. */
+int pt_enable_ip_filtering_live(CPUState *cpu, uint8_t addrn)
+{
+    if (addrn > 3) return -1;
+
+    if (GET_GLOBAL_STATE()->pt_ip_filter_a[addrn] >
+        GET_GLOBAL_STATE()->pt_ip_filter_b[addrn])
+        return -EINVAL;
+
+    if (!GET_GLOBAL_STATE()->pt_ip_filter_configured[addrn] ||
+        GET_GLOBAL_STATE()->pt_ip_filter_a[addrn] == 0 ||
+        GET_GLOBAL_STATE()->pt_ip_filter_b[addrn] == 0)
+        return -EINVAL;
+
+    int r = 0;
+    r += pt_cmd(cpu, KVM_VMX_PT_CONFIGURE_ADDR0 + addrn, false);
+    r += pt_cmd(cpu, KVM_VMX_PT_ENABLE_ADDR0 + addrn, false);
+    GET_GLOBAL_STATE()->pt_ip_filter_enabled[addrn] = true;
+    return r;
+}
+
 int pt_enable_ip_filtering(CPUState *cpu, uint8_t addrn, bool redqueen, bool hmp_mode)
 {
     int r = 0;
