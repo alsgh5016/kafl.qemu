@@ -2546,7 +2546,7 @@ int kvm_cpu_exec(CPUState *cpu)
             {
                 static uint64_t vm_exit_counter = 0;
                 vm_exit_counter++;
-                if ((vm_exit_counter % 500) == 0) {
+                if ((vm_exit_counter % 50) == 0) {
                     wte_rescan_user_pages(cpu);
                 }
             }
