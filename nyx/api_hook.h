@@ -24,37 +24,37 @@
 
 typedef enum {
     NYX_HOOK_NONE = 0,
-    NYX_HOOK_LDR_LOAD_DLL_ENTRY,
-    NYX_HOOK_NT_ALLOCATE_VM_ENTRY,
-    NYX_HOOK_NT_PROTECT_VM_ENTRY,
-    NYX_HOOK_NT_MAP_VIEW_ENTRY,
-    /* Return-side hooks share IDs in the same enum, dynamically packed
-     * with a stack frame index to disambiguate concurrent calls. */
-    NYX_HOOK_RETURN_BASE = 0x10000,
+    NYX_HOOK_LDR_LOAD_DLL_ENTRY      = 1,
+    NYX_HOOK_NT_ALLOCATE_VM_ENTRY    = 2,
+    NYX_HOOK_NT_PROTECT_VM_ENTRY     = 3,
+    NYX_HOOK_NT_MAP_VIEW_ENTRY       = 4,
 } nyx_hook_kind_t;
 
-/* Build hook_id for return one-shot: (RETURN_BASE + slot_index) packed
- * with a 32-bit nonce so we can detect mismatches.  Layout:
- *   bits  0..15 = slot_index (0..63)
- *   bits 16..31 = entry_kind (NYX_HOOK_*_ENTRY)
- *   bits 32..63 = nonce
+/* hook_id layout
+ *   bit 63       : RETURN flag (1 = return one-shot, 0 = entry)
+ *   bits 32..62  : nonce (re-use detection across snapshot)
+ *   bits 24..31  : (reserved)
+ *   bits 16..23  : entry_kind (1..4)
+ *   bits  0..15  : pending-stack slot index
+ *
+ * ENTRY hook_id is just nyx_hook_kind_t value (1..4) — bit 63 = 0.
  */
+#define NYX_HOOK_ID_RETURN_FLAG  (1ULL << 63)
+
 static inline uint64_t nyx_hook_id_make_return(uint16_t slot_idx,
                                                uint16_t entry_kind,
                                                uint32_t nonce)
 {
-    return (uint64_t)NYX_HOOK_RETURN_BASE
-         | ((uint64_t)slot_idx & 0xFFFFULL)
-         | (((uint64_t)entry_kind & 0xFFFFULL) << 16)
+    return NYX_HOOK_ID_RETURN_FLAG
+         | ((uint64_t)slot_idx   & 0xFFFFULL)
+         | (((uint64_t)entry_kind & 0xFFULL) << 16)
          | ((uint64_t)nonce << 32);
 }
 
-static inline bool nyx_hook_id_is_return(uint64_t hook_id)
-{
-    return (hook_id & ~0xFFFFFFFFFFFFULL) ==
-           ((uint64_t)NYX_HOOK_RETURN_BASE & ~0xFFFFFFFFFFFFULL)
-        || (hook_id & NYX_HOOK_RETURN_BASE) == NYX_HOOK_RETURN_BASE;
-}
+static inline bool     nyx_hook_id_is_return    (uint64_t id) { return (id & NYX_HOOK_ID_RETURN_FLAG) != 0; }
+static inline uint16_t nyx_hook_id_return_slot  (uint64_t id) { return (uint16_t)(id & 0xFFFFULL); }
+static inline uint16_t nyx_hook_id_return_kind  (uint64_t id) { return (uint16_t)((id >> 16) & 0xFFULL); }
+static inline uint32_t nyx_hook_id_return_nonce (uint64_t id) { return (uint32_t)(id >> 32); }
 
 /* ── Pending call tracking (LIFO by RSP) ──────────────────────── */
 

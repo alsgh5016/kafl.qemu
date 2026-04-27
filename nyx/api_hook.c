@@ -13,6 +13,8 @@
 
 #include <linux/kvm.h>
 
+#include "target/i386/cpu.h"
+
 #include "nyx/api_hook.h"
 #include "nyx/wte.h"
 #include "nyx/memory_access.h"
@@ -278,18 +280,321 @@ int nyx_api_hook_install(CPUState *cpu, uint64_t ntdll_base, bool is_64bit)
     return total;
 }
 
-/* ── Dispatch (Phase 3 will fill these) ───────────────────────── */
+/* ── Stack/arg helpers (32-bit guest, stdcall) ────────────────── */
+
+static bool read_guest_u32(CPUState *cpu, uint64_t va, uint32_t *out)
+{
+    return read_virtual_memory(va, (uint8_t *)out, 4, cpu);
+}
+
+/* stdcall: [ESP+0]=RetAddr, [ESP+4]=arg1, [ESP+8]=arg2, ...
+ * idx is 0-based for the first argument. */
+static bool read_stack_arg32(CPUState *cpu, uint64_t esp, int idx, uint32_t *out)
+{
+    return read_guest_u32(cpu, esp + 4ULL * (idx + 1), out);
+}
+
+/* ── Pending stack ────────────────────────────────────────────── */
+
+static int pending_alloc_slot(void)
+{
+    /* Find a free slot first (holes from out-of-order returns). */
+    for (int i = 0; i < NYX_PENDING_MAX; i++) {
+        if (!g_state.pending[i].in_use) {
+            if (i + 1 > g_state.pending_count)
+                g_state.pending_count = i + 1;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void pending_free_slot(int slot)
+{
+    if (slot < 0 || slot >= NYX_PENDING_MAX) return;
+    g_state.pending[slot].in_use = false;
+    /* Compact pending_count from the top. */
+    while (g_state.pending_count > 0 &&
+           !g_state.pending[g_state.pending_count - 1].in_use) {
+        g_state.pending_count--;
+    }
+}
+
+/* ── Return-hook registration ─────────────────────────────────── */
+
+static int register_return_hook(CPUState *cpu, uint64_t return_addr,
+                                uint64_t hook_id)
+{
+    uint64_t cr3 = wte_get_state()->target_cr3;
+    uint64_t pa  = get_paging_phys_addr(cpu, cr3, return_addr);
+    if (pa == 0xFFFFFFFFFFFFFFFFULL || pa == 0) {
+        nyx_printf("[NYX-HOOK] return_addr=0x%lx not mapped (skip)\n",
+                   (unsigned long)return_addr);
+        return -1;
+    }
+    uint64_t gfn = pa >> 12;
+
+    int rc = wte_kvm_set_nx(&gfn, 1);
+    if (rc < 0) {
+        nyx_printf("[NYX-HOOK] return: NX fail gfn=0x%lx ret=%d\n",
+                   (unsigned long)gfn, rc);
+        return rc;
+    }
+    return nyx_api_hook_kvm_add(return_addr, gfn, hook_id);
+}
+
+/* ── ENTRY: capture args, push pending, arm return hook ───────── */
+
+static void on_entry_hit(CPUState *cpu, nyx_hook_kind_t kind, uint64_t rip)
+{
+    X86CPU      *cpux86 = X86_CPU(cpu);
+    CPUX86State *env    = &cpux86->env;
+    uint64_t     esp    = env->regs[R_ESP] & 0xFFFFFFFFULL;
+
+    uint32_t ret_addr_32 = 0;
+    if (!read_guest_u32(cpu, esp, &ret_addr_32)) {
+        nyx_printf("[NYX-HOOK] ENTRY kind=%d: cannot read return addr (ESP=0x%lx)\n",
+                   (int)kind, (unsigned long)esp);
+        return;
+    }
+
+    int slot = pending_alloc_slot();
+    if (slot < 0) {
+        nyx_printf("[NYX-HOOK] ENTRY kind=%d: pending stack full (%d slots)\n",
+                   (int)kind, NYX_PENDING_MAX);
+        return;
+    }
+    nyx_pending_call_t *p = &g_state.pending[slot];
+    memset(p, 0, sizeof(*p));
+    p->in_use      = true;
+    p->slot_idx    = (uint16_t)slot;
+    p->nonce       = g_state.next_nonce++;
+    p->entry_kind  = kind;
+    p->entry_rip   = rip;
+    p->entry_rsp   = esp;
+    p->return_addr = (uint64_t)ret_addr_32;
+
+    /* Capture per-function args from stdcall stack. */
+    uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0;
+    switch (kind) {
+    case NYX_HOOK_LDR_LOAD_DLL_ENTRY:
+        /* (PWSTR Path, PULONG Flags, PUNICODE_STRING ModuleFileName, PHANDLE Module) */
+        read_stack_arg32(cpu, esp, 0, &a0);
+        read_stack_arg32(cpu, esp, 1, &a1);
+        read_stack_arg32(cpu, esp, 2, &a2);
+        read_stack_arg32(cpu, esp, 3, &a3);
+        p->args.ldr.module_handle_out = a3;
+        p->args.ldr.flags             = a1;
+        p->args.ldr.name_unicode_str  = a2;
+        p->args.ldr.handle_ptr        = a3;
+        break;
+    case NYX_HOOK_NT_ALLOCATE_VM_ENTRY:
+        /* (HANDLE, PVOID *Base, ULONG ZeroBits, PSIZE_T RegionSize, ULONG AllocType, ULONG Protect) */
+        read_stack_arg32(cpu, esp, 0, &a0);
+        read_stack_arg32(cpu, esp, 1, &a1);
+        read_stack_arg32(cpu, esp, 2, &a2);
+        read_stack_arg32(cpu, esp, 3, &a3);
+        read_stack_arg32(cpu, esp, 4, &a4);
+        read_stack_arg32(cpu, esp, 5, &a5);
+        p->args.alloc.process_handle = a0;
+        p->args.alloc.base_ptr       = a1;
+        p->args.alloc.zero_bits      = a2;
+        p->args.alloc.size_ptr       = a3;
+        p->args.alloc.alloc_type     = a4;
+        p->args.alloc.protect        = a5;
+        break;
+    case NYX_HOOK_NT_PROTECT_VM_ENTRY:
+        /* (HANDLE, PVOID *Base, PSIZE_T NumberOfBytes, ULONG NewProtect, PULONG OldProtect) */
+        read_stack_arg32(cpu, esp, 0, &a0);
+        read_stack_arg32(cpu, esp, 1, &a1);
+        read_stack_arg32(cpu, esp, 2, &a2);
+        read_stack_arg32(cpu, esp, 3, &a3);
+        read_stack_arg32(cpu, esp, 4, &a4);
+        p->args.protect.process_handle    = a0;
+        p->args.protect.base_ptr          = a1;
+        p->args.protect.size_ptr          = a2;
+        p->args.protect.new_protect       = a3;
+        p->args.protect.old_protect_ptr   = a4;
+        break;
+    case NYX_HOOK_NT_MAP_VIEW_ENTRY:
+        /* (HANDLE Section, HANDLE Process, PVOID *Base, ULONG_PTR ZeroBits, SIZE_T Commit,
+         *  PLARGE_INTEGER Offset, PSIZE_T ViewSize, SECTION_INHERIT Inherit, ULONG AllocType,
+         *  ULONG Win32Protect)
+         * We capture the first 3 args + the AllocType (slot 8) for SEC_IMAGE detection. */
+        read_stack_arg32(cpu, esp, 0, &a0);
+        read_stack_arg32(cpu, esp, 1, &a1);
+        read_stack_arg32(cpu, esp, 2, &a2);
+        read_stack_arg32(cpu, esp, 8, &a3);
+        p->args.map.section_handle = a0;
+        p->args.map.process_handle = a1;
+        p->args.map.base_ptr       = a2;
+        p->args.map.alloc_attrs    = a3;
+        break;
+    default:
+        nyx_printf("[NYX-HOOK] ENTRY: unknown kind=%d\n", (int)kind);
+        pending_free_slot(slot);
+        return;
+    }
+
+    uint64_t rhid = nyx_hook_id_make_return((uint16_t)slot,
+                                            (uint16_t)kind,
+                                            p->nonce);
+    p->return_hook_id = rhid;
+
+    if (register_return_hook(cpu, p->return_addr, rhid) < 0) {
+        /* Could not register — drop pending; outer will run unhooked. */
+        pending_free_slot(slot);
+        return;
+    }
+
+    nyx_printf("[NYX-HOOK] ENTRY kind=%d slot=%d esp=0x%08x ret=0x%08x "
+               "args=[0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x]\n",
+               (int)kind, slot, (uint32_t)esp, (uint32_t)p->return_addr,
+               a0, a1, a2, a3, a4, a5);
+}
+
+/* ── RETURN: read result, run per-function callback ───────────── */
+
+static void on_ldr_load_dll_return(CPUState *cpu, nyx_pending_call_t *p,
+                                   uint32_t status)
+{
+    if ((int32_t)status < 0) {
+        nyx_printf("[NYX-HOOK] LdrLoadDll FAIL status=0x%08x\n", status);
+        return;
+    }
+    /* Module is a PHANDLE → read the HMODULE (= base address). */
+    uint32_t module_base = 0;
+    if (p->args.ldr.handle_ptr)
+        read_guest_u32(cpu, p->args.ldr.handle_ptr, &module_base);
+    nyx_printf("[NYX-HOOK] LdrLoadDll OK status=0x%x base=0x%08x\n",
+               status, module_base);
+
+    /* Phase 3 minimal: rely on wte_enumerate_dlls to refresh module list
+     * lazily.  Phase 4 will plug into wte_state.dll_modules directly +
+     * remove any incorrectly-tracked dynamic entries on this DLL range. */
+}
+
+static void on_nt_allocate_return(CPUState *cpu, nyx_pending_call_t *p,
+                                  uint32_t status)
+{
+    if ((int32_t)status < 0) {
+        nyx_printf("[NYX-HOOK] NtAllocate FAIL status=0x%08x\n", status);
+        return;
+    }
+    /* PAGE_EXECUTE_* family: 0x10 (X), 0x20 (RX), 0x40 (RWX), 0x80 (WCX) */
+    bool has_exec = (p->args.alloc.protect & 0xF0) != 0;
+
+    uint32_t base = 0, size = 0;
+    if (p->args.alloc.base_ptr)
+        read_guest_u32(cpu, p->args.alloc.base_ptr, &base);
+    if (p->args.alloc.size_ptr)
+        read_guest_u32(cpu, p->args.alloc.size_ptr, &size);
+
+    nyx_printf("[NYX-HOOK] NtAllocate OK base=0x%08x size=0x%08x "
+               "alloc_type=0x%x protect=0x%x %s\n",
+               base, size, p->args.alloc.alloc_type, p->args.alloc.protect,
+               has_exec ? "[EXEC]" : "");
+
+    /* Phase 4 will: if has_exec, batch-NX [base, base+size) and create
+     * DYNAMIC entries with baseline=0 so the next exec triggers WtE. */
+}
+
+static void on_nt_protect_return(CPUState *cpu, nyx_pending_call_t *p,
+                                 uint32_t status)
+{
+    if ((int32_t)status < 0) return;
+
+    bool has_exec = (p->args.protect.new_protect & 0xF0) != 0;
+    if (!has_exec) return;  /* downgrades / non-exec — ignore */
+
+    uint32_t base = 0, size = 0;
+    if (p->args.protect.base_ptr)
+        read_guest_u32(cpu, p->args.protect.base_ptr, &base);
+    if (p->args.protect.size_ptr)
+        read_guest_u32(cpu, p->args.protect.size_ptr, &size);
+
+    nyx_printf("[NYX-HOOK] NtProtect+EXEC base=0x%08x size=0x%08x "
+               "new_protect=0x%x\n",
+               base, size, p->args.protect.new_protect);
+
+    /* Phase 4 will NX [base, base+size) so the next exec triggers WtE. */
+}
+
+static void on_nt_map_view_return(CPUState *cpu, nyx_pending_call_t *p,
+                                  uint32_t status)
+{
+    if ((int32_t)status < 0) return;
+
+    /* alloc_attrs SEC_IMAGE = 0x01000000 — DLL/EXE image mapping */
+    bool is_image = (p->args.map.alloc_attrs & 0x01000000U) != 0;
+    uint32_t base = 0;
+    if (p->args.map.base_ptr)
+        read_guest_u32(cpu, p->args.map.base_ptr, &base);
+
+    nyx_printf("[NYX-HOOK] NtMapView OK base=0x%08x alloc_attrs=0x%x %s\n",
+               base, p->args.map.alloc_attrs,
+               is_image ? "[SEC_IMAGE]" : "");
+    (void)cpu;
+}
+
+static void on_return_hit(CPUState *cpu, uint64_t hook_id, uint64_t rip)
+{
+    uint16_t slot   = nyx_hook_id_return_slot(hook_id);
+    uint16_t kind   = nyx_hook_id_return_kind(hook_id);
+    uint32_t nonce  = nyx_hook_id_return_nonce(hook_id);
+
+    if (slot >= NYX_PENDING_MAX) {
+        nyx_printf("[NYX-HOOK] RETURN: bad slot=%u\n", slot);
+        return;
+    }
+    nyx_pending_call_t *p = &g_state.pending[slot];
+    if (!p->in_use) {
+        nyx_printf("[NYX-HOOK] RETURN: slot=%u not in use\n", slot);
+        goto remove_kvm_hook;
+    }
+    if (p->nonce != nonce) {
+        nyx_printf("[NYX-HOOK] RETURN: stale nonce slot=%u expected=%u got=%u\n",
+                   slot, p->nonce, nonce);
+        goto remove_kvm_hook;
+    }
+    if ((unsigned)p->entry_kind != kind) {
+        nyx_printf("[NYX-HOOK] RETURN: kind mismatch slot=%u expected=%u got=%u\n",
+                   slot, p->entry_kind, kind);
+        goto remove_kvm_hook;
+    }
+
+    X86CPU      *cpux86 = X86_CPU(cpu);
+    CPUX86State *env    = &cpux86->env;
+    uint32_t eax        = env->regs[R_EAX] & 0xFFFFFFFFULL;
+
+    switch (p->entry_kind) {
+    case NYX_HOOK_LDR_LOAD_DLL_ENTRY:    on_ldr_load_dll_return (cpu, p, eax); break;
+    case NYX_HOOK_NT_ALLOCATE_VM_ENTRY:  on_nt_allocate_return  (cpu, p, eax); break;
+    case NYX_HOOK_NT_PROTECT_VM_ENTRY:   on_nt_protect_return   (cpu, p, eax); break;
+    case NYX_HOOK_NT_MAP_VIEW_ENTRY:     on_nt_map_view_return  (cpu, p, eax); break;
+    default: break;
+    }
+
+remove_kvm_hook:
+    /* Remove the one-shot return hook from KVM table.
+     * The page stays NX'd in wte_nx_bitmap so any other registered
+     * hook on the same page still works; KVM's nyx_hook_page_has_any
+     * will return false for unrelated RIPs and step them over. */
+    nyx_api_hook_kvm_remove(rip);
+    pending_free_slot(slot);
+}
+
+/* ── Dispatch entry point ─────────────────────────────────────── */
 
 void nyx_api_hook_dispatch(CPUState *cpu, uint64_t hook_id,
                            uint64_t rip, uint64_t cr3)
 {
-    /* Phase 3: arg capture + return-RIP one-shot registration +
-     * function-specific callbacks (DLL register, NX dynamic alloc, ...).
-     * For Phase 2, we just log so we can verify EPT-RIP filtering works. */
-    nyx_printf("[NYX-HOOK] HIT hook_id=0x%lx rip=0x%lx cr3=0x%lx (count=%d)\n",
-               (unsigned long)hook_id, (unsigned long)rip,
-               (unsigned long)cr3, g_state.pending_count);
-    (void)cpu;
+    (void)cr3;
+    if (nyx_hook_id_is_return(hook_id)) {
+        on_return_hit(cpu, hook_id, rip);
+    } else {
+        on_entry_hit(cpu, (nyx_hook_kind_t)hook_id, rip);
+    }
 }
 
 /* ── Lazy install (retry from on-CPU target packer context) ───── */
