@@ -291,3 +291,31 @@ void nyx_api_hook_dispatch(CPUState *cpu, uint64_t hook_id,
                (unsigned long)cr3, g_state.pending_count);
     (void)cpu;
 }
+
+/* ── Lazy install (retry from on-CPU target packer context) ───── */
+
+void nyx_api_hook_try_install_lazy(CPUState *cpu)
+{
+    if (!g_state.initialized) return;
+    if (g_state.active) return;
+
+    /* Re-enumerate using current vCPU context — when invoked from the
+     * WtE exec-violation handler, the target packer (32-bit) is on-CPU
+     * so FS:[0x30] yields the correct 32-bit PEB. */
+    wte_enumerate_dlls(cpu);
+
+    wte_state_t *ws = wte_get_state();
+    uint64_t ntdll_base = 0;
+    for (int i = 0; i < ws->dll_module_count; i++) {
+        const char *n = ws->dll_modules[i].name;
+        if (strncasecmp(n, "ntdll.dll", 9) == 0 && n[9] == '\0') {
+            ntdll_base = ws->dll_modules[i].base;
+            break;
+        }
+    }
+    if (ntdll_base == 0) return;  /* still not visible — retry later */
+
+    int n = nyx_api_hook_install(cpu, ntdll_base, ws->is_64bit);
+    nyx_printf("[NYX-HOOK] lazy install: ntdll=0x%lx hooks=%d\n",
+               (unsigned long)ntdll_base, n);
+}

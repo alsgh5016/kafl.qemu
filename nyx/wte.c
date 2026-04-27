@@ -29,6 +29,7 @@
 #include "nyx/memory_access.h"
 #include "nyx/state/state.h"
 #include "nyx/wte.h"
+#include "nyx/api_hook.h"
 
 #include "nyx/snapshot/memory/backend/nyx_dirty_ring.h"
 #include "nyx/fast_vm_reload.h"
@@ -1068,6 +1069,12 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
 
     nyx_printf("[WtE][EXEC] GFN=0x%lx GPA=0x%lx RIP=0x%lx\n",
                (unsigned long)gfn, (unsigned long)gpa, (unsigned long)rip);
+
+    /* Lazy install API hooks: WTE_SETUP runs in harness (64-bit) context
+     * where PEB→Ldr walk fails to enumerate the target's 32-bit modules.
+     * On the first exec violation the target packer is on-CPU, so the
+     * 32-bit PEB is reachable and ntdll can be discovered for install. */
+    nyx_api_hook_try_install_lazy(cpu);
 
     /* Try to find page entry by GFN → VA lookup */
     uint64_t page_va = 0;

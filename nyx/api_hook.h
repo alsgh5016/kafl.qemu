@@ -120,6 +120,13 @@ void nyx_api_hook_destroy(void);
  * the resolved RIPs so the EPT violation path actually fires. */
 int  nyx_api_hook_install(CPUState *cpu, uint64_t ntdll_base, bool is_64bit);
 
+/* Lazy-install retry: WTE_SETUP runs in harness (64-bit) context
+ * where FS:[0x30] doesn't yield a valid 32-bit PEB, so PEB→Ldr
+ * walk fails to find ntdll.  This helper is called from the WtE
+ * exec-violation handler (target packer is on-CPU at that point)
+ * and re-attempts enumeration + install if not yet active. */
+void nyx_api_hook_try_install_lazy(CPUState *cpu);
+
 /* Dispatched from the KVM_EXIT_KAFL_NYX_HOOK handler in hypercall.c. */
 void nyx_api_hook_dispatch(CPUState *cpu, uint64_t hook_id,
                            uint64_t rip, uint64_t cr3);
