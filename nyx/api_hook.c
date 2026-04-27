@@ -296,7 +296,10 @@ void nyx_api_hook_dispatch(CPUState *cpu, uint64_t hook_id,
 
 void nyx_api_hook_try_install_lazy(CPUState *cpu)
 {
-    if (!g_state.initialized) return;
+    /* Auto-init on first call: WTE_SETUP cannot reach this code path
+     * because the harness context lacks a valid 32-bit PEB, so init
+     * must happen lazily here when the target packer is on-CPU. */
+    if (!g_state.initialized) nyx_api_hook_init();
     if (g_state.active) return;
 
     /* Re-enumerate using current vCPU context — when invoked from the
