@@ -35,5 +35,6 @@ state/state.o \
 state/snapshot_state.o \
 pt.o \
 mem_split.o \
-wte.o
+wte.o \
+api_hook.o
 

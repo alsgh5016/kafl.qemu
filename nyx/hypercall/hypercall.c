@@ -52,6 +52,7 @@ along with QEMU-PT.  If not, see <http://www.gnu.org/licenses/>.
 #include "nyx/state/state.h"
 #include "nyx/synchronization.h"
 #include "nyx/wte.h"
+#include "nyx/api_hook.h"
 
 bool hypercall_enabled = false;
 static bool init_state = true;
@@ -1934,6 +1935,20 @@ int handle_kafl_hypercall(struct kvm_run *run,
         ret = 0;
         break;
     }
+    case KVM_EXIT_KAFL_NYX_HOOK:
+    {
+        /* In-kernel hook table matched a registered RIP.
+         * Dispatch to api_hook module (Phase 3 implements arg capture
+         * + return-RIP one-shot + per-function callbacks). */
+        kvm_arch_get_registers(cpu);
+        uint64_t hk_rip = run->kafl_nyx_hook.rip;
+        uint64_t hk_cr3 = run->kafl_nyx_hook.cr3;
+        uint64_t hk_id  = run->kafl_nyx_hook.hook_id;
+
+        nyx_api_hook_dispatch(cpu, hk_id, hk_rip, hk_cr3);
+        ret = 0;
+        break;
+    }
     case KVM_EXIT_KAFL_WTE_SETUP:
     {
         /*
@@ -2062,6 +2077,33 @@ int handle_kafl_hypercall(struct kvm_run *run,
         /* Step 6: Diagnostic — map target PE VA→GFN for tracking */
         if (setup.image_base != 0 && setup.image_size != 0) {
             wte_diagnose_target_pe(cpu, setup.image_base, setup.image_size);
+        }
+
+        /* Step 6b: Enumerate currently loaded DLLs (PEB→Ldr) and install
+         * stealth API hooks on ntdll Nt* exports.  Hook hits replace the
+         * timing-sensitive periodic rescan with deterministic event-driven
+         * detection of LoadLibrary / VirtualAlloc / VirtualProtect /
+         * MapViewOfSection. */
+        wte_enumerate_dlls(cpu);
+        {
+            uint64_t ntdll_base = 0;
+            wte_state_t *ws = wte_get_state();
+            for (int i = 0; i < ws->dll_module_count; i++) {
+                const char *n = ws->dll_modules[i].name;
+                /* Case-insensitive match of "ntdll.dll" exactly */
+                if (strncasecmp(n, "ntdll.dll", 9) == 0 && n[9] == '\0') {
+                    ntdll_base = ws->dll_modules[i].base;
+                    break;
+                }
+            }
+            if (ntdll_base != 0) {
+                nyx_api_hook_init();
+                int n = nyx_api_hook_install(cpu, ntdll_base, !is_32bit);
+                nyx_printf("[WtE] WTE_SETUP: nyx_api_hook installed=%d\n", n);
+            } else {
+                nyx_printf("[WtE] WTE_SETUP: ntdll.dll not found in PEB→Ldr — "
+                           "API hooks not installed\n");
+            }
         }
 
         /* Step 6: Initial dump — packed PE state before any execution.

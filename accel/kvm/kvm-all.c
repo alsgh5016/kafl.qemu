@@ -2532,6 +2532,7 @@ int kvm_cpu_exec(CPUState *cpu)
          * (WtE EPT violations, MTF) to avoid per-write overhead. */
         if (wte_is_active() &&
             run->exit_reason != KVM_EXIT_KAFL_WTE &&
+            run->exit_reason != KVM_EXIT_KAFL_NYX_HOOK &&
             run->exit_reason != KVM_EXIT_KAFL_MTF) {
             wte_check_deferred_pages(cpu);
             /* wte_scan_dirty_ring() — disabled: applies NX to ALL
