@@ -43,10 +43,10 @@ void nyx_api_hook_destroy(void)
 
 /* ── KVM ioctl wrappers ───────────────────────────────────────── */
 
-int nyx_api_hook_kvm_add(uint64_t rip, uint64_t hook_id)
+int nyx_api_hook_kvm_add(uint64_t rip, uint64_t gfn, uint64_t hook_id)
 {
     struct kvm_nyx_hook_entry req = {
-        .rip = rip, .hook_id = hook_id, .flags = 0, .pad = 0,
+        .rip = rip, .hook_id = hook_id, .gfn = gfn, .flags = 0, .pad = 0,
     };
     int ret = kvm_vm_ioctl(kvm_state, KVM_NYX_HOOK_ADD, &req);
     if (ret < 0)
@@ -58,7 +58,7 @@ int nyx_api_hook_kvm_add(uint64_t rip, uint64_t hook_id)
 int nyx_api_hook_kvm_remove(uint64_t rip)
 {
     struct kvm_nyx_hook_entry req = {
-        .rip = rip, .hook_id = 0, .flags = 0, .pad = 0,
+        .rip = rip, .hook_id = 0, .gfn = 0, .flags = 0, .pad = 0,
     };
     int ret = kvm_vm_ioctl(kvm_state, KVM_NYX_HOOK_REMOVE, &req);
     if (ret < 0 && ret != -ENOENT)
@@ -223,7 +223,7 @@ static int register_entry_hook(CPUState *cpu, const char *label,
         return rc;
     }
 
-    rc = nyx_api_hook_kvm_add(rip, entry_hook_id(kind));
+    rc = nyx_api_hook_kvm_add(rip, gfn, entry_hook_id(kind));
     if (rc < 0) return rc;
 
     nyx_printf("[NYX-HOOK] %s ENTRY @ rip=0x%lx gfn=0x%lx hook_id=%d\n",

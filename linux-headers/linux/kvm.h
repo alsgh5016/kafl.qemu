@@ -1784,6 +1784,7 @@ struct kvm_nyx_wte_gfns {
 struct kvm_nyx_hook_entry {
 	__u64 rip;
 	__u64 hook_id;
+	__u64 gfn;
 	__u32 flags;
 	__u32 pad;
 };

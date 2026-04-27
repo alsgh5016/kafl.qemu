@@ -136,6 +136,6 @@ bool nyx_api_hook_is_active(void);
 nyx_api_hook_state_t *nyx_api_hook_get_state(void);
 
 /* KVM ioctl wrappers (single-entry add/remove) */
-int  nyx_api_hook_kvm_add(uint64_t rip, uint64_t hook_id);
+int  nyx_api_hook_kvm_add(uint64_t rip, uint64_t gfn, uint64_t hook_id);
 int  nyx_api_hook_kvm_remove(uint64_t rip);
 int  nyx_api_hook_kvm_clear(void);
