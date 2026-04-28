@@ -2536,24 +2536,23 @@ int kvm_cpu_exec(CPUState *cpu)
             run->exit_reason != KVM_EXIT_KAFL_MTF) {
             wte_check_deferred_pages(cpu);
 
-            /* Phase 4: api_hook callbacks (wte_register_dynamic_exec_region /
-             * wte_register_loaded_dll) are the primary, deterministic
+            /* Phase 4: api_hook callbacks (wte_register_dynamic_exec_region
+             * and wte_register_loaded_dll) are the primary, deterministic
              * mechanism for tracking dynamic exec regions and DLL ranges.
              *
              * However, advanced reflective loaders (amber et al.) reach
-             * unpacked code via paths that don't go through the four
-             * hooked Nt*/Ldr functions — e.g., direct syscalls, indirect
-             * thunks, or self-modifying code blocks that bypass our
-             * register hooks.  A very-low-frequency rescan acts as a
-             * safety net for those: every ~10000 VM exits (≈ ms range,
-             * well below packer-step granularity) we re-walk the target
-             * CR3 PT to catch any user page our hooks didn't see.
+             * unpacked code via paths that bypass the four hooked
+             * ntdll exports (direct syscalls, indirect thunks, or
+             * self-modifying control flow).  A very-low-frequency
+             * rescan acts as a safety net: every ~10000 VM exits we
+             * re-walk the target CR3 PT to catch any user page the
+             * hooks did not see.
              *
-             * Frequency is intentionally far above the original 500-exit
-             * cadence so that *cross-host timing* divergence is dominated
-             * by hook events, not by rescan cadence — but high enough to
-             * still pick up lazy-COMMIT pages that come into existence
-             * after the api_hook callback ran. */
+             * Frequency is far above the original 500-exit cadence so
+             * cross-host timing divergence is dominated by hook events,
+             * not by rescan cadence, but still high enough to pick up
+             * lazy-COMMIT pages that come into existence after the
+             * api_hook callback ran. */
             {
                 static uint64_t vm_exit_counter = 0;
                 vm_exit_counter++;
