@@ -184,8 +184,28 @@ void wte_protect_pe_range(CPUState *cpu, uint64_t image_base,
  * dynamic region detection (amber-style packers) */
 void wte_protect_all_user_pages(CPUState *cpu, uint64_t cr3);
 
-/* Periodic re-scan: NX newly allocated pages since last scan */
+/* Periodic re-scan: NX newly allocated pages since last scan.
+ * NOTE: superseded by event-driven api_hook in Phase 4 — kept only for
+ * legacy callsites; not called from kvm-all.c / wte_handle_exec_violation
+ * any more. */
 void wte_rescan_user_pages(CPUState *cpu);
+
+/* Event-driven dynamic-region registration — called from the api_hook
+ * RETURN callbacks for NtAllocateVirtualMemory/NtProtectVirtualMemory
+ * when the new protection includes PAGE_EXECUTE_*.  Walks the [base,
+ * base+size) page table mapping in target_cr3, applies EPT NX, and
+ * creates DYNAMIC entries with baseline=0 so the next exec triggers
+ * WtE detection. */
+void wte_register_dynamic_exec_region(CPUState *cpu,
+                                      uint64_t base, uint64_t size);
+
+/* Event-driven DLL registration — called from the api_hook RETURN
+ * callback for LdrLoadDll/NtMapViewOfSection (SEC_IMAGE).  Refreshes
+ * wte_state.dll_modules via PEB→Ldr walk (so the new DLL is now
+ * included in the noise filter) AND removes any DYNAMIC entries that
+ * were mistakenly created on those pages by the legacy rescan path
+ * before the DLL was identified. */
+void wte_register_loaded_dll(CPUState *cpu, uint64_t module_base);
 
 /* Dirty ring scan for non-PE pages (supplementary legacy path) */
 void wte_scan_dirty_ring(void);

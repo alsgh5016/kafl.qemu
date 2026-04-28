@@ -2535,22 +2535,11 @@ int kvm_cpu_exec(CPUState *cpu)
             run->exit_reason != KVM_EXIT_KAFL_NYX_HOOK &&
             run->exit_reason != KVM_EXIT_KAFL_MTF) {
             wte_check_deferred_pages(cpu);
-            /* wte_scan_dirty_ring() — disabled: applies NX to ALL
-             * dirty non-PE pages including DLLs (dll_modules=0 at
-             * startup). Causes NX storm → Broken pipe before
-             * Nyx handshake completes. */
-
-            /* Periodic re-scan: the ONLY mechanism for dynamic
-             * region NX.  Walks guest PT so only user VA pages
-             * are affected.  wte_kvm_set_nx sets both bitmap +
-             * SPTE, so KVM violation handler works correctly. */
-            {
-                static uint64_t vm_exit_counter = 0;
-                vm_exit_counter++;
-                if ((vm_exit_counter % 500) == 0) {
-                    wte_rescan_user_pages(cpu);
-                }
-            }
+            /* Phase 4: periodic wte_rescan_user_pages removed — replaced
+             * by event-driven api_hook callbacks (wte_register_dynamic_exec_region
+             * on NtAllocate/NtProtect with EXECUTE, wte_register_loaded_dll
+             * on LdrLoadDll/NtMapViewOfSection-SEC_IMAGE).  Deterministic
+             * across CPU environments, no timing dependence. */
         }
 // clang-format off
 #endif

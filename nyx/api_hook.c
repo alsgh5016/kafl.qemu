@@ -469,9 +469,8 @@ static void on_ldr_load_dll_return(CPUState *cpu, nyx_pending_call_t *p,
     nyx_printf("[NYX-HOOK] LdrLoadDll OK status=0x%x base=0x%08x\n",
                status, module_base);
 
-    /* Phase 3 minimal: rely on wte_enumerate_dlls to refresh module list
-     * lazily.  Phase 4 will plug into wte_state.dll_modules directly +
-     * remove any incorrectly-tracked dynamic entries on this DLL range. */
+    if (module_base != 0)
+        wte_register_loaded_dll(cpu, (uint64_t)module_base);
 }
 
 static void on_nt_allocate_return(CPUState *cpu, nyx_pending_call_t *p,
@@ -495,8 +494,8 @@ static void on_nt_allocate_return(CPUState *cpu, nyx_pending_call_t *p,
                base, size, p->args.alloc.alloc_type, p->args.alloc.protect,
                has_exec ? "[EXEC]" : "");
 
-    /* Phase 4 will: if has_exec, batch-NX [base, base+size) and create
-     * DYNAMIC entries with baseline=0 so the next exec triggers WtE. */
+    if (has_exec && base != 0 && size != 0)
+        wte_register_dynamic_exec_region(cpu, (uint64_t)base, (uint64_t)size);
 }
 
 static void on_nt_protect_return(CPUState *cpu, nyx_pending_call_t *p,
@@ -517,7 +516,8 @@ static void on_nt_protect_return(CPUState *cpu, nyx_pending_call_t *p,
                "new_protect=0x%x\n",
                base, size, p->args.protect.new_protect);
 
-    /* Phase 4 will NX [base, base+size) so the next exec triggers WtE. */
+    if (base != 0 && size != 0)
+        wte_register_dynamic_exec_region(cpu, (uint64_t)base, (uint64_t)size);
 }
 
 static void on_nt_map_view_return(CPUState *cpu, nyx_pending_call_t *p,
@@ -534,7 +534,9 @@ static void on_nt_map_view_return(CPUState *cpu, nyx_pending_call_t *p,
     nyx_printf("[NYX-HOOK] NtMapView OK base=0x%08x alloc_attrs=0x%x %s\n",
                base, p->args.map.alloc_attrs,
                is_image ? "[SEC_IMAGE]" : "");
-    (void)cpu;
+
+    if (is_image && base != 0)
+        wte_register_loaded_dll(cpu, (uint64_t)base);
 }
 
 static void on_return_hit(CPUState *cpu, uint64_t hook_id, uint64_t rip)

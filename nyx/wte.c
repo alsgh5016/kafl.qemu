@@ -433,6 +433,138 @@ void wte_protect_pe_range(CPUState *cpu, uint64_t image_base,
                mapped, unmapped, wte_state.pe_page_count);
 }
 
+/* ── Event-driven dynamic-region registration ───────────────────
+ *
+ * Called from the api_hook RETURN callbacks when the packer
+ * allocates or promotes memory to executable (NtAllocateVirtualMemory
+ * with PAGE_EXECUTE_*, NtProtectVirtualMemory promoting to EXECUTE).
+ *
+ * For each page in [base, base+size):
+ *   1. Resolve guest VA → PA via target_cr3 page-table walk
+ *   2. Create a DYNAMIC entry with baseline=0 (any non-zero byte is
+ *      treated as packer-written)
+ *   3. Set EPT NX so the next instruction fetch triggers WtE
+ *
+ * Replaces the timing-sensitive periodic rescan: install is bounded
+ * to exactly the range the packer just allocated, deterministically.
+ */
+void wte_register_dynamic_exec_region(CPUState *cpu,
+                                      uint64_t base, uint64_t size)
+{
+    if (!wte_state.active) return;
+    uint64_t cr3 = wte_state.target_cr3;
+    if (cr3 == 0 || size == 0) return;
+
+    uint64_t va_start = base & ~(WTE_PAGE_SIZE - 1ULL);
+    uint64_t va_end   = (base + size + WTE_PAGE_SIZE - 1) &
+                        ~(WTE_PAGE_SIZE - 1ULL);
+
+    uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
+    int      nx_count   = 0;
+    int      registered = 0, skipped_pe = 0, unmapped = 0;
+
+    for (uint64_t va = va_start; va < va_end; va += WTE_PAGE_SIZE) {
+        if (va >= wte_state.pe_base_va && va < wte_state.pe_end_va) {
+            skipped_pe++;
+            continue;
+        }
+        uint64_t pa = get_paging_phys_addr(cpu, cr3, va);
+        if (pa == 0xFFFFFFFFFFFFFFFFULL || pa == 0) {
+            unmapped++;
+            continue;
+        }
+        uint64_t gfn = pa >> 12;
+        uint64_t gpa = gfn << 12;
+
+        wte_page_entry_t *entry = wte_lookup_or_create_va(va, gfn);
+        if (!entry) continue;
+
+        if (!(entry->flags & (WTE_PAGE_X_BLOCKED | WTE_PAGE_X_ALLOWED))) {
+            entry->gpa = gpa;
+            entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_WRITTEN;
+            memset(entry->baseline, 0, WTE_PAGE_SIZE);
+            entry->baseline_valid = true;
+            cpu_physical_memory_read(gpa, entry->current, WTE_PAGE_SIZE);
+        }
+        entry->flags |= WTE_PAGE_X_BLOCKED;
+
+        nx_batch[nx_count++] = gfn;
+        registered++;
+        if (nx_count >= WTE_MAX_BATCH_GFNS) {
+            wte_kvm_set_nx(nx_batch, nx_count);
+            nx_count = 0;
+        }
+    }
+    if (nx_count > 0) wte_kvm_set_nx(nx_batch, nx_count);
+
+    nyx_printf("[WtE][DYN-REG] base=0x%lx size=0x%lx → %d NX'd, "
+               "%d PE-skip, %d unmapped\n",
+               (unsigned long)base, (unsigned long)size,
+               registered, skipped_pe, unmapped);
+}
+
+/* ── Event-driven DLL registration ──────────────────────────────
+ *
+ * Called from api_hook RETURN callbacks when LdrLoadDll succeeds
+ * (or NtMapViewOfSection with SEC_IMAGE).  Refreshes the dll_modules
+ * list via PEB→Ldr (so new DLLs are visible to the noise filter)
+ * and untracks any DYNAMIC entries that were mistakenly created on
+ * the freshly loaded DLL's address range — those came from the legacy
+ * rescan path and would otherwise produce spurious WtE dumps when
+ * the DLL's normal code executes.
+ */
+void wte_register_loaded_dll(CPUState *cpu, uint64_t module_base)
+{
+    if (!wte_state.active || module_base == 0) return;
+
+    /* Refresh dll_modules so subsequent wte_is_dll_rip / dump filtering
+     * sees the new DLL.  Cheap PEB→Ldr walk. */
+    wte_enumerate_dlls(cpu);
+
+    /* Find the freshly-loaded DLL's range. */
+    uint64_t dll_end = 0;
+    for (int i = 0; i < wte_state.dll_module_count; i++) {
+        if (wte_state.dll_modules[i].base == module_base) {
+            dll_end = wte_state.dll_modules[i].end;
+            break;
+        }
+    }
+    if (dll_end == 0) {
+        /* DLL not yet visible in PEB→Ldr (race during loader init).
+         * Caller will retry on the next LdrLoadDll RETURN. */
+        return;
+    }
+
+    /* Sweep page_table for DYNAMIC entries that fall in this DLL's range
+     * and untrack them. */
+    GHashTableIter iter;
+    gpointer       key, value;
+    uint64_t       clear_batch[WTE_MAX_BATCH_GFNS];
+    int            clear_count = 0;
+    int            untracked = 0;
+
+    g_hash_table_iter_init(&iter, wte_state.page_table);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        wte_page_entry_t *entry = (wte_page_entry_t *)value;
+        if (entry->va < module_base || entry->va >= dll_end) continue;
+        if (!(entry->flags & WTE_PAGE_IS_DYNAMIC)) continue;
+
+        if (entry->flags & WTE_PAGE_X_BLOCKED) {
+            if (clear_count < WTE_MAX_BATCH_GFNS)
+                clear_batch[clear_count++] = entry->gfn;
+        }
+        entry->flags &= ~(WTE_PAGE_IS_DYNAMIC | WTE_PAGE_WRITTEN |
+                          WTE_PAGE_X_BLOCKED);
+        entry->flags |= WTE_PAGE_X_ALLOWED;
+        untracked++;
+    }
+    if (clear_count > 0) wte_kvm_clear_nx(clear_batch, clear_count);
+
+    nyx_printf("[WtE][DLL-REG] base=0x%lx end=0x%lx %d entries cleaned\n",
+               (unsigned long)module_base, (unsigned long)dll_end,
+               untracked);
+}
+
 /* ── Global NX: set X=0 on ALL mapped user pages (non-PE) ────────
  *
  * Walk target CR3 page tables and set NX on every user-space page
@@ -1238,11 +1370,10 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
             dump_full_process_memory(cpu, env, wte_label, &evt, 0);
         }
 
-        /* Rescan PT after each WtE dump to NX newly allocated pages.
-         * Amber's stub triggers WtE → at that moment, VirtualAlloc'd
-         * regions are already mapped → rescan catches them → NX set
-         * → next exec (OEP) triggers violation. */
-        wte_rescan_user_pages(cpu);
+        /* Phase 4: post-WtE rescan removed.  api_hook NtAllocate/NtProtect
+         * callbacks register dynamic regions deterministically when the
+         * packer allocates/promotes them, so the rescan-as-catchup pattern
+         * is no longer needed. */
 
         /* Post-detection: update baseline, re-protect for next layer.
          * RIP-in-diff check above prevents tight loops on VM dispatchers,
