@@ -459,6 +459,24 @@ void wte_register_dynamic_exec_region(CPUState *cpu,
     uint64_t va_end   = (base + size + WTE_PAGE_SIZE - 1) &
                         ~(WTE_PAGE_SIZE - 1ULL);
 
+    /* Always record the range so wte_handle_exec_violation can late-bind
+     * pages that are unmapped now but get committed later (lazy COMMIT
+     * is common — e.g., amber's RWX VirtualAlloc(0x427000) returns before
+     * any of the 1063 pages are actually backed). */
+    if (wte_state.dyn_range_count <
+        (int)(sizeof(wte_state.dyn_ranges) / sizeof(wte_state.dyn_ranges[0]))) {
+        bool dup = false;
+        for (int i = 0; i < wte_state.dyn_range_count; i++) {
+            if (wte_state.dyn_ranges[i].base == va_start &&
+                wte_state.dyn_ranges[i].end  == va_end) { dup = true; break; }
+        }
+        if (!dup) {
+            int idx = wte_state.dyn_range_count++;
+            wte_state.dyn_ranges[idx].base = va_start;
+            wte_state.dyn_ranges[idx].end  = va_end;
+        }
+    }
+
     uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
     int      nx_count   = 0;
     int      registered = 0, skipped_pe = 0, unmapped = 0;
@@ -1249,11 +1267,39 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
     }
 
     if (!entry) {
-        /* Completely unknown page — just allow execution */
-        nyx_printf("[WtE][EXEC] Untracked GFN=0x%lx RIP=0x%lx, allowing\n",
-                   (unsigned long)gfn, (unsigned long)rip);
-        wte_kvm_clear_nx(&gfn, 1);
-        return;
+        /* Late-bind for dynamic ranges that were unmapped at api_hook
+         * register time (lazy MEM_COMMIT — pages backed only on first
+         * access).  If RIP falls into a recorded NtAllocate/NtProtect
+         * range, create the entry now and continue with WtE detection. */
+        bool in_dyn_range = false;
+        for (int r = 0; r < wte_state.dyn_range_count; r++) {
+            if (rip >= wte_state.dyn_ranges[r].base &&
+                rip <  wte_state.dyn_ranges[r].end) {
+                in_dyn_range = true;
+                break;
+            }
+        }
+        if (in_dyn_range) {
+            page_va = rip & ~0xFFFULL;
+            entry = wte_lookup_or_create_va(page_va, gfn);
+            entry->gpa = gpa & ~0xFFFULL;
+            entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_WRITTEN;
+            memset(entry->baseline, 0, WTE_PAGE_SIZE);
+            entry->baseline_valid = true;
+            cpu_physical_memory_read(entry->gpa, entry->current,
+                                     WTE_PAGE_SIZE);
+            nyx_printf("[WtE][LATE-BIND] dyn-range hit: VA=0x%lx GFN=0x%lx "
+                       "RIP=0x%lx — tracking now\n",
+                       (unsigned long)page_va, (unsigned long)gfn,
+                       (unsigned long)rip);
+            /* fall through to WRITTEN branch below */
+        } else {
+            /* Completely unknown page — just allow execution */
+            nyx_printf("[WtE][EXEC] Untracked GFN=0x%lx RIP=0x%lx, allowing\n",
+                       (unsigned long)gfn, (unsigned long)rip);
+            wte_kvm_clear_nx(&gfn, 1);
+            return;
+        }
     }
 
     /* Check if this page was written */

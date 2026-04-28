@@ -141,6 +141,18 @@ typedef struct {
     int       renx_count;
     int       renx_capacity;
 
+    /* Dynamic alloc ranges from api_hook NtAllocate/NtProtect callbacks.
+     * Used by wte_handle_exec_violation late-bind path: when an
+     * exec violation arrives on a GFN we never registered (because the
+     * page was lazy-committed and unmapped at register time), but the
+     * RIP falls within a recorded range, we create the tracking entry
+     * on the spot instead of allowing exec through. */
+    struct {
+        uint64_t base;
+        uint64_t end;
+    } dyn_ranges[64];
+    int dyn_range_count;
+
 } wte_state_t;
 
 /* ── Public API ────────────────────────────────────────────────── */
