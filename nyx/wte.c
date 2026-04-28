@@ -583,6 +583,81 @@ void wte_register_loaded_dll(CPUState *cpu, uint64_t module_base)
                untracked);
 }
 
+/* ── Lightweight dyn_range re-check ─────────────────────────────
+ *
+ * Walks ONLY the registered dynamic ranges (api_hook NtAllocate /
+ * NtProtect callbacks recorded these into wte_state.dyn_ranges[]).
+ * Any page that is now mapped but not yet in our tracking table
+ * gets NX'd and a DYNAMIC entry created.
+ *
+ * Cheap: typical dyn_range size is a few hundred to a few thousand
+ * pages, so each call is O(N) PT lookups against target_cr3 — well
+ * under a millisecond.  Called every ~200 VM exits, frequent enough
+ * that a freshly-mapped page is captured before the packer has a
+ * chance to execute it.
+ *
+ * This catches the case where:
+ *  - api_hook ran at NtAllocate RETURN: PTE not present yet (lazy
+ *    COMMIT), set_nx_gfn no-op
+ *  - packer later faults the page in: SPTE created but auto-NX hook
+ *    in tdp_mmu_map_handle_target_level missed it (cr3 race or fault
+ *    type quirk)
+ *  - packer fetches code from the page: no NX on SPTE → fetch
+ *    succeeds, WtE detection bypassed
+ */
+void wte_recheck_dyn_ranges(CPUState *cpu)
+{
+    if (!wte_state.active || wte_state.dyn_range_count == 0) return;
+    uint64_t cr3 = wte_state.target_cr3;
+    if (cr3 == 0) return;
+
+    uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
+    int      nx_count    = 0;
+    int      newly_nxd   = 0;
+
+    for (int r = 0; r < wte_state.dyn_range_count; r++) {
+        uint64_t base = wte_state.dyn_ranges[r].base;
+        uint64_t end  = wte_state.dyn_ranges[r].end;
+        for (uint64_t va = base; va < end; va += WTE_PAGE_SIZE) {
+            if (va >= wte_state.pe_base_va && va < wte_state.pe_end_va)
+                continue;
+
+            uint64_t pa = get_paging_phys_addr(cpu, cr3, va);
+            if (pa == 0xFFFFFFFFFFFFFFFFULL || pa == 0) continue;
+
+            uint64_t gfn = pa >> 12;
+            uint64_t gpa = gfn << 12;
+
+            wte_page_entry_t *entry = wte_lookup_gfn(gfn);
+            if (entry && (entry->flags & (WTE_PAGE_X_BLOCKED |
+                                          WTE_PAGE_X_ALLOWED))) {
+                continue; /* already tracked */
+            }
+
+            entry = wte_lookup_or_create_va(va, gfn);
+            entry->gpa = gpa;
+            entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_WRITTEN |
+                            WTE_PAGE_X_BLOCKED;
+            memset(entry->baseline, 0, WTE_PAGE_SIZE);
+            entry->baseline_valid = true;
+            cpu_physical_memory_read(gpa, entry->current, WTE_PAGE_SIZE);
+
+            nx_batch[nx_count++] = gfn;
+            newly_nxd++;
+            if (nx_count >= WTE_MAX_BATCH_GFNS) {
+                wte_kvm_set_nx(nx_batch, nx_count);
+                nx_count = 0;
+            }
+        }
+    }
+    if (nx_count > 0) wte_kvm_set_nx(nx_batch, nx_count);
+
+    if (newly_nxd > 0)
+        nyx_printf("[WtE][DYN-RECHECK] %d newly mapped page(s) NX'd "
+                   "(across %d range(s))\n",
+                   newly_nxd, wte_state.dyn_range_count);
+}
+
 /* ── Global NX: set X=0 on ALL mapped user pages (non-PE) ────────
  *
  * Walk target CR3 page tables and set NX on every user-space page

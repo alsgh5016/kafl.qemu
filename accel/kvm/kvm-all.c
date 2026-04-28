@@ -2556,6 +2556,17 @@ int kvm_cpu_exec(CPUState *cpu)
             {
                 static uint64_t vm_exit_counter = 0;
                 vm_exit_counter++;
+                /* Lightweight: only walks the api_hook-registered
+                 * dyn_ranges (few hundred to few thousand pages).
+                 * Catches lazy MEM_COMMIT pages whose SPTE auto-NX
+                 * missed.  Frequent enough to pre-empt packer
+                 * execution. */
+                if ((vm_exit_counter % 200) == 0) {
+                    wte_recheck_dyn_ranges(cpu);
+                }
+                /* Heavyweight catch-all for hook-bypass paths
+                 * (direct syscall, indirect thunk) — rare, low
+                 * frequency to keep cross-host timing stable. */
                 if ((vm_exit_counter % 10000) == 0) {
                     wte_rescan_user_pages(cpu);
                 }

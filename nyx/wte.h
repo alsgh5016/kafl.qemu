@@ -219,6 +219,14 @@ void wte_register_dynamic_exec_region(CPUState *cpu,
  * before the DLL was identified. */
 void wte_register_loaded_dll(CPUState *cpu, uint64_t module_base);
 
+/* Lightweight re-check of all registered dyn_ranges:
+ * walks only the recorded ranges (typically a few hundred pages, very
+ * cheap) and applies NX to any page that has become mapped since
+ * register-time but isn't yet in our tracking table.  Catches lazy
+ * MEM_COMMIT pages whose SPTE was created without auto-NX firing
+ * (target_cr3 race etc.). */
+void wte_recheck_dyn_ranges(CPUState *cpu);
+
 /* Dirty ring scan for non-PE pages (supplementary legacy path) */
 void wte_scan_dirty_ring(void);
 
