@@ -45,16 +45,19 @@ static inline uint64_t nyx_hook_id_make_return(uint16_t slot_idx,
                                                uint16_t entry_kind,
                                                uint32_t nonce)
 {
+    /* nonce restricted to 31 bits so it doesn't collide with the
+     * RETURN_FLAG bit at position 63 once shifted into bits 32..63. */
     return NYX_HOOK_ID_RETURN_FLAG
          | ((uint64_t)slot_idx   & 0xFFFFULL)
          | (((uint64_t)entry_kind & 0xFFULL) << 16)
-         | ((uint64_t)nonce << 32);
+         | (((uint64_t)nonce     & 0x7FFFFFFFULL) << 32);
 }
 
 static inline bool     nyx_hook_id_is_return    (uint64_t id) { return (id & NYX_HOOK_ID_RETURN_FLAG) != 0; }
 static inline uint16_t nyx_hook_id_return_slot  (uint64_t id) { return (uint16_t)(id & 0xFFFFULL); }
 static inline uint16_t nyx_hook_id_return_kind  (uint64_t id) { return (uint16_t)((id >> 16) & 0xFFULL); }
-static inline uint32_t nyx_hook_id_return_nonce (uint64_t id) { return (uint32_t)(id >> 32); }
+/* mask out RETURN_FLAG that collapsed into bit 31 after the right-shift. */
+static inline uint32_t nyx_hook_id_return_nonce (uint64_t id) { return (uint32_t)((id >> 32) & 0x7FFFFFFFU); }
 
 /* ── Pending call tracking (LIFO by RSP) ──────────────────────── */
 
