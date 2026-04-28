@@ -474,6 +474,18 @@ void wte_register_dynamic_exec_region(CPUState *cpu,
             int idx = wte_state.dyn_range_count++;
             wte_state.dyn_ranges[idx].base = va_start;
             wte_state.dyn_ranges[idx].end  = va_end;
+
+            /* Also register with KVM so the EPT-violation handler can
+             * pre-NX the SPTE on lazy-COMMIT fault — eliminates the
+             * polling race that left amber's OEP at OEP+0x84. */
+            struct kvm_nyx_dyn_range req = {
+                .base = va_start,
+                .end  = va_end,
+            };
+            int rc = kvm_vm_ioctl(kvm_state,
+                                  KVM_NYX_DYN_RANGE_ADD, &req);
+            if (rc < 0)
+                nyx_printf("[WtE][DYN-REG] KVM ioctl failed: %d\n", rc);
         }
     }
 

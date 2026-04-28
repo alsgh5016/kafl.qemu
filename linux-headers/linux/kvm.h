@@ -1775,6 +1775,10 @@ struct kvm_hyperv_eventfd {
 #define KVM_NYX_HOOK_REMOVE					_IOW(KVMIO,	0xfa, struct kvm_nyx_hook_entry)
 #define KVM_NYX_HOOK_CLEAR					_IO (KVMIO,	0xfb)
 
+/* Nyx dynamic alloc-range tracking — VA-based pre-NX in EPT handler */
+#define KVM_NYX_DYN_RANGE_ADD				_IOW(KVMIO,	0xfc, struct kvm_nyx_dyn_range)
+#define KVM_NYX_DYN_RANGE_CLEAR				_IO (KVMIO,	0xfd)
+
 struct kvm_nyx_wte_gfns {
 	__u32 count;
 	__u32 flags;			/* reserved */
@@ -1787,6 +1791,11 @@ struct kvm_nyx_hook_entry {
 	__u64 gfn;
 	__u32 flags;
 	__u32 pad;
+};
+
+struct kvm_nyx_dyn_range {
+	__u64 base;
+	__u64 end;
 };
 
 /* KVM dirty-ring */
