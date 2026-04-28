@@ -2559,9 +2559,11 @@ int kvm_cpu_exec(CPUState *cpu)
                 /* Lightweight: only walks the api_hook-registered
                  * dyn_ranges (few hundred to few thousand pages).
                  * Catches lazy MEM_COMMIT pages whose SPTE auto-NX
-                 * missed.  Frequent enough to pre-empt packer
-                 * execution. */
-                if ((vm_exit_counter % 200) == 0) {
+                 * missed.  Frequency must be high enough to apply NX
+                 * BEFORE the packer fetches the first instruction on
+                 * a freshly committed page (OEP precision); too low
+                 * and we catch dump on OEP+N instead of OEP itself. */
+                if ((vm_exit_counter % 50) == 0) {
                     wte_recheck_dyn_ranges(cpu);
                 }
                 /* Heavyweight catch-all for hook-bypass paths
