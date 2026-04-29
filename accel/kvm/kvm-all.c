@@ -2567,9 +2567,13 @@ int kvm_cpu_exec(CPUState *cpu)
                     wte_recheck_dyn_ranges(cpu);
                 }
                 /* Heavyweight catch-all for hook-bypass paths
-                 * (direct syscall, indirect thunk) — rare, low
-                 * frequency to keep cross-host timing stable. */
-                if ((vm_exit_counter % 10000) == 0) {
+                 * (direct syscall, indirect thunk, reflective loader).
+                 * Empirically, %10000 missed main-entry exec on faster
+                 * hosts (iMac3) for ~20/82 amber samples: packer
+                 * reached OEP between rescan windows.  Cross-host
+                 * timing variance is already dominated by packer
+                 * non-determinism, so trade rescan cost for coverage. */
+                if ((vm_exit_counter % 500) == 0) {
                     wte_rescan_user_pages(cpu);
                 }
             }
