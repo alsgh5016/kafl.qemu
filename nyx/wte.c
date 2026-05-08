@@ -681,99 +681,143 @@ void wte_recheck_dyn_ranges(CPUState *cpu)
  *   - DLL pages → allowed by DLL filter (wte_is_dll_rip)
  *   - Dynamic unpack regions → DYN-EXEC path → WtE detection
  */
-void wte_protect_all_user_pages(CPUState *cpu, uint64_t cr3)
+/* Per-mapped-page callback used by wte_walk_user_pages. */
+typedef void (*wte_page_action_fn)(uint64_t va, uint64_t gfn, uint64_t gpa,
+                                   void *ctx);
+
+/* User-space VA bounds.
+ *
+ *   32-bit (WOW64): walk PML4[0] → PDPT[0..1] (covers 0..2 GiB).
+ *     Skip [0..0x10000) and [0x7FFF0000..) — NULL guard / Windows top-of-user.
+ *
+ *   64-bit native: walk PML4[0..255] (canonical lower half, 0..128 TiB) →
+ *     full PDPT[0..511] per entry. Skip [0..0x10000) and the top 128 KiB of
+ *     canonical user space as a guard against kernel-shared pages.
+ */
+#define WTE_VA_LOW_GUARD          0x0000000000010000ULL
+#define WTE_VA_HIGH_GUARD_32      0x000000007FFF0000ULL
+#define WTE_VA_HIGH_GUARD_64      0x00007FFFFFFE0000ULL
+
+/* Walk every mapped 4 KiB user-space page under `cr3` and invoke `fn` on it.
+ *
+ * 2 MiB huge pages are expanded into 512 × 4 KiB invocations so callers see
+ * a uniform 4 KiB granularity. 1 GiB huge pages are skipped (rare in user
+ * space; would expand to 256 K invocations).
+ */
+static void wte_walk_user_pages(CPUState *cpu, uint64_t cr3, bool is_64bit,
+                                wte_page_action_fn fn, void *ctx)
 {
+    (void)cpu;
+
     uint64_t pml4_base = cr3 & 0x000FFFFFFFFFF000ULL;
     uint64_t pml4_table[512];
     cpu_physical_memory_read(pml4_base, pml4_table, 4096);
 
-    uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
-    int nx_count = 0;
-    int total_nx = 0, skipped_pe = 0;
+    int pml4_max = is_64bit ? 256 : 1;
+    int pdpt_max = is_64bit ? 512 : 2;
 
-    /* PML4[0] covers user-space VA 0x000000000000 - 0x007FFFFFFFFFFF */
-    uint64_t pml4e = pml4_table[0];
-    if (!(pml4e & 1)) {
-        nyx_printf("[WtE][GLOBAL-NX] PML4[0] not present, skip\n");
-        return;
-    }
+    uint64_t high_guard = is_64bit ? WTE_VA_HIGH_GUARD_64
+                                   : WTE_VA_HIGH_GUARD_32;
 
-    uint64_t pdpt_base = pml4e & 0x000FFFFFFFFFF000ULL;
-    uint64_t pdpt_table[512];
-    cpu_physical_memory_read(pdpt_base, pdpt_table, 4096);
+    for (int pml4_idx = 0; pml4_idx < pml4_max; pml4_idx++) {
+        uint64_t pml4e = pml4_table[pml4_idx];
+        if (!(pml4e & 1)) continue;
 
-    /* PDPT[0..1] covers VA 0x00000000 - 0x7FFFFFFF (32-bit user space) */
-    for (int pdpte_idx = 0; pdpte_idx < 2; pdpte_idx++) {
-        uint64_t pdpte = pdpt_table[pdpte_idx];
-        if (!(pdpte & 1)) continue;
-        if (pdpte & (1ULL << 7)) continue; /* 1GB huge page */
+        uint64_t pdpt_base = pml4e & 0x000FFFFFFFFFF000ULL;
+        uint64_t pdpt_table[512];
+        cpu_physical_memory_read(pdpt_base, pdpt_table, 4096);
 
-        uint64_t pd_base = pdpte & 0x000FFFFFFFFFF000ULL;
-        uint64_t pd_table[512];
-        cpu_physical_memory_read(pd_base, pd_table, 4096);
+        for (int pdpte_idx = 0; pdpte_idx < pdpt_max; pdpte_idx++) {
+            uint64_t pdpte = pdpt_table[pdpte_idx];
+            if (!(pdpte & 1)) continue;
+            if (pdpte & (1ULL << 7)) continue; /* 1 GiB huge page */
 
-        for (int pde_idx = 0; pde_idx < 512; pde_idx++) {
-            uint64_t pde = pd_table[pde_idx];
-            if (!(pde & 1)) continue;
+            uint64_t pd_base = pdpte & 0x000FFFFFFFFFF000ULL;
+            uint64_t pd_table[512];
+            cpu_physical_memory_read(pd_base, pd_table, 4096);
 
-            if (pde & (1ULL << 7)) {
-                /* 2MB huge page → split into 512 × 4KB for NX */
-                uint64_t page_phys = pde & 0x000FFFFFFFE00000ULL;
-                uint32_t base_va = ((uint32_t)pdpte_idx << 30) |
-                                   ((uint32_t)pde_idx << 21);
-                for (int k = 0; k < 512; k++) {
-                    uint32_t va = base_va + ((uint32_t)k << 12);
-                    if (va < 0x10000 || va >= 0x7FFF0000) continue;
-                    uint64_t gfn = (page_phys + ((uint64_t)k << 12)) >> 12;
+            uint64_t base_va_lvl3 = ((uint64_t)pml4_idx  << 39) |
+                                    ((uint64_t)pdpte_idx << 30);
 
-                    /* Skip PE pages (already W=0+X=0) */
-                    bool is_pe = (va >= wte_state.pe_base_va &&
-                                  va < wte_state.pe_end_va);
-                    if (is_pe) { skipped_pe++; continue; }
+            for (int pde_idx = 0; pde_idx < 512; pde_idx++) {
+                uint64_t pde = pd_table[pde_idx];
+                if (!(pde & 1)) continue;
 
-                    nx_batch[nx_count++] = gfn;
-                    total_nx++;
-                    if (nx_count >= WTE_MAX_BATCH_GFNS) {
-                        wte_kvm_set_nx(nx_batch, nx_count);
-                        nx_count = 0;
+                uint64_t base_va = base_va_lvl3 |
+                                   ((uint64_t)pde_idx << 21);
+
+                if (pde & (1ULL << 7)) {
+                    /* 2 MiB huge page → emit 512 × 4 KiB */
+                    uint64_t page_phys = pde & 0x000FFFFFFFE00000ULL;
+                    for (int k = 0; k < 512; k++) {
+                        uint64_t va = base_va | ((uint64_t)k << 12);
+                        if (va < WTE_VA_LOW_GUARD) continue;
+                        if (va >= high_guard) continue;
+                        uint64_t gfn = (page_phys + ((uint64_t)k << 12)) >> 12;
+                        fn(va, gfn, gfn << 12, ctx);
                     }
-                }
-            } else {
-                /* 4KB page table */
-                uint64_t pt_base = pde & 0x000FFFFFFFFFF000ULL;
-                uint64_t pt_table[512];
-                cpu_physical_memory_read(pt_base, pt_table, 4096);
+                } else {
+                    uint64_t pt_base = pde & 0x000FFFFFFFFFF000ULL;
+                    uint64_t pt_table[512];
+                    cpu_physical_memory_read(pt_base, pt_table, 4096);
 
-                for (int pte_idx = 0; pte_idx < 512; pte_idx++) {
-                    uint64_t pte = pt_table[pte_idx];
-                    if (!(pte & 1)) continue;
+                    for (int pte_idx = 0; pte_idx < 512; pte_idx++) {
+                        uint64_t pte = pt_table[pte_idx];
+                        if (!(pte & 1)) continue;
 
-                    uint32_t va = ((uint32_t)pdpte_idx << 30) |
-                                  ((uint32_t)pde_idx << 21) |
-                                  ((uint32_t)pte_idx << 12);
-                    if (va < 0x10000 || va >= 0x7FFF0000) continue;
+                        uint64_t va = base_va | ((uint64_t)pte_idx << 12);
+                        if (va < WTE_VA_LOW_GUARD) continue;
+                        if (va >= high_guard) continue;
 
-                    uint64_t gfn = (pte & 0x000FFFFFFFFFF000ULL) >> 12;
-
-                    bool is_pe = (va >= wte_state.pe_base_va &&
-                                  va < wte_state.pe_end_va);
-                    if (is_pe) { skipped_pe++; continue; }
-
-                    nx_batch[nx_count++] = gfn;
-                    total_nx++;
-                    if (nx_count >= WTE_MAX_BATCH_GFNS) {
-                        wte_kvm_set_nx(nx_batch, nx_count);
-                        nx_count = 0;
+                        uint64_t gfn = (pte & 0x000FFFFFFFFFF000ULL) >> 12;
+                        fn(va, gfn, gfn << 12, ctx);
                     }
                 }
             }
         }
     }
+}
 
-    if (nx_count > 0) wte_kvm_set_nx(nx_batch, nx_count);
+typedef struct {
+    uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
+    int      nx_count;
+    int      total_nx;
+    int      skipped_pe;
+} wte_protect_ctx_t;
 
-    nyx_printf("[WtE][GLOBAL-NX] Set X=0 on %d non-PE user pages "
-               "(%d PE pages skipped)\n", total_nx, skipped_pe);
+static void wte_protect_visit(uint64_t va, uint64_t gfn, uint64_t gpa,
+                              void *ctx_)
+{
+    (void)gpa;
+    wte_protect_ctx_t *ctx = ctx_;
+
+    if (va >= wte_state.pe_base_va && va < wte_state.pe_end_va) {
+        ctx->skipped_pe++;
+        return;
+    }
+
+    ctx->nx_batch[ctx->nx_count++] = gfn;
+    ctx->total_nx++;
+    if (ctx->nx_count >= WTE_MAX_BATCH_GFNS) {
+        wte_kvm_set_nx(ctx->nx_batch, ctx->nx_count);
+        ctx->nx_count = 0;
+    }
+}
+
+void wte_protect_all_user_pages(CPUState *cpu, uint64_t cr3)
+{
+    wte_protect_ctx_t pctx = { 0 };
+
+    wte_walk_user_pages(cpu, cr3, wte_state.is_64bit,
+                        wte_protect_visit, &pctx);
+
+    if (pctx.nx_count > 0)
+        wte_kvm_set_nx(pctx.nx_batch, pctx.nx_count);
+
+    nyx_printf("[WtE][GLOBAL-NX] (%s) Set X=0 on %d non-PE user pages "
+               "(%d PE pages skipped)\n",
+               wte_state.is_64bit ? "64-bit" : "32-bit",
+               pctx.total_nx, pctx.skipped_pe);
 }
 
 /* ── Periodic re-scan: NX newly allocated user pages ─────────────
@@ -782,151 +826,90 @@ void wte_protect_all_user_pages(CPUState *cpu, uint64_t cr3)
  * page table and sets NX on any user page that wasn't present at
  * the initial WTE_SETUP scan.
  */
+typedef struct {
+    uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
+    int      nx_count;
+    int      new_nx;
+    int      rescan_call_count;
+} wte_rescan_ctx_t;
+
+static void wte_rescan_visit(uint64_t va, uint64_t gfn, uint64_t gpa,
+                             void *ctx_)
+{
+    wte_rescan_ctx_t *ctx = ctx_;
+
+    if (va >= wte_state.pe_base_va && va < wte_state.pe_end_va) return;
+
+    /* Skip if already tracked */
+    wte_page_entry_t *entry = wte_lookup_gfn(gfn);
+    if (entry && (entry->flags & (WTE_PAGE_X_BLOCKED |
+                                  WTE_PAGE_X_ALLOWED))) return;
+
+    if (!entry) {
+        /* Create tracking entry so exec handler finds it.
+         * Baseline is zeroed (not read from memory) because the page was
+         * dynamically allocated — any non-zero content means "written by
+         * packer" and should trigger WtE detection. Reading baseline =
+         * current would make diff_count = 0, silently allowing execution. */
+        entry = wte_lookup_or_create_va(va, gfn);
+        entry->gpa = gpa;
+        entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_WRITTEN;
+        memset(entry->baseline, 0, WTE_PAGE_SIZE);
+        entry->baseline_valid = true;
+        cpu_physical_memory_read(gpa, entry->current, WTE_PAGE_SIZE);
+
+        /* Per-page diagnostic for the WOW64 shared-user / TEB cluster.
+         * Only meaningful in 32-bit walks; native x64 uses different
+         * VA ranges so we suppress this noise there. */
+        if (!wte_state.is_64bit &&
+            (((va >= 0x7f900000ULL && va < 0x7fc00000ULL) ||
+              (va >= 0x7fd00000ULL && va < 0x7ff00000ULL)))) {
+            nyx_printf("[WtE][RESCAN-PAGE] NEW VA=0x%lx "
+                       "GFN=0x%lx (rescan #%d)\n",
+                       (unsigned long)va, (unsigned long)gfn,
+                       ctx->rescan_call_count);
+        }
+    }
+    entry->flags |= WTE_PAGE_X_BLOCKED;
+
+    ctx->nx_batch[ctx->nx_count++] = gfn;
+    ctx->new_nx++;
+    if (ctx->nx_count >= WTE_MAX_BATCH_GFNS) {
+        wte_kvm_set_nx(ctx->nx_batch, ctx->nx_count);
+        ctx->nx_count = 0;
+    }
+}
+
 void wte_rescan_user_pages(CPUState *cpu)
 {
     if (!wte_state.active) return;
-
-    X86CPU *cpux86 = X86_CPU(cpu);
-    CPUX86State *env = &cpux86->env;
 
     /* Only rescan when running in a context where target CR3 is valid */
     uint64_t cr3 = wte_state.target_cr3;
     if (cr3 == 0) return;
 
-    uint64_t pml4_base = cr3 & 0x000FFFFFFFFFF000ULL;
-    uint64_t pml4_table[512];
-    cpu_physical_memory_read(pml4_base, pml4_table, 4096);
-
-    uint64_t pml4e = pml4_table[0];
-    if (!(pml4e & 1)) return;
-
-    uint64_t pdpt_base = pml4e & 0x000FFFFFFFFFF000ULL;
-    uint64_t pdpt_table[512];
-    cpu_physical_memory_read(pdpt_base, pdpt_table, 4096);
-
-    uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
-    int nx_count = 0;
-    int new_nx = 0;
     static int rescan_call_count = 0;
     static int total_user_pages_seen = 0;
     rescan_call_count++;
 
-    for (int pdpte_idx = 0; pdpte_idx < 2; pdpte_idx++) {
-        uint64_t pdpte = pdpt_table[pdpte_idx];
-        if (!(pdpte & 1)) continue;
-        if (pdpte & (1ULL << 7)) continue;
+    wte_rescan_ctx_t rctx = {
+        .nx_count          = 0,
+        .new_nx            = 0,
+        .rescan_call_count = rescan_call_count,
+    };
 
-        uint64_t pd_base = pdpte & 0x000FFFFFFFFFF000ULL;
-        uint64_t pd_table[512];
-        cpu_physical_memory_read(pd_base, pd_table, 4096);
+    wte_walk_user_pages(cpu, cr3, wte_state.is_64bit,
+                        wte_rescan_visit, &rctx);
 
-        for (int pde_idx = 0; pde_idx < 512; pde_idx++) {
-            uint64_t pde = pd_table[pde_idx];
-            if (!(pde & 1)) continue;
+    if (rctx.nx_count > 0) wte_kvm_set_nx(rctx.nx_batch, rctx.nx_count);
 
-            if (pde & (1ULL << 7)) {
-                /* 2MB huge page */
-                uint64_t page_phys = pde & 0x000FFFFFFFE00000ULL;
-                uint32_t base_va = ((uint32_t)pdpte_idx << 30) |
-                                   ((uint32_t)pde_idx << 21);
-                for (int k = 0; k < 512; k++) {
-                    uint32_t va = base_va + ((uint32_t)k << 12);
-                    if (va < 0x10000 || va >= 0x7FFF0000) continue;
-                    if (va >= wte_state.pe_base_va &&
-                        va < wte_state.pe_end_va) continue;
-                    uint64_t gfn = (page_phys + ((uint64_t)k << 12)) >> 12;
-                    uint64_t gpa = gfn << 12;
+    total_user_pages_seen += rctx.new_nx;
 
-                    /* Skip if already tracked */
-                    wte_page_entry_t *entry = wte_lookup_gfn(gfn);
-                    if (entry && (entry->flags & (WTE_PAGE_X_BLOCKED |
-                                                  WTE_PAGE_X_ALLOWED)))
-                        continue;
-
-                    /* Create tracking entry so exec handler finds it.
-                     * Baseline is zeroed (not read from memory) because
-                     * the page was dynamically allocated — any non-zero
-                     * content means "written by packer" and should trigger
-                     * WtE detection. Reading baseline = current would make
-                     * diff_count = 0, silently allowing execution. */
-                    if (!entry) {
-                        entry = wte_lookup_or_create_va((uint64_t)va, gfn);
-                        entry->gpa = gpa;
-                        entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_WRITTEN;
-                        memset(entry->baseline, 0, WTE_PAGE_SIZE);
-                        entry->baseline_valid = true;
-                        cpu_physical_memory_read(gpa, entry->current, WTE_PAGE_SIZE);
-                    }
-                    entry->flags |= WTE_PAGE_X_BLOCKED;
-
-                    nx_batch[nx_count++] = gfn;
-                    new_nx++;
-                    if (nx_count >= WTE_MAX_BATCH_GFNS) {
-                        wte_kvm_set_nx(nx_batch, nx_count);
-                        nx_count = 0;
-                    }
-                }
-            } else {
-                uint64_t pt_base = pde & 0x000FFFFFFFFFF000ULL;
-                uint64_t pt_table[512];
-                cpu_physical_memory_read(pt_base, pt_table, 4096);
-
-                for (int pte_idx = 0; pte_idx < 512; pte_idx++) {
-                    uint64_t pte = pt_table[pte_idx];
-                    if (!(pte & 1)) continue;
-
-                    uint32_t va = ((uint32_t)pdpte_idx << 30) |
-                                  ((uint32_t)pde_idx << 21) |
-                                  ((uint32_t)pte_idx << 12);
-                    if (va < 0x10000 || va >= 0x7FFF0000) continue;
-                    if (va >= wte_state.pe_base_va &&
-                        va < wte_state.pe_end_va) continue;
-                    uint64_t gfn = (pte & 0x000FFFFFFFFFF000ULL) >> 12;
-                    uint64_t gpa = gfn << 12;
-
-                    wte_page_entry_t *entry = wte_lookup_gfn(gfn);
-                    if (entry && (entry->flags & (WTE_PAGE_X_BLOCKED |
-                                                  WTE_PAGE_X_ALLOWED)))
-                        continue;
-
-                    if (!entry) {
-                        entry = wte_lookup_or_create_va((uint64_t)va, gfn);
-                        entry->gpa = gpa;
-                        entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_WRITTEN;
-                        memset(entry->baseline, 0, WTE_PAGE_SIZE);
-                        entry->baseline_valid = true;
-                        cpu_physical_memory_read(gpa, entry->current, WTE_PAGE_SIZE);
-
-                        /* Per-page diagnostic for dynamic region */
-                        if ((va >= 0x7f900000 && va < 0x7fc00000) ||
-                            (va >= 0x7fd00000 && va < 0x7ff00000)) {
-                            nyx_printf("[WtE][RESCAN-PAGE] NEW VA=0x%x "
-                                       "GFN=0x%lx (rescan #%d)\n",
-                                       va, (unsigned long)gfn,
-                                       rescan_call_count);
-                        }
-                    }
-                    entry->flags |= WTE_PAGE_X_BLOCKED;
-
-                    nx_batch[nx_count++] = gfn;
-                    new_nx++;
-                    if (nx_count >= WTE_MAX_BATCH_GFNS) {
-                        wte_kvm_set_nx(nx_batch, nx_count);
-                        nx_count = 0;
-                    }
-                }
-            }
-        }
-    }
-
-    if (nx_count > 0) wte_kvm_set_nx(nx_batch, nx_count);
-
-    total_user_pages_seen += new_nx;
-
-    if (new_nx > 0) {
-        nyx_printf("[WtE][RESCAN] #%d: NX applied to %d new user pages "
+    if (rctx.new_nx > 0) {
+        nyx_printf("[WtE][RESCAN] (%s) #%d: NX applied to %d new user pages "
                    "(total tracked: %d)\n",
-                   rescan_call_count, new_nx, total_user_pages_seen);
+                   wte_state.is_64bit ? "64-bit" : "32-bit",
+                   rescan_call_count, rctx.new_nx, total_user_pages_seen);
     }
 
     /* Diagnostic: count all dynamic (non-PE) tracked pages */
