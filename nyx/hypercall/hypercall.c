@@ -1880,9 +1880,17 @@ int handle_kafl_hypercall(struct kvm_run *run,
                        (unsigned long)wte_gfn, (unsigned long)wte_rip);
             wte_handle_write_violation(wte_gfn, wte_gpa, wte_rip, cpu);
         } else {
-            nyx_printf("[WtE] KVM exit (EXEC): GFN=0x%lx RIP=0x%lx\n",
-                       (unsigned long)wte_gfn, (unsigned long)wte_rip);
-            wte_handle_exec_violation(wte_gfn, wte_gpa, wte_rip, cpu);
+            /* Non-target CR3: harness or OS hit a shared NX DLL page.
+             * Clear NX quietly — no WtE event (page was not written). */
+            if (wte_is_active() &&
+                wte_get_state()->target_cr3 != 0 &&
+                wte_cr3 != wte_get_state()->target_cr3) {
+                wte_kvm_clear_nx(&wte_gfn, 1);
+            } else {
+                nyx_printf("[WtE] KVM exit (EXEC): GFN=0x%lx RIP=0x%lx\n",
+                           (unsigned long)wte_gfn, (unsigned long)wte_rip);
+                wte_handle_exec_violation(wte_gfn, wte_gpa, wte_rip, cpu);
+            }
         }
         ret = 0;
         break;
