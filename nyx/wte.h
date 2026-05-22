@@ -256,6 +256,7 @@ bool wte_is_target_pe_gfn(uint64_t gfn);
 void wte_pt_check(CPUState *cpu);
 
 /* DLL module enumeration (PEB→Ldr walk) and RIP filtering */
+int  wte_walk_module_list(CPUState *cpu, wte_dll_entry_t *out, int max);
 void wte_enumerate_dlls(CPUState *cpu);
 bool wte_is_dll_rip(uint64_t rip, CPUState *cpu);
 

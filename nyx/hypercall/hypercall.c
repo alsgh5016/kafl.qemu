@@ -762,7 +762,6 @@ static void handle_hypercall_kafl_user_submit_mode(struct kvm_run *run,
  *   env   - x86 CPU environment (must have fresh registers)
  *   label - human-readable label for this dump (e.g. API name, hook name)
  */
-typedef struct { uint32_t base; uint32_t size; char name[128]; } mod_info_t;
 typedef struct { uint32_t va; uint64_t phys; uint8_t perm; } mapped_page_t;
 #define MAX_MODS 256
 
@@ -827,66 +826,17 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
 {
     int seq = dump_seq_counter++;
 
-    /* --- 1. Read TEB/PEB for module enumeration (32-bit WOW64) --- */
-    uint32_t fs_base = (uint32_t)(env->segs[R_FS].base);
-    uint32_t peb_ptr = 0;
-    if (!read_virtual_memory((uint64_t)(fs_base + 0x30),
-                             (uint8_t*)&peb_ptr, 4, cpu)) {
-        nyx_printf("    [FULLDUMP] Failed to read PEB ptr (FS:0x%x+0x30)\n",
-                   fs_base);
-        return;
-    }
+    /* --- 1+2. Enumerate loaded modules via PEB→Ldr (bitness-aware) --- */
+    wte_dll_entry_t *modules = calloc(MAX_MODS, sizeof(wte_dll_entry_t));
+    int num_modules = wte_walk_module_list(cpu, modules, MAX_MODS);
 
-    /* --- 2. Enumerate loaded modules via PEB->Ldr --- */
-    mod_info_t *modules = calloc(MAX_MODS, sizeof(mod_info_t));
-    int num_modules = 0;
-
-    uint32_t ldr_ptr = 0;
-    if (read_virtual_memory((uint64_t)(peb_ptr + 0x0C),
-                            (uint8_t*)&ldr_ptr, 4, cpu) && ldr_ptr != 0) {
-        uint32_t list_head = ldr_ptr + 0x14;
-        uint32_t flink = 0;
-        read_virtual_memory((uint64_t)list_head, (uint8_t*)&flink, 4, cpu);
-
-        uint32_t cur = flink;
-        while (cur != 0 && cur != list_head && num_modules < MAX_MODS) {
-            uint32_t dll_base = 0, dll_size = 0;
-            read_virtual_memory((uint64_t)(cur + 0x10), (uint8_t*)&dll_base, 4, cpu);
-            read_virtual_memory((uint64_t)(cur + 0x18), (uint8_t*)&dll_size, 4, cpu);
-
-            uint16_t name_len = 0;
-            uint32_t name_buf = 0;
-            read_virtual_memory((uint64_t)(cur + 0x24), (uint8_t*)&name_len, 2, cpu);
-            read_virtual_memory((uint64_t)(cur + 0x24 + 4), (uint8_t*)&name_buf, 4, cpu);
-
-            modules[num_modules].base = dll_base;
-            modules[num_modules].size = dll_size;
-            memset(modules[num_modules].name, 0, 128);
-
-            if (name_len > 0 && name_buf != 0) {
-                uint16_t wbuf[128];
-                memset(wbuf, 0, sizeof(wbuf));
-                int nchars = (name_len / 2 < 127) ? name_len / 2 : 127;
-                read_virtual_memory((uint64_t)name_buf, (uint8_t*)wbuf, nchars * 2, cpu);
-                for (int c = 0; c < nchars; c++)
-                    modules[num_modules].name[c] = (char)(wbuf[c] & 0xFF);
-            }
-
-            num_modules++;
-
-            uint32_t next = 0;
-            if (!read_virtual_memory((uint64_t)cur, (uint8_t*)&next, 4, cpu))
-                break;
-            if (next == cur) break;
-            cur = next;
-        }
-    }
-
-    nyx_printf("    [FULLDUMP] #%03d (%s): PEB=0x%x, %d modules loaded\n",
-               seq, label, peb_ptr, num_modules);
+    nyx_printf("    [FULLDUMP] #%03d (%s): %d modules loaded\n",
+               seq, label, num_modules);
     for (int m = 0; m < num_modules; m++) {
-        nyx_printf("    [FULLDUMP]   %-30s @ 0x%08x  size=0x%x\n",
-                   modules[m].name, modules[m].base, modules[m].size);
+        nyx_printf("    [FULLDUMP]   %-30s @ 0x%016lx  size=0x%lx\n",
+                   modules[m].name,
+                   (unsigned long)modules[m].base,
+                   (unsigned long)(modules[m].end - modules[m].base));
     }
 
     /* --- 3. Create dump directory --- */
@@ -968,8 +918,10 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
             "START", "END", "SIZE", "PERM", "FILE", "MODULE");
 
     for (int m = 0; m < num_modules; m++) {
-        fprintf(map_f, "# MODULE: %-30s  base=0x%08x  size=0x%08x\n",
-                modules[m].name, modules[m].base, modules[m].size);
+        fprintf(map_f, "# MODULE: %-30s  base=0x%016lx  size=0x%lx\n",
+                modules[m].name,
+                (unsigned long)modules[m].base,
+                (unsigned long)(modules[m].end - modules[m].base));
     }
     fprintf(map_f, "\n");
 
@@ -1139,7 +1091,7 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
             const char *mod_name = NULL;
             for (int m = 0; m < num_modules; m++) {
                 if (region_start >= modules[m].base &&
-                    region_start < modules[m].base + modules[m].size) {
+                    region_start < modules[m].end) {
                     mod_name = modules[m].name;
                     break;
                 }
@@ -1200,7 +1152,7 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
             const char *mod_name = NULL;
             for (int m = 0; m < num_modules; m++) {
                 if (va >= modules[m].base &&
-                    va < modules[m].base + modules[m].size) {
+                    va < modules[m].end) {
                     mod_name = modules[m].name;
                     break;
                 }
@@ -1296,7 +1248,7 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                     const char *mname = NULL;
                     for (int m = 0; m < num_modules; m++) {
                         if (va >= modules[m].base &&
-                            va < modules[m].base + modules[m].size) {
+                            va < modules[m].end) {
                             mname = modules[m].name;
                             break;
                         }
@@ -1343,7 +1295,7 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                 const char *mname = NULL;
                 for (int m = 0; m < num_modules; m++) {
                     if (va >= modules[m].base &&
-                        va < modules[m].base + modules[m].size) {
+                        va < modules[m].end) {
                         mname = modules[m].name;
                         break;
                     }
