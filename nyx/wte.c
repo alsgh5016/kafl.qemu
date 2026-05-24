@@ -840,6 +840,16 @@ static void wte_rescan_visit(uint64_t va, uint64_t gfn, uint64_t gpa,
 
     if (va >= wte_state.pe_base_va && va < wte_state.pe_end_va) return;
 
+    /* Skip known DLL pages — only target PE and dynamic alloc regions are
+     * WtE targets; marking DLL pages IS_DYNAMIC causes false positives. */
+    if (wte_state.dll_filter_enabled) {
+        for (int d = 0; d < wte_state.dll_module_count; d++) {
+            if (va >= wte_state.dll_modules[d].base &&
+                va <  wte_state.dll_modules[d].end)
+                return;
+        }
+    }
+
     /* Skip if already tracked */
     wte_page_entry_t *entry = wte_lookup_gfn(gfn);
     if (entry && (entry->flags & (WTE_PAGE_X_BLOCKED |
@@ -1471,6 +1481,22 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
             return;
         }
 
+        /* Architectural guard: only report WtE on target PE pages or
+         * explicitly registered dynamic alloc regions.  Pages tracked via
+         * dirty ring alone (IS_PE / IS_DYNAMIC both clear) are DLL / system
+         * pages — allow execution silently without triggering a dump. */
+        if (!(entry->flags & (WTE_PAGE_IS_PE | WTE_PAGE_IS_DYNAMIC))) {
+            nyx_printf("[WtE][EXEC] Non-target page VA=0x%lx skipped "
+                       "(not IS_PE/IS_DYNAMIC)\n",
+                       (unsigned long)entry->va);
+            memcpy(entry->baseline, entry->current, WTE_PAGE_SIZE);
+            entry->flags &= ~WTE_PAGE_WRITTEN;
+            wte_kvm_clear_nx(&gfn, 1);
+            entry->flags &= ~WTE_PAGE_X_BLOCKED;
+            entry->flags |= WTE_PAGE_X_ALLOWED;
+            return;
+        }
+
         /* Check if the EXECUTED address was actually modified.
          * A page may have diffs (e.g., Themida VM writes data at offset A)
          * but execute at a different offset B that was NOT modified.
@@ -1593,8 +1619,21 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
         /* If this is an unknown dynamic region, start write tracking */
         bool is_known = (entry->flags & WTE_PAGE_IS_PE) ||
                         (entry->flags & WTE_PAGE_IS_DYNAMIC);
-        bool in_dll = wte_state.dll_filter_enabled &&
-                      wte_is_dll_rip(rip, cpu);
+
+        /* VA-range check first (no rate-limit); fall back to RIP-based
+         * check (wte_is_dll_rip includes lazy re-enumerate for new DLLs). */
+        bool in_dll = false;
+        if (wte_state.dll_filter_enabled) {
+            for (int d = 0; d < wte_state.dll_module_count; d++) {
+                if (entry->va >= wte_state.dll_modules[d].base &&
+                    entry->va <  wte_state.dll_modules[d].end) {
+                    in_dll = true;
+                    break;
+                }
+            }
+            if (!in_dll)
+                in_dll = wte_is_dll_rip(rip, cpu);
+        }
 
         if (!is_known && !in_dll) {
             nyx_printf("[WtE][DYN-EXEC] New execution region: VA=0x%lx "
