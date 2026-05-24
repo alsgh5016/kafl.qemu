@@ -762,7 +762,7 @@ static void handle_hypercall_kafl_user_submit_mode(struct kvm_run *run,
  *   env   - x86 CPU environment (must have fresh registers)
  *   label - human-readable label for this dump (e.g. API name, hook name)
  */
-typedef struct { uint32_t va; uint64_t phys; uint8_t perm; } mapped_page_t;
+typedef struct { uint64_t va; uint64_t phys; uint8_t perm; } mapped_page_t;
 #define MAX_MODS 256
 
 static int dump_seq_counter = 0;
@@ -770,7 +770,7 @@ static int dump_seq_counter = 0;
 /* ── Cross-dump byte diff: previous snapshot state ────────────── */
 
 typedef struct {
-    uint32_t va;                              /* Virtual address of page   */
+    uint64_t va;                              /* Virtual address of page   */
     uint8_t  content[WTE_PAGE_SIZE];          /* Page content (4096 bytes) */
 } crossdump_page_t;
 
@@ -807,7 +807,7 @@ void wte_crossdump_destroy(void)
 }
 
 /* Binary search helper — crossdump pages are sorted by VA */
-static int crossdump_find_va(uint32_t va)
+static int crossdump_find_va(uint64_t va)
 {
     int lo = 0, hi = crossdump_prev.count - 1;
     while (lo <= hi) {
@@ -946,9 +946,17 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
     uint64_t pml4_table[512];
     cpu_physical_memory_read(pml4_base, pml4_table, 4096);
 
-    /* PML4[0] covers user-space VA 0x000000000000 - 0x007FFFFFFFFFFF */
-    uint64_t pml4e = pml4_table[0];
-    if (pml4e & 1) {
+    /*
+     * Walk all user-space PML4 entries (0-255 for Windows 64-bit user space).
+     * Windows 64-bit places DLLs and PEs in the high user range (e.g.
+     * 0x7FF6...), which falls in PML4[255].  The old code only read PML4[0]
+     * and iterated PDPT[0..1], covering only VA 0-2 GB — entirely missing
+     * 64-bit PE images.
+     */
+    for (int pml4_idx = 0; pml4_idx < 256; pml4_idx++) {
+        uint64_t pml4e = pml4_table[pml4_idx];
+        if (!(pml4e & 1)) continue;
+
         bool pml4_w = !!(pml4e & (1ULL << 1));
         bool pml4_x = !(pml4e & (1ULL << 63));
 
@@ -956,11 +964,33 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
         uint64_t pdpt_table[512];
         cpu_physical_memory_read(pdpt_base, pdpt_table, 4096);
 
-        /* PDPT[0..1] covers VA 0x00000000 - 0x7FFFFFFF (32-bit user space) */
-        for (int pdpte_idx = 0; pdpte_idx < 2; pdpte_idx++) {
+        for (int pdpte_idx = 0; pdpte_idx < 512; pdpte_idx++) {
             uint64_t pdpte = pdpt_table[pdpte_idx];
             if (!(pdpte & 1)) continue;
-            if (pdpte & (1ULL << 7)) continue; /* 1GB huge page - skip */
+
+            if (pdpte & (1ULL << 7)) {
+                /* 1GB huge page */
+                bool hp_w = pml4_w && !!(pdpte & (1ULL << 1));
+                bool hp_x = pml4_x && !(pdpte & (1ULL << 63));
+                uint64_t page_phys = pdpte & 0x000FFFFFC0000000ULL;
+                uint64_t base_va = ((uint64_t)pml4_idx << 39) |
+                                   ((uint64_t)pdpte_idx << 30);
+                for (int k = 0; k < 512 * 512; k++) {
+                    uint64_t va = base_va + ((uint64_t)k << 12);
+                    if (va < 0x10000) continue;
+                    if (pg_count >= pg_capacity) {
+                        pg_capacity *= 2;
+                        pages = realloc(pages, pg_capacity * sizeof(mapped_page_t));
+                    }
+                    pages[pg_count].va   = va;
+                    pages[pg_count].phys = page_phys + ((uint64_t)k << 12);
+                    pages[pg_count].perm = 0x01
+                                         | (hp_w ? 0x02 : 0)
+                                         | (hp_x ? 0x04 : 0);
+                    pg_count++;
+                }
+                continue;
+            }
 
             bool pdpt_w = pml4_w && !!(pdpte & (1ULL << 1));
             bool pdpt_x = pml4_x && !(pdpte & (1ULL << 63));
@@ -976,20 +1006,19 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                 bool pd_w = pdpt_w && !!(pde & (1ULL << 1));
                 bool pd_x = pdpt_x && !(pde & (1ULL << 63));
 
+                uint64_t base_va = ((uint64_t)pml4_idx << 39) |
+                                   ((uint64_t)pdpte_idx << 30) |
+                                   ((uint64_t)pde_idx << 21);
+
                 if (pde & (1ULL << 7)) {
-                    /* 2MB huge page: physical base uses bits 21-51 */
+                    /* 2MB huge page */
                     uint64_t page_phys = pde & 0x000FFFFFFFE00000ULL;
-                    uint32_t base_va = ((uint32_t)pdpte_idx << 30) |
-                                       ((uint32_t)pde_idx << 21);
-
                     for (int k = 0; k < 512; k++) {
-                        uint32_t va = base_va + ((uint32_t)k << 12);
-                        if (va < 0x10000 || va >= 0x7FFF0000) continue;
-
+                        uint64_t va = base_va + ((uint64_t)k << 12);
+                        if (va < 0x10000) continue;
                         if (pg_count >= pg_capacity) {
                             pg_capacity *= 2;
-                            pages = realloc(pages,
-                                            pg_capacity * sizeof(mapped_page_t));
+                            pages = realloc(pages, pg_capacity * sizeof(mapped_page_t));
                         }
                         pages[pg_count].va   = va;
                         pages[pg_count].phys = page_phys + ((uint64_t)k << 12);
@@ -1001,7 +1030,7 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                     continue;
                 }
 
-                /* 4KB pages: load the page table */
+                /* 4KB pages */
                 uint64_t pt_base = pde & 0x000FFFFFFFFFF000ULL;
                 uint64_t pt_table[512];
                 cpu_physical_memory_read(pt_base, pt_table, 4096);
@@ -1010,10 +1039,8 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                     uint64_t pte = pt_table[pte_idx];
                     if (!(pte & 1)) continue;
 
-                    uint32_t va = ((uint32_t)pdpte_idx << 30) |
-                                  ((uint32_t)pde_idx << 21) |
-                                  ((uint32_t)pte_idx << 12);
-                    if (va < 0x10000 || va >= 0x7FFF0000) continue;
+                    uint64_t va = base_va + ((uint64_t)pte_idx << 12);
+                    if (va < 0x10000) continue;
 
                     uint64_t phys = pte & 0x000FFFFFFFFFF000ULL;
                     bool w = pd_w && !!(pte & (1ULL << 1));
@@ -1021,8 +1048,7 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
 
                     if (pg_count >= pg_capacity) {
                         pg_capacity *= 2;
-                        pages = realloc(pages,
-                                        pg_capacity * sizeof(mapped_page_t));
+                        pages = realloc(pages, pg_capacity * sizeof(mapped_page_t));
                     }
                     pages[pg_count].va   = va;
                     pages[pg_count].phys = phys;
@@ -1068,7 +1094,7 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
         /* First dump: write all regions (full baseline) */
         int i = 0;
         while (i < pg_count) {
-            uint32_t region_start = pages[i].va;
+            uint64_t region_start = pages[i].va;
             uint8_t  region_perm  = pages[i].perm;
             int      region_first = i;
 
@@ -1080,7 +1106,7 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
             int region_last = i;
             i++;
 
-            uint32_t region_size = (uint32_t)(region_last - region_first + 1) * 0x1000;
+            uint64_t region_size = (uint64_t)(region_last - region_first + 1) * 0x1000;
 
             char perm_str[4];
             perm_str[0] = 'r';
@@ -1098,8 +1124,9 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
             }
 
             char *reg_path = NULL;
-            assert(asprintf(&reg_path, "%s/region_%08x_%x_%s.bin",
-                            dump_dir, region_start, region_size, perm_str) != -1);
+            assert(asprintf(&reg_path, "%s/region_%016lx_%lx_%s.bin",
+                            dump_dir, (unsigned long)region_start,
+                            (unsigned long)region_size, perm_str) != -1);
             FILE *rf = fopen(reg_path, "w");
             if (rf) {
                 for (int p = region_first; p <= region_last; p++) {
@@ -1108,9 +1135,14 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                 fclose(rf);
             }
 
-            fprintf(map_f, "  0x%08x  0x%08x  0x%08x  %-5s  region_%08x_%x_%s.bin  %s\n",
-                    region_start, region_start + region_size, region_size,
-                    perm_str, region_start, region_size, perm_str,
+            fprintf(map_f, "  0x%016lx  0x%016lx  0x%016lx  %-5s  region_%016lx_%lx_%s.bin  %s\n",
+                    (unsigned long)region_start,
+                    (unsigned long)(region_start + region_size),
+                    (unsigned long)region_size,
+                    perm_str,
+                    (unsigned long)region_start,
+                    (unsigned long)region_size,
+                    perm_str,
                     mod_name ? mod_name : "");
 
             region_count++;
@@ -1124,7 +1156,7 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                 crossdump_prev.prev_seq);
 
         for (int p = 0; p < cur_snap_count; p++) {
-            uint32_t va = cur_snap[p].va;
+            uint64_t va = cur_snap[p].va;
             int prev_idx = crossdump_find_va(va);
 
             bool page_changed;
@@ -1159,17 +1191,17 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
             }
 
             char *pg_path = NULL;
-            assert(asprintf(&pg_path, "%s/page_%08x_%s.bin",
-                            dump_dir, va, perm_str) != -1);
+            assert(asprintf(&pg_path, "%s/page_%016lx_%s.bin",
+                            dump_dir, (unsigned long)va, perm_str) != -1);
             FILE *pf = fopen(pg_path, "w");
             if (pf) {
                 fwrite(cur_snap[p].content, 1, 0x1000, pf);
                 fclose(pf);
             }
 
-            fprintf(map_f, "  0x%08x  0x%08x  0x00001000  %-5s  page_%08x_%s.bin  %-7s  %s\n",
-                    va, va + 0x1000,
-                    perm_str, va, perm_str,
+            fprintf(map_f, "  0x%016lx  0x%016lx  0x00001000  %-5s  page_%016lx_%s.bin  %-7s  %s\n",
+                    (unsigned long)va, (unsigned long)(va + 0x1000),
+                    perm_str, (unsigned long)va, perm_str,
                     prev_idx < 0 ? "NEW" : "CHANGED",
                     mod_name ? mod_name : "");
 
@@ -1237,7 +1269,7 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
 
             /* Compare each current page with previous snapshot */
             for (int c = 0; c < cur_snap_count; c++) {
-                uint32_t va = cur_snap[c].va;
+                uint64_t va = cur_snap[c].va;
                 int prev_idx = crossdump_find_va(va);
 
                 if (prev_idx < 0) {
@@ -1254,8 +1286,8 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                         }
                     }
 
-                    fprintf(diff_f, "NEW   VA=0x%08x  %s\n",
-                            va, mname ? mname : "(unmapped)");
+                    fprintf(diff_f, "NEW   VA=0x%016lx  %s\n",
+                            (unsigned long)va, mname ? mname : "(unmapped)");
                     continue;
                 }
 
@@ -1301,8 +1333,8 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                     }
                 }
 
-                fprintf(diff_f, "CHANGED  VA=0x%08x  %d ranges  %d bytes  %s\n",
-                        va, range_count, page_changed_bytes,
+                fprintf(diff_f, "CHANGED  VA=0x%016lx  %d ranges  %d bytes  %s\n",
+                        (unsigned long)va, range_count, page_changed_bytes,
                         mname ? mname : "(unmapped)");
                 for (int r = 0; r < range_count; r++) {
                     fprintf(diff_f, "    offset=0x%04x  len=%d\n",
@@ -1312,8 +1344,7 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
 
             /* Check for removed pages (in prev but not in current) */
             for (int p = 0; p < crossdump_prev.count; p++) {
-                uint32_t prev_va = crossdump_prev.pages[p].va;
-                /* Linear scan in current snapshot (sorted by VA) */
+                uint64_t prev_va = crossdump_prev.pages[p].va;
                 bool found = false;
                 int lo = 0, hi = cur_snap_count - 1;
                 while (lo <= hi) {
@@ -1324,7 +1355,7 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                 }
                 if (!found) {
                     removed_pages++;
-                    fprintf(diff_f, "REMOVED  VA=0x%08x\n", prev_va);
+                    fprintf(diff_f, "REMOVED  VA=0x%016lx\n", (unsigned long)prev_va);
                 }
             }
 
