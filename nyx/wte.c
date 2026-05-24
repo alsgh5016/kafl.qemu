@@ -1053,6 +1053,34 @@ void wte_handle_mtf(CPUState *cpu)
                (unsigned long)va);
 }
 
+/* ── Thread ID helper ────────────────────────────────────────── */
+
+/*
+ * Read the Windows Thread ID from the current thread's TEB.
+ *   64-bit: GS.base = TEB, ClientId.UniqueThread at TEB+0x48
+ *   32-bit: FS.base = TEB, ClientId.UniqueThread at TEB+0x24
+ * Returns 0 on read failure (never returns garbage).
+ */
+static uint32_t wte_get_thread_id(CPUState *cpu)
+{
+    X86CPU      *cpux86 = X86_CPU(cpu);
+    CPUX86State *env    = &cpux86->env;
+
+    if (wte_state.is_64bit) {
+        uint64_t teb = env->segs[R_GS].base;
+        uint64_t tid64 = 0;
+        if (!read_virtual_memory(teb + 0x48, (uint8_t *)&tid64, 8, cpu))
+            return 0;
+        return (uint32_t)tid64;
+    } else {
+        uint32_t teb = (uint32_t)env->segs[R_FS].base;
+        uint32_t tid = 0;
+        if (!read_virtual_memory((uint64_t)(teb + 0x24), (uint8_t *)&tid, 4, cpu))
+            return 0;
+        return tid;
+    }
+}
+
 /* ── Deferred Verification (same-page self-modifying code) ────── */
 
 void wte_check_deferred_pages(CPUState *cpu)
@@ -1091,17 +1119,20 @@ void wte_check_deferred_pages(CPUState *cpu)
                 X86CPU *cpux86 = X86_CPU(cpu);
                 CPUX86State *env = &cpux86->env;
                 char wte_label[128];
-                uint32_t _fs = (uint32_t)env->segs[R_FS].base;
+                uint32_t _tid = wte_get_thread_id(cpu);
                 snprintf(wte_label, sizeof(wte_label),
                          "wte_rip0x%lx_va0x%lx_tid0x%08x",
                          (unsigned long)entry->last_write_rip,
-                         (unsigned long)entry->va, _fs);
+                         (unsigned long)entry->va, _tid);
+                uint64_t _teb = wte_state.is_64bit
+                    ? env->segs[R_GS].base
+                    : (uint64_t)(uint32_t)env->segs[R_FS].base;
                 wte_dump_event_t evt = {
                     .type            = "DEFERRED",
                     .rip             = entry->last_write_rip,
                     .va              = entry->va,
                     .gfn             = entry->gfn,
-                    .fs_base         = (uint64_t)env->segs[R_FS].base,
+                    .fs_base         = _teb,
                     .diff_count      = entry->diff_count,
                     .wte_count       = wte_state.wte_count,
                     .total_wte_count = wte_state.total_wte_count,
@@ -1155,6 +1186,7 @@ static void wte_read_name(CPUState *cpu, uint64_t buf, uint16_t len,
  *   cur+0x10 = DllBase (4B), cur+0x18 = SizeOfImage (4B),
  *   cur+0x24 = BaseDllName.Length (2B), cur+0x28 = BaseDllName.Buffer (4B)
  */
+
 int wte_walk_module_list(CPUState *cpu, wte_dll_entry_t *out, int max)
 {
     X86CPU      *cpux86 = X86_CPU(cpu);
@@ -1510,17 +1542,20 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
             X86CPU *cpux86 = X86_CPU(cpu);
             CPUX86State *env = &cpux86->env;
             char wte_label[128];
-            uint32_t _fs = (uint32_t)env->segs[R_FS].base;
+            uint32_t _tid = wte_get_thread_id(cpu);
             snprintf(wte_label, sizeof(wte_label),
                      "wte_rip0x%lx_va0x%lx_tid0x%08x",
                      (unsigned long)rip,
-                     (unsigned long)entry->va, _fs);
+                     (unsigned long)entry->va, _tid);
+            uint64_t _teb = wte_state.is_64bit
+                ? env->segs[R_GS].base
+                : (uint64_t)(uint32_t)env->segs[R_FS].base;
             wte_dump_event_t evt = {
                 .type            = "EXEC",
                 .rip             = rip,
                 .va              = entry->va,
                 .gfn             = entry->gfn,
-                .fs_base         = (uint64_t)env->segs[R_FS].base,
+                .fs_base         = _teb,
                 .diff_count      = entry->diff_count,
                 .wte_count       = wte_state.wte_count,
                 .total_wte_count = wte_state.total_wte_count,
