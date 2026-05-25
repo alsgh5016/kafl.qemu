@@ -827,79 +827,41 @@ void wte_protect_all_user_pages(CPUState *cpu, uint64_t cr3)
  * the initial WTE_SETUP scan.
  */
 typedef struct {
-    uint64_t  nx_batch[WTE_MAX_BATCH_GFNS];
-    int       nx_count;
-    int       new_nx;
-    int       rescan_call_count;
-    CPUState *cpu;              /* for on-demand DLL re-enumeration */
-    bool      dll_reenumerated; /* re-enumerate at most once per rescan run */
+    uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
+    int      nx_count;
+    int      new_nx;
+    int      rescan_call_count;
 } wte_rescan_ctx_t;
 
 static void wte_rescan_visit(uint64_t va, uint64_t gfn, uint64_t gpa,
                              void *ctx_)
 {
+    (void)gpa;
     wte_rescan_ctx_t *ctx = ctx_;
 
     if (va >= wte_state.pe_base_va && va < wte_state.pe_end_va) return;
 
-    /* Skip known DLL pages — only target PE and dynamic alloc regions are
-     * WtE targets; marking DLL pages IS_DYNAMIC causes false positives. */
-    if (wte_state.dll_filter_enabled) {
-        for (int d = 0; d < wte_state.dll_module_count; d++) {
-            if (va >= wte_state.dll_modules[d].base &&
-                va <  wte_state.dll_modules[d].end)
-                return;
-        }
-    }
-
-    /* Skip if already tracked */
+    /* Skip if already NX-blocked or execution already allowed */
     wte_page_entry_t *entry = wte_lookup_gfn(gfn);
     if (entry && (entry->flags & (WTE_PAGE_X_BLOCKED |
                                   WTE_PAGE_X_ALLOWED))) return;
 
-    if (!entry) {
-        /* New page not in current DLL list.  Re-enumerate DLLs once per
-         * rescan run to catch DLLs that loaded after the last enumeration
-         * (e.g., delayed-import, COM, app-verifier stubs).  This avoids
-         * the IS_DYNAMIC false-positive for pages belonging to a newly
-         * loaded DLL that wasn't visible at rescan start. */
-        if (wte_state.dll_filter_enabled && ctx->cpu &&
-            !ctx->dll_reenumerated) {
-            ctx->dll_reenumerated = true;
-            wte_enumerate_dlls(ctx->cpu);
-            /* Re-check with freshly updated DLL list */
-            for (int d = 0; d < wte_state.dll_module_count; d++) {
-                if (va >= wte_state.dll_modules[d].base &&
-                    va <  wte_state.dll_modules[d].end)
-                    return;
-            }
-        }
-
-        /* Create tracking entry so exec handler finds it.
-         * Baseline is zeroed (not read from memory) because the page was
-         * dynamically allocated — any non-zero content means "written by
-         * packer" and should trigger WtE detection. Reading baseline =
-         * current would make diff_count = 0, silently allowing execution. */
-        entry = wte_lookup_or_create_va(va, gfn);
-        entry->gpa = gpa;
-        entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_WRITTEN;
-        memset(entry->baseline, 0, WTE_PAGE_SIZE);
-        entry->baseline_valid = true;
-        cpu_physical_memory_read(gpa, entry->current, WTE_PAGE_SIZE);
-
-        /* Per-page diagnostic for the WOW64 shared-user / TEB cluster.
-         * Only meaningful in 32-bit walks; native x64 uses different
-         * VA ranges so we suppress this noise there. */
-        if (!wte_state.is_64bit &&
-            (((va >= 0x7f900000ULL && va < 0x7fc00000ULL) ||
-              (va >= 0x7fd00000ULL && va < 0x7ff00000ULL)))) {
-            nyx_printf("[WtE][RESCAN-PAGE] NEW VA=0x%lx "
-                       "GFN=0x%lx (rescan #%d)\n",
-                       (unsigned long)va, (unsigned long)gfn,
-                       ctx->rescan_call_count);
-        }
-    }
-    entry->flags |= WTE_PAGE_X_BLOCKED;
+    /* Apply NX only.  Do NOT create tracking entries or set IS_DYNAMIC here.
+     *
+     * IS_DYNAMIC is set exclusively by wte_register_dynamic_exec_region
+     * (called from NtAllocate/NtProtect api_hooks) and by the late-bind
+     * path in wte_handle_exec_violation for pages in registered dyn_ranges.
+     *
+     * Creating IS_DYNAMIC entries during rescan is unreliable: the DLL list
+     * may be stale or the enumeration context incorrect (rescan fires from
+     * arbitrary VM exits, not necessarily the target-process context).
+     * This caused DLL pages loaded after the initial enumeration to receive
+     * IS_DYNAMIC and then generate spurious WtE events.
+     *
+     * Pages NX'd here without a tracking entry hit the "untracked GFN →
+     * allow execution" fast path in wte_handle_exec_violation. */
+    if (entry)
+        entry->flags |= WTE_PAGE_X_BLOCKED;
 
     ctx->nx_batch[ctx->nx_count++] = gfn;
     ctx->new_nx++;
@@ -931,8 +893,6 @@ void wte_rescan_user_pages(CPUState *cpu)
         .nx_count          = 0,
         .new_nx            = 0,
         .rescan_call_count = rescan_call_count,
-        .cpu               = cpu,
-        .dll_reenumerated  = false,
     };
 
     wte_walk_user_pages(cpu, cr3, wte_state.is_64bit,
