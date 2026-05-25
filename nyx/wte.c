@@ -898,6 +898,12 @@ void wte_rescan_user_pages(CPUState *cpu)
     uint64_t cr3 = wte_state.target_cr3;
     if (cr3 == 0) return;
 
+    /* Ensure DLL list is populated before the walk so wte_rescan_visit can
+     * skip DLL pages.  Without this, the per-page DLL check loops zero times
+     * and every page (including DLL pages) gets marked IS_DYNAMIC. */
+    if (wte_state.dll_filter_enabled && wte_state.dll_module_count == 0)
+        wte_enumerate_dlls(cpu);
+
     static int rescan_call_count = 0;
     static int total_user_pages_seen = 0;
     rescan_call_count++;
