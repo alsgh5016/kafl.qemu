@@ -827,10 +827,12 @@ void wte_protect_all_user_pages(CPUState *cpu, uint64_t cr3)
  * the initial WTE_SETUP scan.
  */
 typedef struct {
-    uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
-    int      nx_count;
-    int      new_nx;
-    int      rescan_call_count;
+    uint64_t  nx_batch[WTE_MAX_BATCH_GFNS];
+    int       nx_count;
+    int       new_nx;
+    int       rescan_call_count;
+    CPUState *cpu;              /* for on-demand DLL re-enumeration */
+    bool      dll_reenumerated; /* re-enumerate at most once per rescan run */
 } wte_rescan_ctx_t;
 
 static void wte_rescan_visit(uint64_t va, uint64_t gfn, uint64_t gpa,
@@ -856,6 +858,23 @@ static void wte_rescan_visit(uint64_t va, uint64_t gfn, uint64_t gpa,
                                   WTE_PAGE_X_ALLOWED))) return;
 
     if (!entry) {
+        /* New page not in current DLL list.  Re-enumerate DLLs once per
+         * rescan run to catch DLLs that loaded after the last enumeration
+         * (e.g., delayed-import, COM, app-verifier stubs).  This avoids
+         * the IS_DYNAMIC false-positive for pages belonging to a newly
+         * loaded DLL that wasn't visible at rescan start. */
+        if (wte_state.dll_filter_enabled && ctx->cpu &&
+            !ctx->dll_reenumerated) {
+            ctx->dll_reenumerated = true;
+            wte_enumerate_dlls(ctx->cpu);
+            /* Re-check with freshly updated DLL list */
+            for (int d = 0; d < wte_state.dll_module_count; d++) {
+                if (va >= wte_state.dll_modules[d].base &&
+                    va <  wte_state.dll_modules[d].end)
+                    return;
+            }
+        }
+
         /* Create tracking entry so exec handler finds it.
          * Baseline is zeroed (not read from memory) because the page was
          * dynamically allocated — any non-zero content means "written by
@@ -912,6 +931,8 @@ void wte_rescan_user_pages(CPUState *cpu)
         .nx_count          = 0,
         .new_nx            = 0,
         .rescan_call_count = rescan_call_count,
+        .cpu               = cpu,
+        .dll_reenumerated  = false,
     };
 
     wte_walk_user_pages(cpu, cr3, wte_state.is_64bit,
