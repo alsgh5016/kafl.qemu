@@ -1012,6 +1012,19 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
         uint32_t il_size   = *(uint32_t *)(info_buf + 0x0C);
         uint32_t eh_count  = *(uint32_t *)(info_buf + 0x14);
 
+        /* Diagnostic: dump raw stack/struct to find mis-read */
+        {
+            uint32_t ret_addr = 0, comp_ptr = 0;
+            read_virtual_memory((uint64_t)esp,       (uint8_t *)&ret_addr, 4, cpu);
+            read_virtual_memory((uint64_t)(esp + 4), (uint8_t *)&comp_ptr, 4, cpu);
+            nyx_printf("[JIT-TAP] CM entry: rip=0x%x esp=0x%x "
+                       "[+0]=0x%x [+4]=0x%x [+8]=0x%x\n",
+                       (uint32_t)rip, esp, ret_addr, comp_ptr, info_ptr);
+            nyx_printf("[JIT-TAP] CM info: ftn=0x%x scope=0x%x "
+                       "ilcode=0x%x il_size=%u eh=%u\n",
+                       ftn, scope, ilcode, il_size, eh_count);
+        }
+
         if (il_size == 0 || il_size > 0x10000) {
             nyx_printf("[JIT-TAP] compileMethod: skip il_size=%u\n", il_size);
             goto allow_cm;
