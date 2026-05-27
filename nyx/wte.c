@@ -337,8 +337,9 @@ void wte_activate(uint64_t cr3, bool is_64bit)
     wte_state.jit_tap.getjit_gfn              = 0;
     wte_state.jit_tap.compile_method_nx_armed = false;
     wte_state.jit_tap.compile_method_gfn      = 0;
-    wte_state.jit_tap.rearm_pending           = false;
-    wte_state.jit_tap.mtf_rearm_gfn           = 0;
+    wte_state.jit_tap.rearm_pending              = false;
+    wte_state.jit_tap.getjit_returned_pending    = false;
+    wte_state.jit_tap.mtf_rearm_gfn              = 0;
     wte_state.jit_tap.dump_file               = NULL;
     wte_state.jit_tap.records_written         = 0;
     wte_state.jit_tap.count_file_offset       = 0;
@@ -880,6 +881,37 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
         /* Do NOT return — continue to process this exec violation normally */
     }
 
+    /* Deferred getJit resolve: getJit initializes the g_jit singleton itself,
+     * so g_jit is null at getJit entry.  After clearing NX (allowing getJit
+     * to run), we set getjit_returned_pending=true.  On the next exec
+     * violation from a different GFN (after getJit has returned), retry. */
+    if (wte_state.jit_tap.getjit_returned_pending &&
+        gfn != wte_state.jit_tap.getjit_gfn) {
+        wte_state.jit_tap.getjit_returned_pending = false;
+        uint64_t cm_va = wte_jit_resolve_compile_method(
+            cpu, wte_state.jit_tap.g_jit_va);
+        if (cm_va != 0) {
+            wte_state.jit_tap.compile_method_va = cm_va;
+            nyx_printf("[JIT-TAP] compileMethod VA=0x%lx (deferred getJit resolve)\n",
+                       (unsigned long)cm_va);
+            wte_jit_tap_arm_nx(cpu, cm_va,
+                               &wte_state.jit_tap.compile_method_gfn);
+            wte_state.jit_tap.compile_method_nx_armed =
+                (wte_state.jit_tap.compile_method_gfn != 0);
+            if (!wte_state.jit_tap.dump_file)
+                wte_jit_il_open();
+        } else {
+            /* Still null — re-arm getJit trap for another try */
+            nyx_printf("[JIT-TAP] deferred resolve: g_jit still null, "
+                       "re-arming getJit trap\n");
+            wte_jit_tap_arm_nx(cpu, wte_state.jit_tap.getjit_va,
+                               &wte_state.jit_tap.getjit_gfn);
+            wte_state.jit_tap.getjit_nx_armed =
+                (wte_state.jit_tap.getjit_gfn != 0);
+        }
+        /* Do NOT return — continue to process this exec violation normally */
+    }
+
     bool is_getjit_page = (wte_state.jit_tap.getjit_nx_armed &&
                            gfn == wte_state.jit_tap.getjit_gfn);
     bool is_cm_page     = (wte_state.jit_tap.compile_method_nx_armed &&
@@ -911,12 +943,13 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
             if (!wte_state.jit_tap.dump_file)
                 wte_jit_il_open();
         } else {
-            /* g_jit still null at getJit entry — extremely rare
-             * (would mean getJit is being called for the very first time
-             * and JIT singleton not yet stored).  Log and give up; the
-             * tap will miss records for this run. */
-            nyx_printf("[JIT-TAP] WARN: g_jit still null at getJit trap, "
-                       "giving up resolution\n");
+            /* g_jit null at getJit entry: getJit() itself creates the
+             * singleton, so it's always null before getJit runs.
+             * Set deferred flag; the resolve will be retried on the next
+             * exec violation from a different GFN (after getJit returns). */
+            wte_state.jit_tap.getjit_returned_pending = true;
+            nyx_printf("[JIT-TAP] getJit entry: g_jit null, "
+                       "deferring resolve to return\n");
         }
         return true;
     }
@@ -1786,6 +1819,19 @@ void wte_enumerate_dlls(CPUState *cpu)
                    wte_state.dll_modules[i].name,
                    (unsigned long)wte_state.dll_modules[i].base,
                    (unsigned long)wte_state.dll_modules[i].end);
+    }
+
+    /* JIT tap: if not yet armed, scan newly enumerated list for clrjit.dll.
+     * Catches the case where clrjit.dll was already loaded before the first
+     * api_hook LdrLoadDll callback fires (e.g. early DLL injection). */
+    if (!wte_state.jit_tap.enabled) {
+        for (int i = 0; i < wte_state.dll_module_count; i++) {
+            wte_jit_tap_on_dll_load(cpu,
+                                    wte_state.dll_modules[i].base,
+                                    wte_state.dll_modules[i].end,
+                                    wte_state.dll_modules[i].name);
+            if (wte_state.jit_tap.enabled) break;
+        }
     }
 }
 

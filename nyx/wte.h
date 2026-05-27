@@ -166,10 +166,16 @@ typedef struct {
         uint64_t compile_method_gfn;
 
         /* Deferred re-arm: when compileMethod NX is cleared to allow exec,
-         * re_arm_pending is set.  The JIT tap exec handler re-arms NX on
+         * rearm_pending is set.  The JIT tap exec handler re-arms NX on
          * the NEXT violation from a different GFN (i.e., after compileMethod
          * has returned to its caller), avoiding the single-page MTF loop. */
         bool     rearm_pending;
+
+        /* Deferred getJit resolve: set when getJit trap fires at entry but
+         * g_jit is still null (getJit itself initializes the singleton).
+         * On the next exec violation from a different GFN (after getJit has
+         * returned), retry wte_jit_resolve_compile_method(). */
+        bool     getjit_returned_pending;
 
         /* MTF re-arm: used only for the one-shot getJit trap path */
         uint64_t mtf_rearm_gfn;
