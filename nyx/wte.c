@@ -972,27 +972,32 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
     if (rip == wte_state.jit_tap.compile_method_va) {
         /* Capture CORINFO_METHOD_INFO arguments.
          *
-         * x86 thiscall at compileMethod entry:
-         *   ECX         = this (ICorJitCompiler*)
+         * ConfuserEx2 (and similar .NET JIT hooks) replaces vtable[0] with
+         * a stdcall wrapper that passes 'this' as an explicit first arg:
+         *
          *   [ESP + 0x00] = return address
-         *   [ESP + 0x04] = comp  (ICorJitInfo*)
-         *   [ESP + 0x08] = info  (CORINFO_METHOD_INFO*)
-         *   [ESP + 0x0C] = flags
+         *   [ESP + 0x04] = pThis (ICorJitCompiler*, lives inside clrjit.dll)
+         *   [ESP + 0x08] = comp  (ICorJitInfo*)
+         *   [ESP + 0x0C] = info  (CORINFO_METHOD_INFO*)  ← read here
+         *   [ESP + 0x10] = flags
+         *
+         * Standard thiscall would put info at [ESP+8]; diagnostic confirmed
+         * il_size == [ESP+8] value, so the actual offset is +0x0C.
          *
          * CORINFO_METHOD_INFO layout (x86, .NET Framework 4.x):
          *   +0x00 ftn        (CORINFO_METHOD_HANDLE)
          *   +0x04 scope      (CORINFO_MODULE_HANDLE)
          *   +0x08 ILCode     (BYTE*)
          *   +0x0C ILCodeSize (unsigned int)
-         *   +0x10 maxStack   (unsigned int)
-         *   +0x14 EHcount    (unsigned int)
+         *   +0x10 maxStack   (unsigned short)
+         *   +0x12 EHcount    (unsigned short)
          */
         X86CPU      *cpux86 = X86_CPU(cpu);
         CPUX86State *env    = &cpux86->env;
         uint32_t esp = (uint32_t)env->regs[R_ESP];
 
         uint32_t info_ptr = 0;
-        if (!read_virtual_memory((uint64_t)(esp + 8),
+        if (!read_virtual_memory((uint64_t)(esp + 0xC),
                                  (uint8_t *)&info_ptr, 4, cpu) ||
             info_ptr == 0) {
             nyx_printf("[JIT-TAP] compileMethod: failed to read info ptr\n");
@@ -1010,20 +1015,7 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
         uint32_t scope     = *(uint32_t *)(info_buf + 0x04);
         uint32_t ilcode    = *(uint32_t *)(info_buf + 0x08);
         uint32_t il_size   = *(uint32_t *)(info_buf + 0x0C);
-        uint32_t eh_count  = *(uint32_t *)(info_buf + 0x14);
-
-        /* Diagnostic: dump raw stack/struct to find mis-read */
-        {
-            uint32_t ret_addr = 0, comp_ptr = 0;
-            read_virtual_memory((uint64_t)esp,       (uint8_t *)&ret_addr, 4, cpu);
-            read_virtual_memory((uint64_t)(esp + 4), (uint8_t *)&comp_ptr, 4, cpu);
-            nyx_printf("[JIT-TAP] CM entry: rip=0x%x esp=0x%x "
-                       "[+0]=0x%x [+4]=0x%x [+8]=0x%x\n",
-                       (uint32_t)rip, esp, ret_addr, comp_ptr, info_ptr);
-            nyx_printf("[JIT-TAP] CM info: ftn=0x%x scope=0x%x "
-                       "ilcode=0x%x il_size=%u eh=%u\n",
-                       ftn, scope, ilcode, il_size, eh_count);
-        }
+        uint16_t eh_count  = *(uint16_t *)(info_buf + 0x12);
 
         if (il_size == 0 || il_size > 0x10000) {
             nyx_printf("[JIT-TAP] compileMethod: skip il_size=%u\n", il_size);
