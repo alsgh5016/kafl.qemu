@@ -917,6 +917,20 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
     bool is_cm_page     = (wte_state.jit_tap.compile_method_nx_armed &&
                            gfn == wte_state.jit_tap.compile_method_gfn);
 
+    /* Late-bind: arm_nx failed (compileMethod page was demand-paged at
+     * resolve time), but we now see the actual execution.  The current
+     * EPT violation proves the GFN is live — record it and handle as a
+     * normal compileMethod trap (deferred re-arm will install NX later). */
+    if (!is_cm_page &&
+        !wte_state.jit_tap.compile_method_nx_armed &&
+        wte_state.jit_tap.compile_method_va != 0 &&
+        rip == wte_state.jit_tap.compile_method_va) {
+        wte_state.jit_tap.compile_method_gfn = gfn;
+        nyx_printf("[JIT-TAP] Late-bind: compileMethod GFN=0x%lx\n",
+                   (unsigned long)gfn);
+        is_cm_page = true;
+    }
+
     if (!is_getjit_page && !is_cm_page) return false;
 
     (void)gpa;
