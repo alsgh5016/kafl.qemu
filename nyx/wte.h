@@ -118,8 +118,13 @@ typedef struct {
     int             dll_filtered_count;
     int             dll_filtered_total;
 
-    /* MTF state for same-page write confirmation */
-    bool     mtf_active;           /* MTF armed for a same-page write    */
+    /* MTF reason codes */
+#define WTE_MTF_REASON_WRITE     0   /* same-page write confirmation     */
+#define WTE_MTF_REASON_JIT_REARM 1   /* re-arm JIT tap page NX           */
+
+    /* MTF state for same-page write confirmation and JIT tap re-arm */
+    bool     mtf_active;           /* MTF is armed                       */
+    uint8_t  mtf_reason;           /* WTE_MTF_REASON_* discriminator     */
     uint64_t mtf_target_va;        /* VA of the page being written       */
     uint64_t mtf_target_gfn;       /* GFN of the page being written      */
 
@@ -140,6 +145,41 @@ typedef struct {
     uint64_t *renx_queue;
     int       renx_count;
     int       renx_capacity;
+
+    /* JIT-IL tap state (Phase 2) — hypervisor-side compileMethod capture */
+    struct {
+        bool     enabled;
+
+        /* clrjit.dll address range (filled at DLL load time) */
+        uint64_t clrjit_base;
+        uint64_t clrjit_end;
+
+        /* Resolved VAs (0 until resolved) */
+        uint64_t g_jit_va;           /* VA of the g_jit global (ICorJitCompiler**) */
+        uint64_t getjit_va;          /* VA of getJit() export */
+        uint64_t compile_method_va;  /* VA of ICorJitCompiler::compileMethod */
+
+        /* EPT NX trap state */
+        bool     getjit_nx_armed;
+        uint64_t getjit_gfn;
+        bool     compile_method_nx_armed;
+        uint64_t compile_method_gfn;
+
+        /* Deferred re-arm: when compileMethod NX is cleared to allow exec,
+         * re_arm_pending is set.  The JIT tap exec handler re-arms NX on
+         * the NEXT violation from a different GFN (i.e., after compileMethod
+         * has returned to its caller), avoiding the single-page MTF loop. */
+        bool     rearm_pending;
+
+        /* MTF re-arm: used only for the one-shot getJit trap path */
+        uint64_t mtf_rearm_gfn;
+
+        /* jit_il_dump_N output file */
+        int      dump_seq;           /* incremented each wte_activate */
+        FILE    *dump_file;          /* NULL when closed                */
+        int      records_written;
+        long     count_file_offset;  /* fseek position of num_records field */
+    } jit_tap;
 
     /* Dynamic alloc ranges from api_hook NtAllocate/NtProtect callbacks.
      * Used by wte_handle_exec_violation late-bind path: when an
@@ -254,6 +294,23 @@ bool wte_is_target_pe_gfn(uint64_t gfn);
 /* Intel PT safety net: check PT trace for CoW-missed WtE.
  * Call at every VM exit after dirty ring scan. */
 void wte_pt_check(CPUState *cpu);
+
+/* JIT-IL tap: called from wte_register_loaded_dll when a DLL is mapped.
+ * If the DLL is clrjit.dll, resolves compileMethod and arms EPT NX. */
+void wte_jit_tap_on_dll_load(CPUState *cpu, uint64_t module_base,
+                              uint64_t module_end, const char *name);
+
+/* JIT-IL tap: exec-violation handler for tap pages.
+ * Returns true if the violation was consumed (caller must not process it). */
+bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
+                              uint64_t rip);
+
+/* JIT-IL tap: MTF handler — re-arms NX on the tap page.
+ * Returns true if the MTF was consumed (caller must not process it). */
+bool wte_jit_tap_handle_mtf(CPUState *cpu);
+
+/* JIT-IL tap: finalize and close the current dump file (called at deactivate). */
+void wte_jit_il_close(void);
 
 /* DLL module enumeration (PEB→Ldr walk) and RIP filtering */
 int  wte_walk_module_list(CPUState *cpu, wte_dll_entry_t *out, int max);

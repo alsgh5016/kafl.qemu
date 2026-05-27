@@ -322,8 +322,26 @@ void wte_activate(uint64_t cr3, bool is_64bit)
     wte_state.dll_filtered_total  = 0;
 
     wte_state.mtf_active     = false;
+    wte_state.mtf_reason     = WTE_MTF_REASON_WRITE;
     wte_state.mtf_target_va  = 0;
     wte_state.mtf_target_gfn = 0;
+
+    /* Reset JIT tap state (keep dump_seq for monotone file naming) */
+    wte_state.jit_tap.enabled                 = false;
+    wte_state.jit_tap.clrjit_base             = 0;
+    wte_state.jit_tap.clrjit_end              = 0;
+    wte_state.jit_tap.g_jit_va                = 0;
+    wte_state.jit_tap.getjit_va               = 0;
+    wte_state.jit_tap.compile_method_va       = 0;
+    wte_state.jit_tap.getjit_nx_armed         = false;
+    wte_state.jit_tap.getjit_gfn              = 0;
+    wte_state.jit_tap.compile_method_nx_armed = false;
+    wte_state.jit_tap.compile_method_gfn      = 0;
+    wte_state.jit_tap.rearm_pending           = false;
+    wte_state.jit_tap.mtf_rearm_gfn           = 0;
+    wte_state.jit_tap.dump_file               = NULL;
+    wte_state.jit_tap.records_written         = 0;
+    wte_state.jit_tap.count_file_offset       = 0;
 
     if (!wte_state.kvm_wte_enabled) {
         wte_kvm_enable();
@@ -339,6 +357,24 @@ void wte_activate(uint64_t cr3, bool is_64bit)
 
 void wte_deactivate(void)
 {
+    /* Finalize JIT-IL dump if open */
+    if (wte_state.jit_tap.dump_file)
+        wte_jit_il_close();
+
+    /* Disarm any remaining JIT tap NX */
+    if (wte_state.jit_tap.getjit_nx_armed &&
+        wte_state.jit_tap.getjit_gfn != 0) {
+        uint64_t gfn = wte_state.jit_tap.getjit_gfn;
+        wte_kvm_clear_nx(&gfn, 1);
+        wte_state.jit_tap.getjit_nx_armed = false;
+    }
+    if (wte_state.jit_tap.compile_method_nx_armed &&
+        wte_state.jit_tap.compile_method_gfn != 0) {
+        uint64_t gfn = wte_state.jit_tap.compile_method_gfn;
+        wte_kvm_clear_nx(&gfn, 1);
+        wte_state.jit_tap.compile_method_nx_armed = false;
+    }
+
     nyx_printf("[WtE] Deactivated: total=%d (dumped=%d, DLL-filtered=%d, "
                "CoW-recovered=%lu) across %d rounds\n",
                wte_state.total_wte_count,
@@ -533,6 +569,452 @@ void wte_register_dynamic_exec_region(CPUState *cpu,
                registered, skipped_pe, unmapped);
 }
 
+/* ── JIT-IL Tap (Phase 2) ───────────────────────────────────────── */
+
+/*
+ * Binary dump format (little-endian, x86 32-bit pointers):
+ *
+ *   File header  (10 bytes):
+ *       magic[6]      b"JITIL\x01"
+ *       num_records   uint32   (patched at close time)
+ *
+ *   Per record:
+ *       wte_seq       uint32
+ *       ftn           uint32   (MethodDesc*)
+ *       scope         uint32   (CORINFO_MODULE_HANDLE*)
+ *       il_size       uint32
+ *       eh_count      uint16
+ *       _reserved     uint16   = 0
+ *       il_bytes[il_size]
+ *       pad[]                  zero-pad to next 4-byte boundary
+ */
+
+static const uint8_t k_jitil_magic[6] = {'J','I','T','I','L','\x01'};
+
+static void wte_jit_il_open(void)
+{
+    wte_state.jit_tap.records_written = 0;
+    wte_state.jit_tap.count_file_offset = 0;
+    wte_state.jit_tap.dump_file = NULL;
+
+    char *path = NULL;
+    assert(asprintf(&path, "%s/dump/jit_il_dump_%d",
+                    GET_GLOBAL_STATE()->workdir_path,
+                    wte_state.jit_tap.dump_seq++) != -1);
+
+    /* Ensure dump directory exists */
+    char *ddir = NULL;
+    assert(asprintf(&ddir, "%s/dump", GET_GLOBAL_STATE()->workdir_path) != -1);
+    mkdir(ddir, 0755);
+    free(ddir);
+
+    FILE *f = fopen(path, "wb");
+    free(path);
+    if (!f) {
+        nyx_printf("[JIT-TAP] ERROR: cannot open jit_il dump file\n");
+        return;
+    }
+    fwrite(k_jitil_magic, 1, 6, f);
+    uint32_t zero = 0;
+    wte_state.jit_tap.count_file_offset = ftell(f);
+    fwrite(&zero, 4, 1, f);
+    fflush(f);
+    wte_state.jit_tap.dump_file = f;
+    nyx_printf("[JIT-TAP] Opened jit_il_dump_%d\n",
+               wte_state.jit_tap.dump_seq - 1);
+}
+
+static void wte_jit_il_write(uint32_t wte_seq, uint32_t ftn, uint32_t scope,
+                              const uint8_t *il_bytes, uint32_t il_size,
+                              uint16_t eh_count)
+{
+    FILE *f = wte_state.jit_tap.dump_file;
+    if (!f) return;
+
+    /* Fixed record header: wte_seq(4) ftn(4) scope(4) il_size(4)
+     *                       eh_count(2) _reserved(2) */
+    uint8_t hdr[20];
+    memset(hdr, 0, sizeof(hdr));
+    memcpy(hdr + 0,  &wte_seq,   4);
+    memcpy(hdr + 4,  &ftn,       4);
+    memcpy(hdr + 8,  &scope,     4);
+    memcpy(hdr + 12, &il_size,   4);
+    memcpy(hdr + 16, &eh_count,  2);
+    fwrite(hdr, 1, sizeof(hdr), f);
+    fwrite(il_bytes, 1, il_size, f);
+
+    /* Pad to next absolute 4-byte boundary */
+    long cur = ftell(f);
+    int pad = (int)((-cur) & 3);
+    if (pad > 0) {
+        uint8_t zeros[3] = {0, 0, 0};
+        fwrite(zeros, 1, pad, f);
+    }
+    fflush(f);
+
+    wte_state.jit_tap.records_written++;
+    nyx_printf("[JIT-TAP] Record #%d: ftn=0x%x scope=0x%x il_size=%u eh=%u\n",
+               wte_state.jit_tap.records_written, ftn, scope, il_size, eh_count);
+}
+
+void wte_jit_il_close(void)
+{
+    FILE *f = wte_state.jit_tap.dump_file;
+    if (!f) return;
+
+    /* Patch num_records in the file header */
+    uint32_t count = (uint32_t)wte_state.jit_tap.records_written;
+    fseek(f, wte_state.jit_tap.count_file_offset, SEEK_SET);
+    fwrite(&count, 4, 1, f);
+    fclose(f);
+    wte_state.jit_tap.dump_file = NULL;
+
+    nyx_printf("[JIT-TAP] Closed jit_il dump (%d records)\n", count);
+}
+
+/* Parse PE export directory to find the VA of a named export.
+ * Returns 0 on failure.
+ * Reads from guest virtual memory under current CR3. */
+static uint64_t wte_jit_find_export(CPUState *cpu, uint64_t dll_base,
+                                     const char *target_name)
+{
+    /* DOS header */
+    uint8_t dos[0x40];
+    if (!read_virtual_memory(dll_base, dos, sizeof(dos), cpu)) return 0;
+    if (dos[0] != 'M' || dos[1] != 'Z') return 0;
+    uint32_t pe_off = *(uint32_t *)(dos + 0x3C);
+
+    /* PE signature + COFF + optional header */
+    uint8_t pe[0x108];
+    if (!read_virtual_memory(dll_base + pe_off, pe, sizeof(pe), cpu)) return 0;
+    if (memcmp(pe, "PE\0\0", 4) != 0) return 0;
+
+    uint16_t magic = *(uint16_t *)(pe + 24);  /* Optional header magic */
+    uint32_t exp_rva;
+    if (magic == 0x10B)       /* PE32  (x86) */
+        exp_rva = *(uint32_t *)(pe + 24 + 96);
+    else if (magic == 0x20B)  /* PE32+ (x64) */
+        exp_rva = *(uint32_t *)(pe + 24 + 112);
+    else return 0;
+    if (exp_rva == 0) return 0;
+
+    /* IMAGE_EXPORT_DIRECTORY (40 bytes) */
+    uint8_t exp[40];
+    if (!read_virtual_memory(dll_base + exp_rva, exp, sizeof(exp), cpu)) return 0;
+
+    uint32_t num_names = *(uint32_t *)(exp + 24);
+    uint32_t addr_rva  = *(uint32_t *)(exp + 28);
+    uint32_t name_rva  = *(uint32_t *)(exp + 32);
+    uint32_t ord_rva   = *(uint32_t *)(exp + 36);
+
+    size_t tlen = strlen(target_name);
+
+    for (uint32_t i = 0; i < num_names && i < 8192; i++) {
+        uint32_t nrva = 0;
+        if (!read_virtual_memory(dll_base + name_rva + (uint64_t)i * 4,
+                                 (uint8_t *)&nrva, 4, cpu)) break;
+
+        uint8_t name[32] = {0};
+        read_virtual_memory(dll_base + nrva, name,
+                            tlen + 1 < sizeof(name) ? tlen + 1 : sizeof(name) - 1,
+                            cpu);
+        if (memcmp(name, target_name, tlen) != 0 || name[tlen] != 0)
+            continue;
+
+        uint16_t ordinal = 0;
+        if (!read_virtual_memory(dll_base + ord_rva + (uint64_t)i * 2,
+                                 (uint8_t *)&ordinal, 2, cpu)) return 0;
+        uint32_t func_rva = 0;
+        if (!read_virtual_memory(dll_base + addr_rva + (uint64_t)ordinal * 4,
+                                 (uint8_t *)&func_rva, 4, cpu)) return 0;
+        return dll_base + func_rva;
+    }
+    return 0;
+}
+
+/* Scan the first bytes of getJit() for MOV EAX, [moffs32] (0xA1 <addr32>).
+ * Returns the absolute VA of the g_jit global, or 0 if not found. */
+static uint64_t wte_jit_find_g_jit(CPUState *cpu, uint64_t getjit_va)
+{
+    uint8_t code[8];
+    if (!read_virtual_memory(getjit_va, code, sizeof(code), cpu)) return 0;
+    /* 0xA1 = MOV EAX, moffs32 (x86 32-bit, 5 bytes: opcode + abs addr) */
+    if (code[0] == 0xA1) {
+        uint32_t addr = *(uint32_t *)(code + 1);
+        return (uint64_t)addr;
+    }
+    return 0;
+}
+
+/* Dereference g_jit → ICorJitCompiler* → vtable → vtable[0] = compileMethod.
+ * Returns 0 if g_jit has not been initialized (null instance). */
+static uint64_t wte_jit_resolve_compile_method(CPUState *cpu, uint64_t g_jit_va)
+{
+    uint32_t instance = 0;
+    if (!read_virtual_memory(g_jit_va, (uint8_t *)&instance, 4, cpu) ||
+        instance == 0)
+        return 0;
+
+    uint32_t vtable = 0;
+    if (!read_virtual_memory((uint64_t)instance, (uint8_t *)&vtable, 4, cpu) ||
+        vtable == 0)
+        return 0;
+
+    uint32_t compile_method = 0;
+    if (!read_virtual_memory((uint64_t)vtable, (uint8_t *)&compile_method, 4,
+                              cpu) || compile_method == 0)
+        return 0;
+
+    return (uint64_t)compile_method;
+}
+
+/* Arm EPT NX on a single page (helper used by JIT tap). */
+static void wte_jit_tap_arm_nx(CPUState *cpu, uint64_t va, uint64_t *out_gfn)
+{
+    (void)cpu;
+    uint64_t pa = get_paging_phys_addr(cpu, wte_state.target_cr3, va);
+    if (pa == 0xFFFFFFFFFFFFFFFFULL || pa == 0) {
+        nyx_printf("[JIT-TAP] arm_nx: VA=0x%lx not mapped\n", (unsigned long)va);
+        *out_gfn = 0;
+        return;
+    }
+    uint64_t gfn = pa >> 12;
+    wte_kvm_set_nx(&gfn, 1);
+    *out_gfn = gfn;
+    nyx_printf("[JIT-TAP] NX armed: VA=0x%lx GFN=0x%lx\n",
+               (unsigned long)va, (unsigned long)gfn);
+}
+
+void wte_jit_tap_on_dll_load(CPUState *cpu, uint64_t module_base,
+                              uint64_t module_end, const char *name)
+{
+    if (!wte_state.active) return;
+
+    /* Case-insensitive check for "clrjit.dll" */
+    const char *bn = name;
+    /* Strip path if present */
+    const char *slash = strrchr(name, '\\');
+    if (!slash) slash = strrchr(name, '/');
+    if (slash) bn = slash + 1;
+
+    bool is_clrjit = (strncasecmp(bn, "clrjit.dll", 10) == 0 ||
+                      strncasecmp(bn, "mscorjit.dll", 12) == 0);
+    if (!is_clrjit) return;
+
+    nyx_printf("[JIT-TAP] Detected CLR JIT: %s base=0x%lx end=0x%lx\n",
+               name, (unsigned long)module_base, (unsigned long)module_end);
+
+    wte_state.jit_tap.enabled    = true;
+    wte_state.jit_tap.clrjit_base = module_base;
+    wte_state.jit_tap.clrjit_end  = module_end;
+
+    /* Step 1: find getJit() export */
+    uint64_t getjit_va = wte_jit_find_export(cpu, module_base, "getJit");
+    if (getjit_va == 0) {
+        nyx_printf("[JIT-TAP] getJit export not found\n");
+        return;
+    }
+    wte_state.jit_tap.getjit_va = getjit_va;
+    nyx_printf("[JIT-TAP] getJit VA=0x%lx\n", (unsigned long)getjit_va);
+
+    /* Step 2: extract g_jit global VA from first instruction */
+    uint64_t g_jit_va = wte_jit_find_g_jit(cpu, getjit_va);
+    if (g_jit_va == 0) {
+        nyx_printf("[JIT-TAP] g_jit global not found in getJit prologue\n");
+        return;
+    }
+    wte_state.jit_tap.g_jit_va = g_jit_va;
+    nyx_printf("[JIT-TAP] g_jit VA=0x%lx\n", (unsigned long)g_jit_va);
+
+    /* Step 3: try to resolve compileMethod now (g_jit may already be set
+     * if CLR was initialized before we detected the DLL) */
+    uint64_t cm_va = wte_jit_resolve_compile_method(cpu, g_jit_va);
+    if (cm_va != 0) {
+        wte_state.jit_tap.compile_method_va = cm_va;
+        nyx_printf("[JIT-TAP] compileMethod VA=0x%lx (immediate)\n",
+                   (unsigned long)cm_va);
+        wte_jit_tap_arm_nx(cpu, cm_va, &wte_state.jit_tap.compile_method_gfn);
+        wte_state.jit_tap.compile_method_nx_armed = (wte_state.jit_tap.compile_method_gfn != 0);
+        if (!wte_state.jit_tap.dump_file)
+            wte_jit_il_open();
+    } else {
+        /* g_jit not initialized yet: arm trap on getJit page so we'll
+         * retry resolution after the JIT singleton is created. */
+        nyx_printf("[JIT-TAP] g_jit not initialized yet — arming getJit trap\n");
+        wte_jit_tap_arm_nx(cpu, getjit_va, &wte_state.jit_tap.getjit_gfn);
+        wte_state.jit_tap.getjit_nx_armed = (wte_state.jit_tap.getjit_gfn != 0);
+    }
+}
+
+/* Handle exec violation on a JIT tap page (getJit or compileMethod).
+ *
+ * Returns true if the violation was consumed — caller must return immediately.
+ * Returns false if the GFN/RIP is unrelated to the JIT tap.
+ *
+ * Execution flow:
+ *   getJit page trap:
+ *     → try to resolve compileMethod (g_jit may now be set)
+ *     → if resolved: disarm getJit NX, arm compileMethod NX
+ *     → either way: allow exec via MTF re-arm on getJit page
+ *
+ *   compileMethod page trap:
+ *     → if RIP == compile_method_va: capture CORINFO_METHOD_INFO args
+ *     → allow exec via MTF re-arm on compileMethod page
+ */
+bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
+                              uint64_t rip)
+{
+    if (!wte_state.jit_tap.enabled) return false;
+
+    /* Deferred re-arm: if the previous compileMethod trap cleared NX to allow
+     * execution, re-arm NX now that we're back on a different page (the
+     * compileMethod function has returned to its caller). */
+    if (wte_state.jit_tap.rearm_pending &&
+        gfn != wte_state.jit_tap.compile_method_gfn) {
+        uint64_t cm_gfn = wte_state.jit_tap.compile_method_gfn;
+        wte_kvm_set_nx(&cm_gfn, 1);
+        wte_state.jit_tap.rearm_pending            = false;
+        wte_state.jit_tap.compile_method_nx_armed  = true;
+        nyx_printf("[JIT-TAP] Deferred re-arm: NX restored on compileMethod "
+                   "GFN=0x%lx\n", (unsigned long)cm_gfn);
+        /* Do NOT return — continue to process this exec violation normally */
+    }
+
+    bool is_getjit_page = (wte_state.jit_tap.getjit_nx_armed &&
+                           gfn == wte_state.jit_tap.getjit_gfn);
+    bool is_cm_page     = (wte_state.jit_tap.compile_method_nx_armed &&
+                           gfn == wte_state.jit_tap.compile_method_gfn);
+
+    if (!is_getjit_page && !is_cm_page) return false;
+
+    (void)gpa;
+
+    if (is_getjit_page) {
+        /* One-shot getJit trap: disarm NX first to avoid loop (the trap
+         * fires at entry before any instruction runs; re-arm would
+         * immediately trap every instruction on the same page). */
+        uint64_t gjgfn = wte_state.jit_tap.getjit_gfn;
+        wte_kvm_clear_nx(&gjgfn, 1);
+        wte_state.jit_tap.getjit_nx_armed = false;
+
+        /* Try to resolve compileMethod */
+        uint64_t cm_va = wte_jit_resolve_compile_method(
+            cpu, wte_state.jit_tap.g_jit_va);
+        if (cm_va != 0) {
+            wte_state.jit_tap.compile_method_va = cm_va;
+            nyx_printf("[JIT-TAP] compileMethod VA=0x%lx (from getJit trap)\n",
+                       (unsigned long)cm_va);
+            wte_jit_tap_arm_nx(cpu, cm_va,
+                               &wte_state.jit_tap.compile_method_gfn);
+            wte_state.jit_tap.compile_method_nx_armed =
+                (wte_state.jit_tap.compile_method_gfn != 0);
+            if (!wte_state.jit_tap.dump_file)
+                wte_jit_il_open();
+        } else {
+            /* g_jit still null at getJit entry — extremely rare
+             * (would mean getJit is being called for the very first time
+             * and JIT singleton not yet stored).  Log and give up; the
+             * tap will miss records for this run. */
+            nyx_printf("[JIT-TAP] WARN: g_jit still null at getJit trap, "
+                       "giving up resolution\n");
+        }
+        return true;
+    }
+
+    /* compileMethod page trap */
+    if (rip == wte_state.jit_tap.compile_method_va) {
+        /* Capture CORINFO_METHOD_INFO arguments.
+         *
+         * x86 thiscall at compileMethod entry:
+         *   ECX         = this (ICorJitCompiler*)
+         *   [ESP + 0x00] = return address
+         *   [ESP + 0x04] = comp  (ICorJitInfo*)
+         *   [ESP + 0x08] = info  (CORINFO_METHOD_INFO*)
+         *   [ESP + 0x0C] = flags
+         *
+         * CORINFO_METHOD_INFO layout (x86, .NET Framework 4.x):
+         *   +0x00 ftn        (CORINFO_METHOD_HANDLE)
+         *   +0x04 scope      (CORINFO_MODULE_HANDLE)
+         *   +0x08 ILCode     (BYTE*)
+         *   +0x0C ILCodeSize (unsigned int)
+         *   +0x10 maxStack   (unsigned int)
+         *   +0x14 EHcount    (unsigned int)
+         */
+        X86CPU      *cpux86 = X86_CPU(cpu);
+        CPUX86State *env    = &cpux86->env;
+        uint32_t esp = (uint32_t)env->regs[R_ESP];
+
+        uint32_t info_ptr = 0;
+        if (!read_virtual_memory((uint64_t)(esp + 8),
+                                 (uint8_t *)&info_ptr, 4, cpu) ||
+            info_ptr == 0) {
+            nyx_printf("[JIT-TAP] compileMethod: failed to read info ptr\n");
+            goto allow_cm;
+        }
+
+        uint8_t info_buf[24];
+        if (!read_virtual_memory((uint64_t)info_ptr, info_buf, sizeof(info_buf),
+                                 cpu)) {
+            nyx_printf("[JIT-TAP] compileMethod: failed to read CORINFO_METHOD_INFO\n");
+            goto allow_cm;
+        }
+
+        uint32_t ftn       = *(uint32_t *)(info_buf + 0x00);
+        uint32_t scope     = *(uint32_t *)(info_buf + 0x04);
+        uint32_t ilcode    = *(uint32_t *)(info_buf + 0x08);
+        uint32_t il_size   = *(uint32_t *)(info_buf + 0x0C);
+        uint32_t eh_count  = *(uint32_t *)(info_buf + 0x14);
+
+        if (il_size == 0 || il_size > 0x10000) {
+            nyx_printf("[JIT-TAP] compileMethod: skip il_size=%u\n", il_size);
+            goto allow_cm;
+        }
+
+        uint8_t *il_bytes = malloc(il_size);
+        if (!il_bytes) goto allow_cm;
+
+        bool ok = read_virtual_memory((uint64_t)ilcode, il_bytes, il_size, cpu);
+        if (ok) {
+            wte_jit_il_write(
+                (uint32_t)wte_state.wte_count,  /* wte_seq correlation */
+                ftn, scope, il_bytes, il_size,
+                (uint16_t)(eh_count & 0xFFFF));
+        } else {
+            nyx_printf("[JIT-TAP] compileMethod: failed to read IL bytes "
+                       "(ILCode=0x%x size=%u)\n", ilcode, il_size);
+        }
+        free(il_bytes);
+    }
+
+allow_cm:
+    /* Allow compileMethod to execute by clearing NX.  Re-arm is deferred:
+     * the next exec violation from a different GFN triggers re-arm
+     * (see the rearm_pending check at the top of this function). */
+    wte_kvm_clear_nx(&wte_state.jit_tap.compile_method_gfn, 1);
+    wte_state.jit_tap.compile_method_nx_armed = false;
+    wte_state.jit_tap.rearm_pending           = true;
+    return true;
+}
+
+/* Re-arm NX on the JIT tap page after MTF single-step.
+ * Returns true if the MTF was consumed by the JIT tap. */
+bool wte_jit_tap_handle_mtf(CPUState *cpu)
+{
+    (void)cpu;
+    if (!wte_state.jit_tap.enabled) return false;
+    if (wte_state.mtf_reason != WTE_MTF_REASON_JIT_REARM) return false;
+
+    uint64_t gfn = wte_state.jit_tap.mtf_rearm_gfn;
+    if (gfn != 0) {
+        wte_kvm_set_nx(&gfn, 1);
+        nyx_printf("[JIT-TAP] MTF: NX re-armed on GFN=0x%lx\n",
+                   (unsigned long)gfn);
+    }
+    wte_state.mtf_active = false;
+    wte_state.mtf_reason = WTE_MTF_REASON_WRITE;
+    return true;
+}
+
 /* ── Event-driven DLL registration ──────────────────────────────
  *
  * Called from api_hook RETURN callbacks when LdrLoadDll succeeds
@@ -550,6 +1032,17 @@ void wte_register_loaded_dll(CPUState *cpu, uint64_t module_base)
     /* Refresh dll_modules so subsequent wte_is_dll_rip / dump filtering
      * sees the new DLL.  Cheap PEB→Ldr walk. */
     wte_enumerate_dlls(cpu);
+
+    /* JIT tap: check if this is clrjit.dll and arm compileMethod trap */
+    for (int i = 0; i < wte_state.dll_module_count; i++) {
+        if (wte_state.dll_modules[i].base == module_base) {
+            wte_jit_tap_on_dll_load(cpu,
+                                    wte_state.dll_modules[i].base,
+                                    wte_state.dll_modules[i].end,
+                                    wte_state.dll_modules[i].name);
+            break;
+        }
+    }
 
     /* Find the freshly-loaded DLL's range. */
     uint64_t dll_end = 0;
@@ -1031,10 +1524,17 @@ void wte_handle_mtf(CPUState *cpu)
 {
     if (!wte_state.active || !wte_state.mtf_active) return;
 
+    /* JIT tap re-arm takes priority — check reason field */
+    if (wte_state.mtf_reason == WTE_MTF_REASON_JIT_REARM) {
+        wte_jit_tap_handle_mtf(cpu);
+        return;
+    }
+
     uint64_t gfn = wte_state.mtf_target_gfn;
     uint64_t va  = wte_state.mtf_target_va;
 
-    wte_state.mtf_active = false;
+    wte_state.mtf_active  = false;
+    wte_state.mtf_reason  = WTE_MTF_REASON_WRITE;
 
     wte_page_entry_t *entry = wte_lookup_va(va);
     if (!entry) return;
@@ -1349,6 +1849,11 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
         wte_kvm_clear_nx(&gfn, 1);
         return;
     }
+
+    /* JIT tap: check before WTE path so tap pages aren't cleared as
+     * "untracked GFN" (clrjit pages are not in the PE/dyn tracking). */
+    if (wte_jit_tap_handle_exec(cpu, gfn, gpa, rip))
+        return;
 
     wte_state.total_x_violations++;
 
@@ -1841,6 +2346,7 @@ void wte_reset_round(void)
 
     /* Clear in-flight MTF state */
     wte_state.mtf_active     = false;
+    wte_state.mtf_reason     = WTE_MTF_REASON_WRITE;
     wte_state.mtf_target_va  = 0;
     wte_state.mtf_target_gfn = 0;
 

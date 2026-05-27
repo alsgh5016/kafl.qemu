@@ -397,9 +397,9 @@ void handle_hypercall_kafl_mtf(struct kvm_run *run, CPUState *cpu, uint64_t hype
     nyx_debug_p(CORE_PREFIX, "%s --> %lx\n", __func__, get_rip(cpu));
     kvm_vcpu_ioctl(cpu, KVM_VMX_PT_DISABLE_MTF);
 
-    /* WtE same-page MTF: confirm write and re-arm W=0 */
+    /* WtE MTF: same-page write confirmation or JIT tap NX re-arm */
     if (wte_is_active() && wte_get_state()->mtf_active) {
-        wte_handle_mtf(cpu);
+        wte_handle_mtf(cpu);  /* wte_handle_mtf dispatches on mtf_reason */
         return;
     }
 
