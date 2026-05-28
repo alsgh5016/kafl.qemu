@@ -656,9 +656,17 @@ static void wte_jit_il_write(uint32_t wte_seq, uint32_t ftn, uint32_t scope,
         uint8_t zeros[3] = {0, 0, 0};
         fwrite(zeros, 1, pad, f);
     }
+    wte_state.jit_tap.records_written++;
+
+    /* Patch num_records in-place after every write so the file is valid
+     * even if the process is killed by timeout before wte_jit_il_close(). */
+    long end_pos = ftell(f);
+    uint32_t count = (uint32_t)wte_state.jit_tap.records_written;
+    fseek(f, wte_state.jit_tap.count_file_offset, SEEK_SET);
+    fwrite(&count, 4, 1, f);
+    fseek(f, end_pos, SEEK_SET);
     fflush(f);
 
-    wte_state.jit_tap.records_written++;
     nyx_printf("[JIT-TAP] Record #%d: ftn=0x%x scope=0x%x il_size=%u eh=%u\n",
                wte_state.jit_tap.records_written, ftn, scope, il_size, eh_count);
 }
