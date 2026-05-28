@@ -326,6 +326,11 @@ void wte_activate(uint64_t cr3, bool is_64bit)
     wte_state.mtf_target_va  = 0;
     wte_state.mtf_target_gfn = 0;
 
+    /* Close any open JIT-IL dump before resetting state so num_records
+     * gets patched correctly (wte_activate may be called multiple rounds). */
+    if (wte_state.jit_tap.dump_file)
+        wte_jit_il_close();
+
     /* Reset JIT tap state (keep dump_seq for monotone file naming) */
     wte_state.jit_tap.enabled                 = false;
     wte_state.jit_tap.clrjit_base             = 0;
