@@ -1181,7 +1181,30 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
         uint32_t scope     = *(uint32_t *)(info_buf + 0x04);
         uint32_t ilcode    = *(uint32_t *)(info_buf + 0x08);
         uint32_t il_size   = *(uint32_t *)(info_buf + 0x0C);
+        uint16_t max_stack = *(uint16_t *)(info_buf + 0x10);
         uint16_t eh_count  = *(uint16_t *)(info_buf + 0x12);
+        uint32_t options   = *(uint32_t *)(info_buf + 0x14);
+
+        /* Diagnostic: dump raw info_buf for first 20 records to verify layout */
+        static int _diag_count = 0;
+        if (_diag_count < 20) {
+            _diag_count++;
+            nyx_printf("[JIT-TAP][DIAG] info_buf raw: "
+                       "%02x%02x%02x%02x %02x%02x%02x%02x "
+                       "%02x%02x%02x%02x %02x%02x%02x%02x "
+                       "%02x%02x%02x%02x %02x%02x%02x%02x\n",
+                       info_buf[0],info_buf[1],info_buf[2],info_buf[3],
+                       info_buf[4],info_buf[5],info_buf[6],info_buf[7],
+                       info_buf[8],info_buf[9],info_buf[10],info_buf[11],
+                       info_buf[12],info_buf[13],info_buf[14],info_buf[15],
+                       info_buf[16],info_buf[17],info_buf[18],info_buf[19],
+                       info_buf[20],info_buf[21],info_buf[22],info_buf[23]);
+            nyx_printf("[JIT-TAP][DIAG] ftn=0x%x scope=0x%x ilcode=0x%x "
+                       "il_size=%u maxStack=%u EHcount=%u options=0x%x "
+                       "esp=0x%x info_ptr=0x%x\n",
+                       ftn, scope, ilcode, il_size, max_stack, eh_count,
+                       options, esp, info_ptr);
+        }
 
         if (il_size == 0 || il_size > 0x10000) {
             nyx_printf("[JIT-TAP] compileMethod: skip il_size=%u\n", il_size);
