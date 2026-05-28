@@ -349,6 +349,24 @@ void wte_activate(uint64_t cr3, bool is_64bit)
     wte_state.jit_tap.records_written         = 0;
     wte_state.jit_tap.count_file_offset       = 0;
 
+    wte_state.jit_tap.getehinfo_va          = 0;
+    wte_state.jit_tap.getehinfo_nx_armed    = false;
+    wte_state.jit_tap.getehinfo_gfn         = 0;
+    wte_state.jit_tap.pending_write         = false;
+    wte_state.jit_tap.pending_ftn           = 0;
+    wte_state.jit_tap.pending_scope         = 0;
+    if (wte_state.jit_tap.pending_il_bytes) {
+        free(wte_state.jit_tap.pending_il_bytes);
+        wte_state.jit_tap.pending_il_bytes  = NULL;
+    }
+    wte_state.jit_tap.pending_il_size       = 0;
+    wte_state.jit_tap.pending_eh_count      = 0;
+    wte_state.jit_tap.eh_expected           = 0;
+    wte_state.jit_tap.eh_captured           = 0;
+    wte_state.jit_tap.eh_clause_ptr         = 0;
+    wte_state.jit_tap.eh_return_pending     = false;
+    wte_state.jit_tap.eh_return_gfn         = 0;
+
     if (!wte_state.kvm_wte_enabled) {
         wte_kvm_enable();
     }
@@ -380,6 +398,23 @@ void wte_deactivate(void)
         wte_kvm_clear_nx(&gfn, 1);
         wte_state.jit_tap.compile_method_nx_armed = false;
     }
+    if (wte_state.jit_tap.getehinfo_nx_armed &&
+        wte_state.jit_tap.getehinfo_gfn != 0) {
+        uint64_t gfn = wte_state.jit_tap.getehinfo_gfn;
+        wte_kvm_clear_nx(&gfn, 1);
+        wte_state.jit_tap.getehinfo_nx_armed = false;
+    }
+    if (wte_state.jit_tap.eh_return_pending &&
+        wte_state.jit_tap.eh_return_gfn != 0) {
+        uint64_t gfn = wte_state.jit_tap.eh_return_gfn;
+        wte_kvm_clear_nx(&gfn, 1);
+        wte_state.jit_tap.eh_return_pending = false;
+    }
+    if (wte_state.jit_tap.pending_il_bytes) {
+        free(wte_state.jit_tap.pending_il_bytes);
+        wte_state.jit_tap.pending_il_bytes = NULL;
+    }
+    wte_state.jit_tap.pending_write = false;
 
     nyx_printf("[WtE] Deactivated: total=%d (dumped=%d, DLL-filtered=%d, "
                "CoW-recovered=%lu) across %d rounds\n",
@@ -595,7 +630,7 @@ void wte_register_dynamic_exec_region(CPUState *cpu,
  *       pad[]                  zero-pad to next 4-byte boundary
  */
 
-static const uint8_t k_jitil_magic[6] = {'J','I','T','I','L','\x01'};
+static const uint8_t k_jitil_magic[6] = {'J','I','T','I','L','\x02'};
 
 static void wte_jit_il_open(void)
 {
@@ -632,7 +667,8 @@ static void wte_jit_il_open(void)
 
 static void wte_jit_il_write(uint32_t wte_seq, uint32_t ftn, uint32_t scope,
                               const uint8_t *il_bytes, uint32_t il_size,
-                              uint16_t eh_count)
+                              uint16_t eh_count,
+                              const wte_eh_clause_t *eh_clauses)
 {
     FILE *f = wte_state.jit_tap.dump_file;
     if (!f) return;
@@ -656,6 +692,12 @@ static void wte_jit_il_write(uint32_t wte_seq, uint32_t ftn, uint32_t scope,
         uint8_t zeros[3] = {0, 0, 0};
         fwrite(zeros, 1, pad, f);
     }
+
+    /* Write EH clauses (24 bytes each, already 4-byte aligned) */
+    if (eh_count > 0 && eh_clauses != NULL) {
+        fwrite(eh_clauses, sizeof(wte_eh_clause_t), eh_count, f);
+    }
+
     wte_state.jit_tap.records_written++;
 
     /* Patch num_records in-place after every write so the file is valid
@@ -671,10 +713,32 @@ static void wte_jit_il_write(uint32_t wte_seq, uint32_t ftn, uint32_t scope,
                wte_state.jit_tap.records_written, ftn, scope, il_size, eh_count);
 }
 
+static void wte_jit_flush_pending(void)
+{
+    if (!wte_state.jit_tap.pending_write) return;
+    wte_jit_il_write(wte_state.jit_tap.pending_wte_seq,
+                     wte_state.jit_tap.pending_ftn,
+                     wte_state.jit_tap.pending_scope,
+                     wte_state.jit_tap.pending_il_bytes,
+                     wte_state.jit_tap.pending_il_size,
+                     wte_state.jit_tap.pending_eh_count,
+                     wte_state.jit_tap.eh_clauses);
+    free(wte_state.jit_tap.pending_il_bytes);
+    wte_state.jit_tap.pending_il_bytes  = NULL;
+    wte_state.jit_tap.pending_write     = false;
+    wte_state.jit_tap.getehinfo_nx_armed = false;
+    wte_state.jit_tap.eh_return_pending  = false;
+}
+
 void wte_jit_il_close(void)
 {
     FILE *f = wte_state.jit_tap.dump_file;
     if (!f) return;
+
+    /* Flush any pending buffered write before closing */
+    if (wte_state.jit_tap.pending_write) {
+        wte_jit_flush_pending();
+    }
 
     /* Patch num_records in the file header */
     uint32_t count = (uint32_t)wte_state.jit_tap.records_written;
@@ -880,11 +944,47 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
 {
     if (!wte_state.jit_tap.enabled) return false;
 
+    /* getEHinfo return trap: getEHinfo has returned; clause_ptr is now filled. */
+    if (wte_state.jit_tap.eh_return_pending &&
+        gfn == wte_state.jit_tap.eh_return_gfn) {
+        wte_state.jit_tap.eh_return_pending = false;
+        uint64_t ret_gfn = wte_state.jit_tap.eh_return_gfn;
+        wte_kvm_clear_nx(&ret_gfn, 1);
+
+        uint16_t captured = wte_state.jit_tap.eh_captured;
+        if (captured < WTE_JIT_MAX_EH_CLAUSES) {
+            wte_eh_clause_t *clause = &wte_state.jit_tap.eh_clauses[captured];
+            if (read_virtual_memory(wte_state.jit_tap.eh_clause_ptr,
+                                    (uint8_t *)clause,
+                                    sizeof(wte_eh_clause_t), cpu)) {
+                wte_state.jit_tap.eh_captured++;
+                nyx_printf("[JIT-TAP] EH[%u]: flags=0x%x try=[0x%x,+0x%x) "
+                           "handler=[0x%x,+0x%x)\n",
+                           captured, clause->flags,
+                           clause->try_offset, clause->try_length,
+                           clause->handler_offset, clause->handler_length);
+            }
+        }
+
+        if (wte_state.jit_tap.eh_captured < wte_state.jit_tap.eh_expected) {
+            /* More clauses — re-arm getEHinfo NX for next call */
+            wte_kvm_set_nx(&wte_state.jit_tap.getehinfo_gfn, 1);
+            wte_state.jit_tap.getehinfo_nx_armed = true;
+        } else {
+            /* All clauses captured — flush IL + EH record */
+            nyx_printf("[JIT-TAP] EH capture complete (%u clauses) — flushing record\n",
+                       wte_state.jit_tap.eh_captured);
+            wte_jit_flush_pending();
+        }
+        return true;
+    }
+
     /* Deferred re-arm: if the previous compileMethod trap cleared NX to allow
      * execution, re-arm NX now that we're back on a different page (the
      * compileMethod function has returned to its caller). */
     if (wte_state.jit_tap.rearm_pending &&
-        gfn != wte_state.jit_tap.compile_method_gfn) {
+        gfn != wte_state.jit_tap.compile_method_gfn &&
+        !wte_state.jit_tap.pending_write) {
         uint64_t cm_gfn = wte_state.jit_tap.compile_method_gfn;
         wte_kvm_set_nx(&cm_gfn, 1);
         wte_state.jit_tap.rearm_pending            = false;
@@ -942,6 +1042,59 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
         nyx_printf("[JIT-TAP] Late-bind: compileMethod GFN=0x%lx\n",
                    (unsigned long)gfn);
         is_cm_page = true;
+    }
+
+    /* getEHinfo entry trap: intercept to install return-address NX. */
+    if (wte_state.jit_tap.pending_write &&
+        wte_state.jit_tap.getehinfo_nx_armed &&
+        gfn == wte_state.jit_tap.getehinfo_gfn) {
+
+        X86CPU      *cpux86_eh = X86_CPU(cpu);
+        CPUX86State *env_eh    = &cpux86_eh->env;
+        uint32_t esp_eh = (uint32_t)env_eh->regs[R_ESP];
+
+        uint32_t ret_addr = 0, ftn_arg = 0, eh_num = 0, clause_ptr = 0;
+        read_virtual_memory((uint64_t)(esp_eh + 0x00), (uint8_t *)&ret_addr,   4, cpu);
+        read_virtual_memory((uint64_t)(esp_eh + 0x08), (uint8_t *)&ftn_arg,    4, cpu);
+        read_virtual_memory((uint64_t)(esp_eh + 0x0C), (uint8_t *)&eh_num,     4, cpu);
+        read_virtual_memory((uint64_t)(esp_eh + 0x10), (uint8_t *)&clause_ptr, 4, cpu);
+
+        /* Verify expected ftn and sequential clause index */
+        if (ftn_arg  == wte_state.jit_tap.pending_ftn &&
+            eh_num   == wte_state.jit_tap.eh_captured &&
+            clause_ptr != 0 && ret_addr != 0) {
+
+            uint64_t ret_pa = get_paging_phys_addr(cpu, wte_state.target_cr3,
+                                                   (uint64_t)ret_addr);
+            if (ret_pa != 0 && ret_pa != 0xFFFFFFFFFFFFFFFFULL) {
+                uint64_t ret_gfn = ret_pa >> 12;
+                wte_kvm_set_nx(&ret_gfn, 1);
+                wte_state.jit_tap.eh_return_gfn     = ret_gfn;
+                wte_state.jit_tap.eh_return_pending = true;
+                wte_state.jit_tap.eh_clause_ptr     = (uint64_t)clause_ptr;
+
+                /* Clear NX to let getEHinfo execute */
+                wte_kvm_clear_nx(&wte_state.jit_tap.getehinfo_gfn, 1);
+                wte_state.jit_tap.getehinfo_nx_armed = false;
+
+                nyx_printf("[JIT-TAP] getEHinfo[%u]: ftn=0x%x clause_ptr=0x%x "
+                           "ret_gfn=0x%lx\n",
+                           eh_num, ftn_arg, clause_ptr,
+                           (unsigned long)ret_gfn);
+                return true;
+            }
+        }
+
+        /* Unexpected args or unmapped ret addr — allow, skip EH for this clause */
+        nyx_printf("[JIT-TAP] getEHinfo entry: unexpected args ftn=0x%x/0x%x "
+                   "eh_num=%u/%u — skipping\n",
+                   ftn_arg, wte_state.jit_tap.pending_ftn,
+                   eh_num, wte_state.jit_tap.eh_captured);
+        wte_kvm_clear_nx(&wte_state.jit_tap.getehinfo_gfn, 1);
+        wte_state.jit_tap.getehinfo_nx_armed = false;
+        /* Flush with partial EH data */
+        wte_jit_flush_pending();
+        return true;
     }
 
     if (!is_getjit_page && !is_cm_page) return false;
@@ -1035,20 +1188,84 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
             goto allow_cm;
         }
 
+        /* Flush any still-pending write from a previous method */
+        if (wte_state.jit_tap.pending_write) {
+            nyx_printf("[JIT-TAP] compileMethod: flushing stale pending write\n");
+            if (wte_state.jit_tap.getehinfo_nx_armed) {
+                wte_kvm_clear_nx(&wte_state.jit_tap.getehinfo_gfn, 1);
+                wte_state.jit_tap.getehinfo_nx_armed = false;
+            }
+            if (wte_state.jit_tap.eh_return_pending) {
+                wte_kvm_clear_nx(&wte_state.jit_tap.eh_return_gfn, 1);
+                wte_state.jit_tap.eh_return_pending = false;
+            }
+            wte_jit_flush_pending();
+        }
+
         uint8_t *il_bytes = malloc(il_size);
         if (!il_bytes) goto allow_cm;
 
         bool ok = read_virtual_memory((uint64_t)ilcode, il_bytes, il_size, cpu);
-        if (ok) {
-            wte_jit_il_write(
-                (uint32_t)wte_state.wte_count,  /* wte_seq correlation */
-                ftn, scope, il_bytes, il_size,
-                (uint16_t)(eh_count & 0xFFFF));
-        } else {
+        if (!ok) {
             nyx_printf("[JIT-TAP] compileMethod: failed to read IL bytes "
                        "(ILCode=0x%x size=%u)\n", ilcode, il_size);
+            free(il_bytes);
+            goto allow_cm;
         }
-        free(il_bytes);
+
+        if (eh_count > 0 && wte_state.jit_tap.getehinfo_va == 0) {
+            /* Resolve getEHinfo VA from comp vtable (one-time per run) */
+            uint32_t comp_va = 0;
+            read_virtual_memory((uint64_t)(esp + 0x08), (uint8_t *)&comp_va, 4, cpu);
+            if (comp_va != 0) {
+                uint32_t vtable = 0;
+                if (read_virtual_memory((uint64_t)comp_va, (uint8_t *)&vtable,
+                                        4, cpu) && vtable != 0) {
+                    uint32_t gehinfo_fn = 0;
+                    uint32_t slot_off = WTE_GETEHINFO_VTABLE_SLOT * 4;
+                    if (read_virtual_memory((uint64_t)(vtable + slot_off),
+                                            (uint8_t *)&gehinfo_fn, 4, cpu) &&
+                        gehinfo_fn != 0) {
+                        wte_state.jit_tap.getehinfo_va = (uint64_t)gehinfo_fn;
+                        nyx_printf("[JIT-TAP] getEHinfo VA=0x%x (vtable[%d])\n",
+                                   gehinfo_fn, WTE_GETEHINFO_VTABLE_SLOT);
+                    }
+                }
+            }
+        }
+
+        if (eh_count > 0 && wte_state.jit_tap.getehinfo_va != 0) {
+            /* Arm getEHinfo NX and buffer the write */
+            uint64_t gehi_gfn = 0;
+            wte_jit_tap_arm_nx(cpu, wte_state.jit_tap.getehinfo_va, &gehi_gfn);
+            if (gehi_gfn != 0) {
+                wte_state.jit_tap.getehinfo_gfn      = gehi_gfn;
+                wte_state.jit_tap.getehinfo_nx_armed = true;
+
+                wte_state.jit_tap.pending_il_bytes  = il_bytes;  /* transfer ownership */
+                wte_state.jit_tap.pending_il_size   = il_size;
+                wte_state.jit_tap.pending_ftn        = ftn;
+                wte_state.jit_tap.pending_scope      = scope;
+                wte_state.jit_tap.pending_wte_seq    = (uint32_t)wte_state.wte_count;
+                wte_state.jit_tap.pending_eh_count   = eh_count;
+                wte_state.jit_tap.eh_expected        = eh_count;
+                wte_state.jit_tap.eh_captured        = 0;
+                wte_state.jit_tap.eh_return_pending  = false;
+                wte_state.jit_tap.pending_write      = true;
+                il_bytes = NULL;  /* owned by pending state now */
+                nyx_printf("[JIT-TAP] compileMethod: buffered ftn=0x%x eh_count=%u "
+                           "pending EH capture\n", ftn, eh_count);
+            } else {
+                /* NX arm failed — write without EH */
+                wte_jit_il_write((uint32_t)wte_state.wte_count, ftn, scope,
+                                  il_bytes, il_size, eh_count, NULL);
+            }
+        } else {
+            /* No EH or getEHinfo not resolved — write immediately */
+            wte_jit_il_write((uint32_t)wte_state.wte_count, ftn, scope,
+                              il_bytes, il_size, eh_count, NULL);
+        }
+        free(il_bytes);  /* NULL-safe if ownership was transferred */
     }
 
 allow_cm:
@@ -2427,6 +2644,23 @@ void wte_reset_round(void)
     wte_state.mtf_reason     = WTE_MTF_REASON_WRITE;
     wte_state.mtf_target_va  = 0;
     wte_state.mtf_target_gfn = 0;
+
+    /* Clear JIT tap EH/pending state */
+    if (wte_state.jit_tap.getehinfo_nx_armed) {
+        wte_kvm_clear_nx(&wte_state.jit_tap.getehinfo_gfn, 1);
+    }
+    if (wte_state.jit_tap.eh_return_pending) {
+        wte_kvm_clear_nx(&wte_state.jit_tap.eh_return_gfn, 1);
+    }
+    if (wte_state.jit_tap.pending_il_bytes) {
+        free(wte_state.jit_tap.pending_il_bytes);
+        wte_state.jit_tap.pending_il_bytes = NULL;
+    }
+    wte_state.jit_tap.pending_write         = false;
+    wte_state.jit_tap.getehinfo_nx_armed    = false;
+    wte_state.jit_tap.eh_return_pending     = false;
+    wte_state.jit_tap.eh_captured           = 0;
+    wte_state.jit_tap.eh_expected           = 0;
 
     /* Reset counters */
     wte_state.round++;

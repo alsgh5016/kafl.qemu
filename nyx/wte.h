@@ -54,6 +54,13 @@
                                           * pending verification at next
                                           * EPT violation on other page  */
 
+/* JIT tap vtable slot for ICorStaticInfo::getEHinfo (.NET 4.x x86 ABI).
+ * Slot 8 = 8th pure virtual after the base-class vtable starts. */
+#define WTE_GETEHINFO_VTABLE_SLOT  8
+
+/* Maximum EH clauses buffered per method. */
+#define WTE_JIT_MAX_EH_CLAUSES     64
+
 /* ── DLL module entry (for noise filtering) ───────────────────── */
 
 typedef struct {
@@ -61,6 +68,16 @@ typedef struct {
     uint64_t end;                            /* base + size               */
     char     name[WTE_DLL_NAME_LEN];         /* module name (ASCII)       */
 } wte_dll_entry_t;
+
+/* EH clause — mirrors CORINFO_EH_CLAUSE (CLR 4.x, 24 bytes). */
+typedef struct {
+    uint32_t flags;          /* 0=catch 1=filter 2=finally 4=fault */
+    uint32_t try_offset;
+    uint32_t try_length;
+    uint32_t handler_offset;
+    uint32_t handler_length;
+    uint32_t class_token;    /* catch type token or filter offset */
+} wte_eh_clause_t;
 
 /* ── Per-page tracking entry ───────────────────────────────────── */
 
@@ -179,6 +196,28 @@ typedef struct {
 
         /* MTF re-arm: used only for the one-shot getJit trap path */
         uint64_t mtf_rearm_gfn;
+
+        /* getEHinfo tap: return-address NX approach */
+        uint64_t getehinfo_va;
+        bool     getehinfo_nx_armed;
+        uint64_t getehinfo_gfn;
+
+        /* Pending IL write — buffered until all EH clauses captured */
+        bool     pending_write;
+        uint32_t pending_wte_seq;
+        uint32_t pending_ftn;
+        uint32_t pending_scope;
+        uint8_t *pending_il_bytes;   /* malloc'd; freed after flush */
+        uint32_t pending_il_size;
+        uint16_t pending_eh_count;
+
+        /* In-flight EH accumulation */
+        uint16_t eh_expected;        /* EHcount from compileMethod           */
+        uint16_t eh_captured;        /* clauses received so far              */
+        uint64_t eh_clause_ptr;      /* guest VA of current clause output    */
+        bool     eh_return_pending;  /* waiting for getEHinfo return-NX trap */
+        uint64_t eh_return_gfn;      /* GFN of getEHinfo return address      */
+        wte_eh_clause_t eh_clauses[WTE_JIT_MAX_EH_CLAUSES];
 
         /* jit_il_dump_N output file */
         int      dump_seq;           /* incremented each wte_activate */
