@@ -217,6 +217,9 @@ typedef struct {
         uint64_t eh_clause_ptr;      /* guest VA of current clause output    */
         bool     eh_return_pending;  /* waiting for getEHinfo return-NX trap */
         uint64_t eh_return_gfn;      /* GFN of getEHinfo return address      */
+        bool     eh_rearm_pending;   /* deferred getEHinfo NX re-arm (MTF busy
+                                      * fallback): re-arm on next exec on a
+                                      * different GFN                        */
         wte_eh_clause_t eh_clauses[WTE_JIT_MAX_EH_CLAUSES];
 
         /* jit_il_dump_N output file */

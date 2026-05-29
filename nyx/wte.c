@@ -366,6 +366,7 @@ void wte_activate(uint64_t cr3, bool is_64bit)
     wte_state.jit_tap.eh_clause_ptr         = 0;
     wte_state.jit_tap.eh_return_pending     = false;
     wte_state.jit_tap.eh_return_gfn         = 0;
+    wte_state.jit_tap.eh_rearm_pending      = false;
 
     if (!wte_state.kvm_wte_enabled) {
         wte_kvm_enable();
@@ -716,18 +717,32 @@ static void wte_jit_il_write(uint32_t wte_seq, uint32_t ftn, uint32_t scope,
 static void wte_jit_flush_pending(void)
 {
     if (!wte_state.jit_tap.pending_write) return;
+
+    /* Write only the clauses we actually captured.  Using pending_eh_count
+     * (the expected EHcount) here would emit stale eh_clauses[] entries from
+     * a previous method plus uninitialised slots when capture was cut short
+     * (e.g. MTF-busy fallback), corrupting the record. */
+    uint16_t captured = wte_state.jit_tap.eh_captured;
+    uint16_t expected = wte_state.jit_tap.pending_eh_count;
+    if (captured < expected) {
+        nyx_printf("[JIT-TAP] WARNING: ftn=0x%x partial EH capture %u/%u — "
+                   "writing %u clause(s)\n",
+                   wte_state.jit_tap.pending_ftn, captured, expected, captured);
+    }
+
     wte_jit_il_write(wte_state.jit_tap.pending_wte_seq,
                      wte_state.jit_tap.pending_ftn,
                      wte_state.jit_tap.pending_scope,
                      wte_state.jit_tap.pending_il_bytes,
                      wte_state.jit_tap.pending_il_size,
-                     wte_state.jit_tap.pending_eh_count,
+                     captured,
                      wte_state.jit_tap.eh_clauses);
     free(wte_state.jit_tap.pending_il_bytes);
-    wte_state.jit_tap.pending_il_bytes  = NULL;
-    wte_state.jit_tap.pending_write     = false;
+    wte_state.jit_tap.pending_il_bytes   = NULL;
+    wte_state.jit_tap.pending_write      = false;
     wte_state.jit_tap.getehinfo_nx_armed = false;
     wte_state.jit_tap.eh_return_pending  = false;
+    wte_state.jit_tap.eh_rearm_pending   = false;
 }
 
 void wte_jit_il_close(void)
@@ -994,6 +1009,22 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
         /* Do NOT return — continue to process this exec violation normally */
     }
 
+    /* Deferred getEHinfo re-arm: a false (non-getEHinfo) entry on the
+     * getEHinfo page cleared NX while MTF was busy with an API hook step.
+     * Now that we're back on a different page (the false function returned),
+     * re-arm the getEHinfo NX so the genuine call is still intercepted. */
+    if (wte_state.jit_tap.eh_rearm_pending &&
+        wte_state.jit_tap.pending_write &&
+        gfn != wte_state.jit_tap.getehinfo_gfn) {
+        uint64_t gehi_gfn = wte_state.jit_tap.getehinfo_gfn;
+        wte_kvm_set_nx(&gehi_gfn, 1);
+        wte_state.jit_tap.eh_rearm_pending   = false;
+        wte_state.jit_tap.getehinfo_nx_armed = true;
+        nyx_printf("[JIT-TAP] Deferred re-arm: NX restored on getEHinfo "
+                   "GFN=0x%lx\n", (unsigned long)gehi_gfn);
+        /* Do NOT return — continue to process this exec violation normally */
+    }
+
     /* Deferred getJit resolve: getJit initializes the g_jit singleton itself,
      * so g_jit is null at getJit entry.  After clearing NX (allowing getJit
      * to run), we set getjit_returned_pending=true.  On the next exec
@@ -1098,20 +1129,23 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
          * genuine call (ftn == pending_ftn) is still intercepted. */
         wte_kvm_clear_nx(&wte_state.jit_tap.getehinfo_gfn, 1);
         if (GET_GLOBAL_STATE()->api_hook_step_idx < 0) {
+            /* Precise: single-step the false entry, re-arm on MTF. */
             wte_state.mtf_active            = true;
             wte_state.mtf_reason            = WTE_MTF_REASON_JIT_REARM;
             wte_state.jit_tap.mtf_rearm_gfn = wte_state.jit_tap.getehinfo_gfn;
             kvm_vcpu_ioctl(cpu, KVM_VMX_PT_ENABLE_MTF);
             /* getehinfo_nx_armed stays true — MTF handler re-arms the NX. */
             nyx_printf("[JIT-TAP] getEHinfo page: non-getEHinfo entry "
-                       "(ftn=0x%x), stepping over to re-arm\n", ftn_arg);
+                       "(ftn=0x%x), MTF step-over to re-arm\n", ftn_arg);
         } else {
-            /* MTF busy with an API hook step — can't re-arm safely.  Drop EH
-             * capture for this method but keep the IL (flush partial). */
-            wte_state.jit_tap.getehinfo_nx_armed = false;
-            nyx_printf("[JIT-TAP] getEHinfo page: MTF busy, flushing without "
-                       "EH (ftn=0x%x)\n", ftn_arg);
-            wte_jit_flush_pending();
+            /* MTF busy with an API hook step — fall back to deferred re-arm:
+             * NX stays cleared for now, and the next exec violation on a
+             * different GFN re-arms the getEHinfo NX (see handle_exec top).
+             * Keeps the pending EH capture alive instead of dropping it. */
+            wte_state.jit_tap.eh_rearm_pending = true;
+            /* getehinfo_nx_armed stays true — deferred path re-arms the NX. */
+            nyx_printf("[JIT-TAP] getEHinfo page: non-getEHinfo entry "
+                       "(ftn=0x%x), MTF busy — deferred re-arm\n", ftn_arg);
         }
         return true;
     }
@@ -1283,6 +1317,7 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
                 wte_state.jit_tap.eh_expected        = eh_count;
                 wte_state.jit_tap.eh_captured        = 0;
                 wte_state.jit_tap.eh_return_pending  = false;
+                wte_state.jit_tap.eh_rearm_pending   = false;
                 wte_state.jit_tap.pending_write      = true;
                 il_bytes = NULL;  /* owned by pending state now */
                 nyx_printf("[JIT-TAP] compileMethod: buffered ftn=0x%x eh_count=%u "
@@ -2691,6 +2726,7 @@ void wte_reset_round(void)
     wte_state.jit_tap.pending_write         = false;
     wte_state.jit_tap.getehinfo_nx_armed    = false;
     wte_state.jit_tap.eh_return_pending     = false;
+    wte_state.jit_tap.eh_rearm_pending      = false;
     wte_state.jit_tap.eh_captured           = 0;
     wte_state.jit_tap.eh_expected           = 0;
 
