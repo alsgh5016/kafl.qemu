@@ -1128,7 +1128,12 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
          * over this instruction with MTF and re-arm the getEHinfo NX so the
          * genuine call (ftn == pending_ftn) is still intercepted. */
         wte_kvm_clear_nx(&wte_state.jit_tap.getehinfo_gfn, 1);
-        if (GET_GLOBAL_STATE()->api_hook_step_idx < 0) {
+        /* MTF is free unless an API hook is mid single-step.  Note: a bare
+         * "api_hook_step_idx < 0" test is wrong — the field is zero-initialised
+         * and only ever set under api_hook_mode, so it stays 0 (>= 0) when no
+         * API hooks exist, which would wrongly block MTF forever. */
+        if (!GET_GLOBAL_STATE()->api_hook_mode ||
+            GET_GLOBAL_STATE()->api_hook_step_idx < 0) {
             /* Precise: single-step the false entry, re-arm on MTF. */
             wte_state.mtf_active            = true;
             wte_state.mtf_reason            = WTE_MTF_REASON_JIT_REARM;
@@ -1850,8 +1855,12 @@ void wte_handle_write_violation(uint64_t gfn, uint64_t gpa,
         entry->last_write_rip = rip;
 
         /* Arm MTF to confirm write and re-arm W=0 after completion.
-         * Skip if API hook is already using MTF. */
-        if (GET_GLOBAL_STATE()->api_hook_step_idx < 0) {
+         * Skip only if an API hook is mid single-step (api_hook_step_idx is
+         * zero-initialised and only set under api_hook_mode, so test the mode
+         * too — a bare "< 0" check would block MTF whenever no API hooks
+         * exist). */
+        if (!GET_GLOBAL_STATE()->api_hook_mode ||
+            GET_GLOBAL_STATE()->api_hook_step_idx < 0) {
             wte_state.mtf_active     = true;
             wte_state.mtf_target_va  = fault_va;
             wte_state.mtf_target_gfn = gfn;
