@@ -1053,27 +1053,17 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
         CPUX86State *env_eh    = &cpux86_eh->env;
         uint32_t esp_eh = (uint32_t)env_eh->regs[R_ESP];
 
+        /* getEHinfo is a C++ virtual member of ICorJitInfo (thiscall, this
+         * in ECX), so the explicit args sit at:
+         *   [ESP+0x00] = return address
+         *   [ESP+0x04] = ftn (CORINFO_METHOD_HANDLE)
+         *   [ESP+0x08] = EHnumber (unsigned)
+         *   [ESP+0x0C] = clause (CORINFO_EH_CLAUSE* output buffer) */
         uint32_t ret_addr = 0, ftn_arg = 0, eh_num = 0, clause_ptr = 0;
         read_virtual_memory((uint64_t)(esp_eh + 0x00), (uint8_t *)&ret_addr,   4, cpu);
-        read_virtual_memory((uint64_t)(esp_eh + 0x08), (uint8_t *)&ftn_arg,    4, cpu);
-        read_virtual_memory((uint64_t)(esp_eh + 0x0C), (uint8_t *)&eh_num,     4, cpu);
-        read_virtual_memory((uint64_t)(esp_eh + 0x10), (uint8_t *)&clause_ptr, 4, cpu);
-
-        /* DIAG: dump first 6 stack slots + ecx to confirm getEHinfo ABI.
-         * Remove once the entry stack layout is confirmed. */
-        {
-            uint32_t s[6] = {0};
-            for (int _i = 0; _i < 6; _i++)
-                read_virtual_memory((uint64_t)(esp_eh + _i * 4),
-                                    (uint8_t *)&s[_i], 4, cpu);
-            nyx_printf("[JIT-TAP][EH-DIAG] esp=0x%x ecx=0x%x slots: "
-                       "+00=0x%x +04=0x%x +08=0x%x +0C=0x%x +10=0x%x +14=0x%x "
-                       "(expect_ftn=0x%x expect_idx=%u)\n",
-                       esp_eh, (uint32_t)env_eh->regs[R_ECX],
-                       s[0], s[1], s[2], s[3], s[4], s[5],
-                       wte_state.jit_tap.pending_ftn,
-                       wte_state.jit_tap.eh_captured);
-        }
+        read_virtual_memory((uint64_t)(esp_eh + 0x04), (uint8_t *)&ftn_arg,    4, cpu);
+        read_virtual_memory((uint64_t)(esp_eh + 0x08), (uint8_t *)&eh_num,     4, cpu);
+        read_virtual_memory((uint64_t)(esp_eh + 0x0C), (uint8_t *)&clause_ptr, 4, cpu);
 
         /* Verify expected ftn and sequential clause index */
         if (ftn_arg  == wte_state.jit_tap.pending_ftn &&
@@ -1101,15 +1091,28 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
             }
         }
 
-        /* Unexpected args or unmapped ret addr — allow, skip EH for this clause */
-        nyx_printf("[JIT-TAP] getEHinfo entry: unexpected args ftn=0x%x/0x%x "
-                   "eh_num=%u/%u — skipping\n",
-                   ftn_arg, wte_state.jit_tap.pending_ftn,
-                   eh_num, wte_state.jit_tap.eh_captured);
+        /* Not the real getEHinfo entry: getEHinfo shares its 4K page with
+         * other JIT helpers, so any of them can fault first (NX is
+         * page-granular).  Don't give up on the pending EH capture — step
+         * over this instruction with MTF and re-arm the getEHinfo NX so the
+         * genuine call (ftn == pending_ftn) is still intercepted. */
         wte_kvm_clear_nx(&wte_state.jit_tap.getehinfo_gfn, 1);
-        wte_state.jit_tap.getehinfo_nx_armed = false;
-        /* Flush with partial EH data */
-        wte_jit_flush_pending();
+        if (GET_GLOBAL_STATE()->api_hook_step_idx < 0) {
+            wte_state.mtf_active            = true;
+            wte_state.mtf_reason            = WTE_MTF_REASON_JIT_REARM;
+            wte_state.jit_tap.mtf_rearm_gfn = wte_state.jit_tap.getehinfo_gfn;
+            kvm_vcpu_ioctl(cpu, KVM_VMX_PT_ENABLE_MTF);
+            /* getehinfo_nx_armed stays true — MTF handler re-arms the NX. */
+            nyx_printf("[JIT-TAP] getEHinfo page: non-getEHinfo entry "
+                       "(ftn=0x%x), stepping over to re-arm\n", ftn_arg);
+        } else {
+            /* MTF busy with an API hook step — can't re-arm safely.  Drop EH
+             * capture for this method but keep the IL (flush partial). */
+            wte_state.jit_tap.getehinfo_nx_armed = false;
+            nyx_printf("[JIT-TAP] getEHinfo page: MTF busy, flushing without "
+                       "EH (ftn=0x%x)\n", ftn_arg);
+            wte_jit_flush_pending();
+        }
         return true;
     }
 
