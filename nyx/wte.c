@@ -1059,6 +1059,22 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
         read_virtual_memory((uint64_t)(esp_eh + 0x0C), (uint8_t *)&eh_num,     4, cpu);
         read_virtual_memory((uint64_t)(esp_eh + 0x10), (uint8_t *)&clause_ptr, 4, cpu);
 
+        /* DIAG: dump first 6 stack slots + ecx to confirm getEHinfo ABI.
+         * Remove once the entry stack layout is confirmed. */
+        {
+            uint32_t s[6] = {0};
+            for (int _i = 0; _i < 6; _i++)
+                read_virtual_memory((uint64_t)(esp_eh + _i * 4),
+                                    (uint8_t *)&s[_i], 4, cpu);
+            nyx_printf("[JIT-TAP][EH-DIAG] esp=0x%x ecx=0x%x slots: "
+                       "+00=0x%x +04=0x%x +08=0x%x +0C=0x%x +10=0x%x +14=0x%x "
+                       "(expect_ftn=0x%x expect_idx=%u)\n",
+                       esp_eh, (uint32_t)env_eh->regs[R_ECX],
+                       s[0], s[1], s[2], s[3], s[4], s[5],
+                       wte_state.jit_tap.pending_ftn,
+                       wte_state.jit_tap.eh_captured);
+        }
+
         /* Verify expected ftn and sequential clause index */
         if (ftn_arg  == wte_state.jit_tap.pending_ftn &&
             eh_num   == wte_state.jit_tap.eh_captured &&
