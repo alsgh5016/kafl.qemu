@@ -229,6 +229,31 @@ typedef struct {
         long     count_file_offset;  /* fseek position of num_records field */
     } jit_tap;
 
+    /* ── Force-JIT sweep trigger (JIT-idle detection) ───────────────
+     * Instead of trapping process exit (which would need EPT-NX on a hot
+     * ntdll page, or a hardware BP), we watch the compileMethod trap rate.
+     * Once no method has been JIT-compiled for `idle_threshold_us`, the JIT
+     * has quiesced — loading is stable and every executed method is already
+     * captured — which is the right moment to run the force-JIT sweep that
+     * picks up never-called methods (e.g. an uninvoked .ctor).
+     *
+     * Detection is purely passive (it reuses the existing compileMethod
+     * trap), so it adds no anti-debug / anti-tamper surface, needs no KVM
+     * change, and never holds a guest thread (no deadlock risk).
+     *
+     * Signalling: when idle is detected we write `1` to a flag in harness
+     * memory (GVA provided at WTE_SETUP).  The harness polls it, runs the
+     * sweep, and the timer trigger remains as a fallback. */
+    struct {
+        bool     enabled;            /* harness provided a flag GVA       */
+        uint64_t flag_gva;           /* harness sweep-signal flag GVA     */
+        uint64_t harness_cr3;        /* CR3 to write the flag             */
+        uint64_t last_jit_us;        /* g_get_monotonic_time() of last
+                                      * compileMethod trap; 0 = none yet  */
+        uint64_t idle_threshold_us;  /* idle span that triggers the sweep */
+        bool     signaled;           /* sweep already requested (one-shot)*/
+    } sweep_trigger;
+
     /* Dynamic alloc ranges from api_hook NtAllocate/NtProtect callbacks.
      * Used by wte_handle_exec_violation late-bind path: when an
      * exec violation arrives on a GFN we never registered (because the
@@ -359,6 +384,20 @@ bool wte_jit_tap_handle_mtf(CPUState *cpu);
 
 /* JIT-IL tap: finalize and close the current dump file (called at deactivate). */
 void wte_jit_il_close(void);
+
+/* Force-JIT sweep trigger: enable JIT-idle detection (called from WTE_SETUP
+ * when the harness provides a sweep-signal flag GVA). */
+void wte_sweep_trigger_setup(uint64_t flag_gva, uint64_t harness_cr3,
+                             uint64_t idle_threshold_us);
+
+/* Force-JIT sweep trigger: note that a method was just JIT-compiled
+ * (called from the compileMethod tap to reset the idle timer). */
+void wte_sweep_trigger_note_jit(void);
+
+/* Force-JIT sweep trigger: check for JIT-idle and, on first detection, write
+ * the sweep-request flag into harness memory.  Called every VM exit from
+ * wte_pt_check.  No-op unless enabled and not yet signaled. */
+void wte_sweep_trigger_check(CPUState *cpu);
 
 /* DLL module enumeration (PEB→Ldr walk) and RIP filtering */
 int  wte_walk_module_list(CPUState *cpu, wte_dll_entry_t *out, int max);

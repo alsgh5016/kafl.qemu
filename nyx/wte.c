@@ -368,6 +368,16 @@ void wte_activate(uint64_t cr3, bool is_64bit)
     wte_state.jit_tap.eh_return_gfn         = 0;
     wte_state.jit_tap.eh_rearm_pending      = false;
 
+    /* Force-JIT sweep trigger (JIT-idle).  Phase 1: self-enable with a
+     * default idle threshold for log-only validation; phase 2 will drive
+     * enable/threshold from WTE_SETUP (harness opt-in). */
+    wte_state.sweep_trigger.enabled           = true;
+    wte_state.sweep_trigger.flag_gva          = 0;
+    wte_state.sweep_trigger.harness_cr3       = 0;
+    wte_state.sweep_trigger.idle_threshold_us = 500000;  /* 500 ms */
+    wte_state.sweep_trigger.last_jit_us       = 0;
+    wte_state.sweep_trigger.signaled          = false;
+
     if (!wte_state.kvm_wte_enabled) {
         wte_kvm_enable();
     }
@@ -763,6 +773,53 @@ void wte_jit_il_close(void)
     wte_state.jit_tap.dump_file = NULL;
 
     nyx_printf("[JIT-TAP] Closed jit_il dump (%d records)\n", count);
+}
+
+/* ── Force-JIT sweep trigger (JIT-idle detection) ───────────────────
+ * Passive: reuses the compileMethod tap to watch how long the JIT has
+ * been quiet.  No EPT-NX on hot pages, no guest thread held — so no
+ * deadlock risk and no anti-debug/anti-tamper surface. */
+
+void wte_sweep_trigger_setup(uint64_t flag_gva, uint64_t harness_cr3,
+                             uint64_t idle_threshold_us)
+{
+    wte_state.sweep_trigger.enabled           = true;
+    wte_state.sweep_trigger.flag_gva          = flag_gva;
+    wte_state.sweep_trigger.harness_cr3       = harness_cr3;
+    wte_state.sweep_trigger.idle_threshold_us = idle_threshold_us;
+    wte_state.sweep_trigger.last_jit_us       = 0;
+    wte_state.sweep_trigger.signaled          = false;
+    nyx_printf("[SWEEP-TRIG] enabled: flag_gva=0x%lx cr3=0x%lx idle=%lu us\n",
+               (unsigned long)flag_gva, (unsigned long)harness_cr3,
+               (unsigned long)idle_threshold_us);
+}
+
+void wte_sweep_trigger_note_jit(void)
+{
+    if (!wte_state.sweep_trigger.enabled) return;
+    wte_state.sweep_trigger.last_jit_us = (uint64_t)g_get_monotonic_time();
+}
+
+void wte_sweep_trigger_check(CPUState *cpu)
+{
+    (void)cpu;
+    if (!wte_state.sweep_trigger.enabled)        return;
+    if (wte_state.sweep_trigger.signaled)        return;
+    if (wte_state.sweep_trigger.last_jit_us == 0) return;  /* no JIT yet */
+
+    uint64_t now  = (uint64_t)g_get_monotonic_time();
+    uint64_t idle = now - wte_state.sweep_trigger.last_jit_us;
+    if (idle < wte_state.sweep_trigger.idle_threshold_us) return;
+
+    wte_state.sweep_trigger.signaled = true;
+    nyx_printf("[SWEEP-TRIG] JIT idle %lu us (threshold %lu us) — sweep point "
+               "reached (phase 1: detect only)\n",
+               (unsigned long)idle,
+               (unsigned long)wte_state.sweep_trigger.idle_threshold_us);
+
+    /* Phase 2 (TODO): write sweep-request flag (=1) into harness memory at
+     * flag_gva under harness_cr3, so the harness polling loop runs the
+     * force-JIT sweep on the live process. */
 }
 
 /* Parse PE export directory to find the VA of a named export.
@@ -1258,6 +1315,9 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
             nyx_printf("[JIT-TAP] compileMethod: skip il_size=%u\n", il_size);
             goto allow_cm;
         }
+
+        /* A real method is being JIT-compiled — reset the sweep idle timer. */
+        wte_sweep_trigger_note_jit();
 
         /* Flush any still-pending write from a previous method */
         if (wte_state.jit_tap.pending_write) {
@@ -2939,6 +2999,9 @@ void wte_pt_check(CPUState *cpu)
     if (!wte_state.active || wte_state.pe_page_count == 0) {
         return;
     }
+
+    /* Passive force-JIT sweep trigger: detect JIT quiescence. */
+    wte_sweep_trigger_check(cpu);
 
     /*
      * CoW detection via VA→GFN rescan:
