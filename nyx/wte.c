@@ -1177,13 +1177,23 @@ bool wte_jit_tap_handle_exec(CPUState *cpu, uint64_t gfn, uint64_t gpa,
             goto allow_cm;
         }
 
+        /* CORINFO_METHOD_INFO (x86 .NET 4.x):
+         *   +0x00 ftn, +0x04 scope, +0x08 ILCode, +0x0C ILCodeSize,
+         *   +0x10 maxStack (unsigned, 4B), +0x14 EHcount (unsigned, 4B),
+         *   +0x18 options.  maxStack/EHcount are 4-byte unsigned, NOT u16. */
         uint32_t ftn       = *(uint32_t *)(info_buf + 0x00);
         uint32_t scope     = *(uint32_t *)(info_buf + 0x04);
         uint32_t ilcode    = *(uint32_t *)(info_buf + 0x08);
         uint32_t il_size   = *(uint32_t *)(info_buf + 0x0C);
-        uint16_t max_stack = *(uint16_t *)(info_buf + 0x10);
-        uint16_t eh_count  = *(uint16_t *)(info_buf + 0x12);
-        uint32_t options   = *(uint32_t *)(info_buf + 0x14);
+        uint32_t eh_count  = *(uint32_t *)(info_buf + 0x14);
+
+        /* Clamp EH count to our capture buffer; a pathological value here
+         * almost certainly means a struct/ABI mismatch, so skip EH capture. */
+        if (eh_count > WTE_JIT_MAX_EH_CLAUSES) {
+            nyx_printf("[JIT-TAP] compileMethod: eh_count=%u exceeds max %d, "
+                       "skipping EH capture\n", eh_count, WTE_JIT_MAX_EH_CLAUSES);
+            eh_count = 0;
+        }
 
 
         if (il_size == 0 || il_size > 0x10000) {
