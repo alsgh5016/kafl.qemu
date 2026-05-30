@@ -832,6 +832,14 @@ void wte_sweep_trigger_check(CPUState *cpu)
         if (pa != 0 && pa != 0xFFFFFFFFFFFFFFFFULL) {
             uint32_t val = wte_state.sweep_trigger.idle_windows;
             wrote = write_physical_memory(pa, (uint8_t *)&val, 4, cpu);
+        } else {
+            nyx_printf("[SWEEP-TRIG] phys walk FAILED: harness_cr3=0x%lx "
+                       "flag_gva=0x%lx -> pa=0x%lx (cur cr3=0x%lx)\n",
+                       (unsigned long)wte_state.sweep_trigger.harness_cr3,
+                       (unsigned long)wte_state.sweep_trigger.flag_gva,
+                       (unsigned long)pa,
+                       (unsigned long)(X86_CPU(cpu)->env.cr[3] &
+                                       0xFFFFFFFFFFFFF000ULL));
         }
     }
 
