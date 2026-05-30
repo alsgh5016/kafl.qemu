@@ -251,7 +251,12 @@ typedef struct {
         uint64_t last_jit_us;        /* g_get_monotonic_time() of last
                                       * compileMethod trap; 0 = none yet  */
         uint64_t idle_threshold_us;  /* idle span that triggers the sweep */
-        bool     signaled;           /* sweep already requested (one-shot)*/
+        bool     idle_active;        /* inside an idle window already
+                                      * logged; cleared when JIT resumes.
+                                      * NOT one-shot — re-arms each gap so
+                                      * the last (pre-exit) gap is caught,
+                                      * not the first CLR-init gap.        */
+        uint32_t idle_windows;       /* count of idle windows seen so far  */
     } sweep_trigger;
 
     /* Dynamic alloc ranges from api_hook NtAllocate/NtProtect callbacks.

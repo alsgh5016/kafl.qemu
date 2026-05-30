@@ -376,7 +376,8 @@ void wte_activate(uint64_t cr3, bool is_64bit)
     wte_state.sweep_trigger.harness_cr3       = 0;
     wte_state.sweep_trigger.idle_threshold_us = 500000;  /* 500 ms */
     wte_state.sweep_trigger.last_jit_us       = 0;
-    wte_state.sweep_trigger.signaled          = false;
+    wte_state.sweep_trigger.idle_active       = false;
+    wte_state.sweep_trigger.idle_windows      = 0;
 
     if (!wte_state.kvm_wte_enabled) {
         wte_kvm_enable();
@@ -788,7 +789,8 @@ void wte_sweep_trigger_setup(uint64_t flag_gva, uint64_t harness_cr3,
     wte_state.sweep_trigger.harness_cr3       = harness_cr3;
     wte_state.sweep_trigger.idle_threshold_us = idle_threshold_us;
     wte_state.sweep_trigger.last_jit_us       = 0;
-    wte_state.sweep_trigger.signaled          = false;
+    wte_state.sweep_trigger.idle_active       = false;
+    wte_state.sweep_trigger.idle_windows      = 0;
     nyx_printf("[SWEEP-TRIG] enabled: flag_gva=0x%lx cr3=0x%lx idle=%lu us\n",
                (unsigned long)flag_gva, (unsigned long)harness_cr3,
                (unsigned long)idle_threshold_us);
@@ -798,28 +800,35 @@ void wte_sweep_trigger_note_jit(void)
 {
     if (!wte_state.sweep_trigger.enabled) return;
     wte_state.sweep_trigger.last_jit_us = (uint64_t)g_get_monotonic_time();
+    /* JIT resumed — close any open idle window so the NEXT gap re-arms.
+     * This is what makes us catch the last (pre-exit) gap instead of the
+     * first CLR-init gap. */
+    wte_state.sweep_trigger.idle_active = false;
 }
 
 void wte_sweep_trigger_check(CPUState *cpu)
 {
     (void)cpu;
-    if (!wte_state.sweep_trigger.enabled)        return;
-    if (wte_state.sweep_trigger.signaled)        return;
-    if (wte_state.sweep_trigger.last_jit_us == 0) return;  /* no JIT yet */
+    if (!wte_state.sweep_trigger.enabled)         return;
+    if (wte_state.sweep_trigger.idle_active)      return;  /* window logged */
+    if (wte_state.sweep_trigger.last_jit_us == 0) return;  /* no JIT yet   */
 
     uint64_t now  = (uint64_t)g_get_monotonic_time();
     uint64_t idle = now - wte_state.sweep_trigger.last_jit_us;
     if (idle < wte_state.sweep_trigger.idle_threshold_us) return;
 
-    wte_state.sweep_trigger.signaled = true;
-    nyx_printf("[SWEEP-TRIG] JIT idle %lu us (threshold %lu us) — sweep point "
-               "reached (phase 1: detect only)\n",
+    wte_state.sweep_trigger.idle_active = true;
+    wte_state.sweep_trigger.idle_windows++;
+    nyx_printf("[SWEEP-TRIG] idle window #%u: JIT quiet %lu us (threshold %lu) "
+               "(phase 1: detect only; re-arms when JIT resumes)\n",
+               wte_state.sweep_trigger.idle_windows,
                (unsigned long)idle,
                (unsigned long)wte_state.sweep_trigger.idle_threshold_us);
 
-    /* Phase 2 (TODO): write sweep-request flag (=1) into harness memory at
-     * flag_gva under harness_cr3, so the harness polling loop runs the
-     * force-JIT sweep on the live process. */
+    /* Phase 2 (TODO): each idle window is a sweep candidate.  The LAST window
+     * before exit is the real one.  Phase 2 will debounce — (re)write the
+     * sweep-request flag on every window; the harness runs the sweep once JIT
+     * stays quiet, and the timer remains as a fallback. */
 }
 
 /* Parse PE export directory to find the VA of a named export.
