@@ -808,7 +808,6 @@ void wte_sweep_trigger_note_jit(void)
 
 void wte_sweep_trigger_check(CPUState *cpu)
 {
-    (void)cpu;
     if (!wte_state.sweep_trigger.enabled)         return;
     if (wte_state.sweep_trigger.idle_active)      return;  /* window logged */
     if (wte_state.sweep_trigger.last_jit_us == 0) return;  /* no JIT yet   */
@@ -819,16 +818,30 @@ void wte_sweep_trigger_check(CPUState *cpu)
 
     wte_state.sweep_trigger.idle_active = true;
     wte_state.sweep_trigger.idle_windows++;
+
+    /* Signal the harness: write the idle-window counter into its flag.  The
+     * harness polling loop sees the change and runs the force-JIT sweep on
+     * the live process.  Every window (re)writes — the last one before exit
+     * is the one that yields full coverage; earlier ones are harmless
+     * (PrepareMethod is idempotent). */
+    bool wrote = false;
+    if (wte_state.sweep_trigger.flag_gva != 0) {
+        uint64_t pa = get_paging_phys_addr(cpu,
+                          wte_state.sweep_trigger.harness_cr3,
+                          wte_state.sweep_trigger.flag_gva);
+        if (pa != 0 && pa != 0xFFFFFFFFFFFFFFFFULL) {
+            uint32_t val = wte_state.sweep_trigger.idle_windows;
+            wrote = write_physical_memory(pa, (uint8_t *)&val, 4, cpu);
+        }
+    }
+
     nyx_printf("[SWEEP-TRIG] idle window #%u: JIT quiet %lu us (threshold %lu) "
-               "(phase 1: detect only; re-arms when JIT resumes)\n",
+               "— harness flag %s\n",
                wte_state.sweep_trigger.idle_windows,
                (unsigned long)idle,
-               (unsigned long)wte_state.sweep_trigger.idle_threshold_us);
-
-    /* Phase 2 (TODO): each idle window is a sweep candidate.  The LAST window
-     * before exit is the real one.  Phase 2 will debounce — (re)write the
-     * sweep-request flag on every window; the harness runs the sweep once JIT
-     * stays quiet, and the timer remains as a fallback. */
+               (unsigned long)wte_state.sweep_trigger.idle_threshold_us,
+               wte_state.sweep_trigger.flag_gva == 0 ? "disabled"
+                   : (wrote ? "written" : "WRITE FAILED (paged out?)"));
 }
 
 /* Parse PE export directory to find the VA of a named export.

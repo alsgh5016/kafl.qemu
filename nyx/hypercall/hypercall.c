@@ -1972,6 +1972,7 @@ int handle_kafl_hypercall(struct kvm_run *run,
             uint64_t image_base;
             uint64_t image_size;
             uint32_t flags;
+            uint64_t sweep_flag_gva;  /* harness VA of force-JIT sweep flag */
         } __attribute__((packed)) kafl_wte_setup_t;
 
         kafl_wte_setup_t setup = {0};
@@ -2048,6 +2049,14 @@ int handle_kafl_hypercall(struct kvm_run *run,
         wte_activate(child_cr3, !is_32bit);  /* is_64bit = !is_32bit */
         nyx_printf("[WtE] WTE_SETUP: WtE activated (cr3=0x%lx, %s)\n",
                    (unsigned long)child_cr3, is_32bit ? "32-bit" : "64-bit");
+
+        /* Force-JIT sweep trigger: if the harness provided a flag GVA, wire
+         * up JIT-idle detection to write it over the harness CR3.  Must run
+         * AFTER wte_activate (which resets sweep_trigger state). */
+        if (setup.sweep_flag_gva != 0) {
+            wte_sweep_trigger_setup(setup.sweep_flag_gva, harness_cr3,
+                                    500000 /* 500ms idle threshold */);
+        }
 
         /* Step 4: Protect target PE pages with W=0 + X=0 (Dual-Watch) */
         if (setup.image_base != 0 && setup.image_size != 0) {
