@@ -148,6 +148,21 @@ static void wte_compute_diff(wte_page_entry_t *entry)
     }
 }
 
+static bool wte_rip_overlaps_diff(const wte_page_entry_t *entry, uint64_t rip)
+{
+    uint16_t rip_offset = (uint16_t)(rip & 0xFFF);
+
+    for (int d = 0; d < entry->diff_count; d++) {
+        uint16_t diff_start = entry->diff_offsets[d];
+        uint16_t diff_end   = diff_start + entry->diff_lengths[d];
+
+        if (rip_offset < diff_end && rip_offset + 15 > diff_start)
+            return true;
+    }
+
+    return false;
+}
+
 /* ── Dump ──────────────────────────────────────────────────────── */
 
 static void wte_dump_detection(uint64_t exec_rip, wte_page_entry_t *entry,
@@ -1956,8 +1971,8 @@ void wte_handle_write_violation(uint64_t gfn, uint64_t gpa,
          *
          * Solution: W=1+X=1 temporarily, arm MTF to confirm write
          * completion, then re-arm W=0. X=0 is NOT set — allows
-         * multiple writes before execute. DEFERRED flag enables
-         * diff-based WtE detection at the next VM exit. */
+         * multiple writes before execute. DEFERRED flag records that
+         * same-page diffs must be confirmed by a later execute trap. */
         if (entry->flags & WTE_PAGE_X_BLOCKED) {
             wte_kvm_clear_nx(&gfn, 1);
             entry->flags &= ~WTE_PAGE_X_BLOCKED;
@@ -2063,60 +2078,27 @@ void wte_check_deferred_pages(CPUState *cpu)
         if (!(entry->flags & WTE_PAGE_DEFERRED)) continue;
 
         /* Page was left open (W=1+X=1) for same-page self-modifying code.
-         * Now re-read content and check if anything actually changed. */
+         * Now re-read content, but do not confirm WtE from diff alone. */
         entry->flags &= ~WTE_PAGE_DEFERRED;
 
         cpu_physical_memory_read(entry->gpa, entry->current, WTE_PAGE_SIZE);
         wte_compute_diff(entry);
 
         if (entry->diff_count > 0) {
-            /* Real change detected — WtE on same-page self-modifying code */
-            wte_state.wte_count++;
-            wte_state.total_wte_count++;
-
-            nyx_printf("[WtE][DEFERRED-DETECT] VA=0x%lx GFN=0x%lx diffs=%d "
-                       "write_rip=0x%lx\n",
+            /* Real change detected, but same-page WtE is confirmed only
+             * when a later fetch RIP overlaps one of these diff ranges. */
+            nyx_printf("[WtE][DEFERRED-PENDING] VA=0x%lx GFN=0x%lx diffs=%d "
+                       "write_rip=0x%lx - arming NX for exec confirmation\n",
                        (unsigned long)entry->va, (unsigned long)entry->gfn,
                        entry->diff_count,
                        (unsigned long)entry->last_write_rip);
-
-            /* Full process memory dump (incremental — only changed pages) */
-            {
-                X86CPU *cpux86 = X86_CPU(cpu);
-                CPUX86State *env = &cpux86->env;
-                char wte_label[128];
-                uint32_t _tid = wte_get_thread_id(cpu);
-                snprintf(wte_label, sizeof(wte_label),
-                         "wte_rip0x%lx_va0x%lx_tid0x%08x",
-                         (unsigned long)entry->last_write_rip,
-                         (unsigned long)entry->va, _tid);
-                uint64_t _teb = wte_state.is_64bit
-                    ? env->segs[R_GS].base
-                    : (uint64_t)(uint32_t)env->segs[R_FS].base;
-                wte_dump_event_t evt = {
-                    .type            = "DEFERRED",
-                    .rip             = entry->last_write_rip,
-                    .va              = entry->va,
-                    .gfn             = entry->gfn,
-                    .fs_base         = _teb,
-                    .diff_count      = entry->diff_count,
-                    .wte_count       = wte_state.wte_count,
-                    .total_wte_count = wte_state.total_wte_count,
-                };
-                dump_full_process_memory(cpu, env, wte_label, &evt, 0);
-            }
-
-            /* Rescan after deferred WtE dump too */
-            wte_rescan_user_pages(cpu);
-
-            /* Update baseline for next change detection */
-            memcpy(entry->baseline, entry->current, WTE_PAGE_SIZE);
+        } else {
+            entry->flags &= ~WTE_PAGE_WRITTEN;
+            entry->write_count = 0;
         }
 
-        /* Re-protect: W=0 + X=0 for next cycle */
-        entry->flags &= ~WTE_PAGE_WRITTEN;
-        entry->write_count = 0;
-
+        /* Re-protect: W=0 catches more writes; X=0 routes execution to
+         * wte_handle_exec_violation(), where RIP must overlap a diff range. */
         uint64_t gfn = entry->gfn;
         wte_kvm_set_wp(&gfn, 1);
         entry->flags |= WTE_PAGE_W_PROTECTED;
@@ -2478,20 +2460,8 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
          * modified range — this is the true "Written-then-Executed". */
         {
             uint16_t rip_offset = (uint16_t)(rip & 0xFFF);
-            /* Check if RIP falls within any diff range.
-             * Use a window of 15 bytes (max x86 instruction length). */
-            bool rip_in_diff = false;
-            for (int d = 0; d < entry->diff_count; d++) {
-                uint16_t diff_start = entry->diff_offsets[d];
-                uint16_t diff_end   = diff_start + entry->diff_lengths[d];
-                /* RIP overlaps diff if instruction window intersects */
-                if (rip_offset < diff_end && rip_offset + 15 > diff_start) {
-                    rip_in_diff = true;
-                    break;
-                }
-            }
 
-            if (!rip_in_diff) {
+            if (!wte_rip_overlaps_diff(entry, rip)) {
                 /* Page was modified but NOT at the executed address.
                  * This is NOT WtE — e.g., VM dispatcher writes data
                  * on the same page as code.
@@ -2511,7 +2481,10 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
                 wte_kvm_clear_nx(&gfn, 1);
                 entry->flags &= ~WTE_PAGE_X_BLOCKED;
                 entry->flags |= WTE_PAGE_X_ALLOWED;
-                /* W=0 is NOT re-set — page stays W=1, X=1 (released) */
+                if (entry->flags & WTE_PAGE_W_PROTECTED) {
+                    wte_kvm_clear_wp(&gfn, 1);
+                    entry->flags &= ~WTE_PAGE_W_PROTECTED;
+                }
                 return;
             }
         }
