@@ -95,6 +95,27 @@ static wte_page_entry_t *wte_lookup_gfn(uint64_t gfn)
     return NULL;
 }
 
+static bool wte_gfn_has_other_reference(uint64_t gfn, uint64_t current_va)
+{
+    GHashTableIter iter;
+    gpointer key, value;
+
+    if (!wte_state.page_table) return false;
+
+    for (int i = 0; i < wte_state.pe_page_count; i++) {
+        if (wte_state.pe_gfns[i] == gfn && wte_state.pe_vas[i] != current_va)
+            return true;
+    }
+
+    g_hash_table_iter_init(&iter, wte_state.page_table);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        wte_page_entry_t *entry = value;
+        if (entry->gfn == gfn && entry->va != current_va)
+            return true;
+    }
+    return false;
+}
+
 /* ── Content Diff ──────────────────────────────────────────────── */
 
 static void wte_compute_diff(wte_page_entry_t *entry)
@@ -3063,6 +3084,11 @@ void wte_pt_check(CPUState *cpu)
         nyx_printf("[WtE][COW-DETECT] VA 0x%lx: GFN 0x%lx → 0x%lx\n",
                    (unsigned long)va, (unsigned long)old_gfn,
                    (unsigned long)new_gfn);
+
+        if (!wte_gfn_has_other_reference(old_gfn, va)) {
+            wte_kvm_clear_nx(&old_gfn, 1);
+            wte_kvm_clear_wp(&old_gfn, 1);
+        }
 
         /* Update or create page entry for this VA */
         wte_page_entry_t *entry = wte_lookup_va(va);
