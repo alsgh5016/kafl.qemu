@@ -60,8 +60,7 @@ static wte_state_t wte_state;
 static wte_page_entry_t *wte_lookup_va(uint64_t page_va)
 {
     if (!wte_state.page_table) return NULL;
-    return g_hash_table_lookup(wte_state.page_table,
-                               GUINT_TO_POINTER(page_va));
+    return g_hash_table_lookup(wte_state.page_table, &page_va);
 }
 
 static wte_page_entry_t *wte_lookup_or_create_va(uint64_t page_va,
@@ -74,8 +73,9 @@ static wte_page_entry_t *wte_lookup_or_create_va(uint64_t page_va,
     entry->va  = page_va;
     entry->gfn = gfn;
     entry->gpa = gfn << 12;
-    g_hash_table_insert(wte_state.page_table,
-                        GUINT_TO_POINTER(page_va), entry);
+    uint64_t *key = g_new(uint64_t, 1);
+    *key = page_va;
+    g_hash_table_insert(wte_state.page_table, key, entry);
     return entry;
 }
 
@@ -276,7 +276,7 @@ void wte_init(void)
     memset(&wte_state, 0, sizeof(wte_state_t));
 
     wte_state.page_table = g_hash_table_new_full(
-        g_direct_hash, g_direct_equal, NULL, g_free);
+        g_int64_hash, g_int64_equal, g_free, g_free);
 
     wte_state.renx_queue    = malloc(WTE_MAX_BATCH_GFNS * sizeof(uint64_t));
     wte_state.renx_count    = 0;
@@ -3115,4 +3115,3 @@ void wte_pt_check(CPUState *cpu)
     if (nx_count > 0) wte_kvm_set_nx(nx_batch, nx_count);
     if (wp_count > 0) wte_kvm_set_wp(wp_batch, wp_count);
 }
-
