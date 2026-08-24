@@ -16,6 +16,7 @@
 #include "target/i386/cpu.h"
 
 #include "nyx/api_hook.h"
+#include "nyx/nyx_anti_catalog.h"   /* generated: NYX_ANTI_APIS[] + decode table */
 #include "nyx/wte.h"
 #include "nyx/memory_access.h"
 #include "nyx/debug.h"
@@ -114,83 +115,91 @@ static bool read_u16(CPUState *cpu, uint64_t va, uint16_t *out)
 static bool read_u32(CPUState *cpu, uint64_t va, uint32_t *out)
 { return read_virtual_memory(va, (uint8_t*)out, 4, cpu); }
 
-/* Resolve a single export name → RVA. Returns 0 if not found. */
-static uint32_t pe_resolve_export_rva(CPUState *cpu, uint64_t img_base,
-                                      const char *target_name)
+/* Locate the export directory of a loaded PE. Fills edir + the directory's own
+ * RVA/size (needed for forwarder detection). Returns false if not a PE / no exports. */
+static bool pe_get_export_dir(CPUState *cpu, uint64_t img_base,
+                              pe_export_dir_t *edir,
+                              uint32_t *dir_rva, uint32_t *dir_size)
 {
     uint16_t dos_sig = 0;
-    if (!read_u16(cpu, img_base, &dos_sig) || dos_sig != IMAGE_DOS_SIGNATURE) {
-        nyx_printf("[NYX-HOOK] PE parse: bad DOS sig at 0x%lx\n",
-                   (unsigned long)img_base);
-        return 0;
-    }
+    if (!read_u16(cpu, img_base, &dos_sig) || dos_sig != IMAGE_DOS_SIGNATURE)
+        return false;
     uint32_t e_lfanew = 0;
-    if (!read_u32(cpu, img_base + DOS_E_LFANEW_OFFSET, &e_lfanew)) return 0;
+    if (!read_u32(cpu, img_base + DOS_E_LFANEW_OFFSET, &e_lfanew)) return false;
 
     uint64_t nt_hdr = img_base + e_lfanew;
     uint32_t nt_sig = 0;
-    if (!read_u32(cpu, nt_hdr, &nt_sig) || nt_sig != IMAGE_NT_SIGNATURE) {
-        nyx_printf("[NYX-HOOK] PE parse: bad NT sig\n");
-        return 0;
-    }
+    if (!read_u32(cpu, nt_hdr, &nt_sig) || nt_sig != IMAGE_NT_SIGNATURE) return false;
 
     /* OptionalHeader starts after FileHeader (size 0x14) at NT+0x18 */
     uint64_t opt_hdr = nt_hdr + 0x18;
     uint16_t magic = 0;
-    if (!read_u16(cpu, opt_hdr, &magic)) return 0;
+    if (!read_u16(cpu, opt_hdr, &magic)) return false;
 
     /* Export Data Directory offset within OptionalHeader:
-     *   PE32  (magic=0x10b): 0x60
-     *   PE32+ (magic=0x20b): 0x70
-     */
-    uint64_t export_dir_rva_off;
-    if (magic == 0x10b)      export_dir_rva_off = 0x60;
-    else if (magic == 0x20b) export_dir_rva_off = 0x70;
-    else {
-        nyx_printf("[NYX-HOOK] PE parse: unknown magic 0x%x\n", magic);
-        return 0;
-    }
-    uint32_t export_dir_rva = 0, export_dir_size = 0;
-    if (!read_u32(cpu, opt_hdr + export_dir_rva_off,     &export_dir_rva))  return 0;
-    if (!read_u32(cpu, opt_hdr + export_dir_rva_off + 4, &export_dir_size)) return 0;
-    if (export_dir_rva == 0 || export_dir_size == 0) return 0;
+     *   PE32 (magic=0x10b): 0x60   PE32+ (magic=0x20b): 0x70 */
+    uint64_t off;
+    if (magic == 0x10b)      off = 0x60;
+    else if (magic == 0x20b) off = 0x70;
+    else return false;
 
-    pe_export_dir_t edir;
-    if (!read_virtual_memory(img_base + export_dir_rva,
-                             (uint8_t*)&edir, sizeof(edir), cpu)) {
-        return 0;
+    if (!read_u32(cpu, opt_hdr + off,     dir_rva))  return false;
+    if (!read_u32(cpu, opt_hdr + off + 4, dir_size)) return false;
+    if (*dir_rva == 0 || *dir_size == 0) return false;
+
+    return read_virtual_memory(img_base + *dir_rva, (uint8_t *)edir,
+                               sizeof(*edir), cpu);
+}
+
+/* Read the export name at name-table index i (capped). Returns false on read fail. */
+static bool pe_read_export_name(CPUState *cpu, uint64_t img_base,
+                                const pe_export_dir_t *edir, uint32_t i,
+                                char *buf, size_t buf_sz)
+{
+    uint32_t name_rva = 0;
+    if (!read_u32(cpu, img_base + edir->name_ptr_rva + i * 4, &name_rva) ||
+        name_rva == 0)
+        return false;
+    for (size_t b = 0; b < buf_sz - 1; b++) {
+        uint8_t ch;
+        if (!read_u8(cpu, img_base + name_rva + b, &ch)) { buf[b] = 0; return false; }
+        buf[b] = (char)ch;
+        if (ch == 0) return true;
     }
+    buf[buf_sz - 1] = 0;
+    return true;
+}
+
+/* Function RVA for name-table index i, or 0 (also 0 for a forwarder — its EAT entry
+ * points inside the export directory, a "DLL.Func" string, not code). */
+static uint32_t pe_export_fn_rva(CPUState *cpu, uint64_t img_base,
+                                 const pe_export_dir_t *edir, uint32_t i,
+                                 uint32_t dir_rva, uint32_t dir_size)
+{
+    uint16_t ord = 0;
+    if (!read_u16(cpu, img_base + edir->ordinal_table_rva + i * 2, &ord)) return 0;
+    if (ord >= edir->addr_table_count) return 0;
+    uint32_t fn_rva = 0;
+    if (!read_u32(cpu, img_base + edir->addr_table_rva + ord * 4, &fn_rva)) return 0;
+    if (fn_rva >= dir_rva && fn_rva < dir_rva + dir_size) return 0;  /* forwarder */
+    return fn_rva;
+}
+
+/* Resolve a single export name → RVA. Returns 0 if not found or forwarded. */
+static uint32_t pe_resolve_export_rva(CPUState *cpu, uint64_t img_base,
+                                      const char *target_name)
+{
+    pe_export_dir_t edir;
+    uint32_t dir_rva = 0, dir_size = 0;
+    if (!pe_get_export_dir(cpu, img_base, &edir, &dir_rva, &dir_size)) return 0;
 
     size_t target_len = strlen(target_name);
-    /* Walk name pointer table */
     for (uint32_t i = 0; i < edir.name_ptr_count; i++) {
-        uint32_t name_rva = 0;
-        if (!read_u32(cpu, img_base + edir.name_ptr_rva + i * 4, &name_rva))
-            continue;
-        if (name_rva == 0) continue;
-
-        /* Read name (cap at 96 bytes) and compare */
         char buf[96];
-        memset(buf, 0, sizeof(buf));
-        for (size_t b = 0; b < sizeof(buf) - 1; b++) {
-            uint8_t ch;
-            if (!read_u8(cpu, img_base + name_rva + b, &ch)) { buf[b] = 0; break; }
-            buf[b] = (char)ch;
-            if (ch == 0) break;
-        }
-        if (strncmp(buf, target_name, target_len) != 0 ||
-            buf[target_len] != 0) continue;
-
-        /* Found — look up corresponding ordinal then EAT entry */
-        uint16_t ord = 0;
-        if (!read_u16(cpu, img_base + edir.ordinal_table_rva + i * 2, &ord))
-            return 0;
-        if (ord >= edir.addr_table_count) return 0;
-
-        uint32_t fn_rva = 0;
-        if (!read_u32(cpu, img_base + edir.addr_table_rva + ord * 4, &fn_rva))
-            return 0;
-        return fn_rva;
+        if (!pe_read_export_name(cpu, img_base, &edir, i, buf, sizeof(buf))) continue;
+        if (strncmp(buf, target_name, target_len) != 0 || buf[target_len] != 0)
+            continue;
+        return pe_export_fn_rva(cpu, img_base, &edir, i, dir_rva, dir_size);
     }
     return 0;
 }
@@ -200,14 +209,12 @@ static uint32_t pe_resolve_export_rva(CPUState *cpu, uint64_t img_base,
 /* Compose ENTRY hook_id from the function kind. */
 static uint64_t entry_hook_id(nyx_hook_kind_t kind) { return (uint64_t)kind; }
 
-static int register_entry_hook(CPUState *cpu, const char *label,
-                               uint64_t rip, nyx_hook_kind_t kind)
+/* Core registration: NX the RIP's page and add it to the KVM hook table with an
+ * arbitrary entry hook_id.  Shared by the bespoke WtE hooks and the generic
+ * anti-observe hooks so both take the same NX/exit path. */
+static int register_entry_hook_id(CPUState *cpu, const char *label,
+                                  uint64_t rip, uint64_t hook_id)
 {
-    if (rip == 0) {
-        nyx_printf("[NYX-HOOK] %s: RVA not found, skip\n", label);
-        return -1;
-    }
-
     /* NX the page so EPT exec violation actually fires.  KVM-side
      * filter checks RIP and decides exit vs in-kernel step-over. */
     uint64_t pa  = get_paging_phys_addr(cpu, wte_get_state()->target_cr3, rip);
@@ -225,12 +232,140 @@ static int register_entry_hook(CPUState *cpu, const char *label,
         return rc;
     }
 
-    rc = nyx_api_hook_kvm_add(rip, gfn, entry_hook_id(kind));
+    rc = nyx_api_hook_kvm_add(rip, gfn, hook_id);
     if (rc < 0) return rc;
-
-    nyx_printf("[NYX-HOOK] %s ENTRY @ rip=0x%lx gfn=0x%lx hook_id=%d\n",
-               label, (unsigned long)rip, (unsigned long)gfn, (int)kind);
     return 0;
+}
+
+static int register_entry_hook(CPUState *cpu, const char *label,
+                               uint64_t rip, nyx_hook_kind_t kind)
+{
+    if (rip == 0) {
+        nyx_printf("[NYX-HOOK] %s: RVA not found, skip\n", label);
+        return -1;
+    }
+    int rc = register_entry_hook_id(cpu, label, rip, entry_hook_id(kind));
+    if (rc == 0)
+        nyx_printf("[NYX-HOOK] %s ENTRY @ rip=0x%lx hook_id=%d\n",
+                   label, (unsigned long)rip, (int)kind);
+    return rc;
+}
+
+/* ── Anti-analysis hook resolution + install ──────────────────── */
+
+/* Module preference for resolving a catalog export: real implementers first so a
+ * forwarder (kernel32→kernelbase) is skipped in favour of the module that owns the
+ * code.  Anything not listed is tried afterwards in load order. */
+static const char *const ANTI_MOD_PREF[] = {
+    "ntdll.dll", "kernelbase.dll", "kernel32.dll", "advapi32.dll",
+    "user32.dll", "shell32.dll", "shlwapi.dll", "psapi.dll",
+    "iphlpapi.dll", "setupapi.dll", "wtsapi32.dll", "ole32.dll", "gdi32.dll",
+};
+
+static uint64_t find_module_base_ci(wte_state_t *ws, const char *name)
+{
+    for (int i = 0; i < ws->dll_module_count; i++) {
+        if (strcasecmp(ws->dll_modules[i].name, name) == 0)
+            return ws->dll_modules[i].base;
+    }
+    return 0;
+}
+
+/* Index of a catalog API by exact export name, or -1. */
+static int anti_index_by_name(const char *name)
+{
+    for (int i = 0; i < NYX_ANTI_APIS_COUNT; i++)
+        if (strcmp(NYX_ANTI_APIS[i].export_name, name) == 0)
+            return i;
+    return -1;
+}
+
+static bool is_pref_module(const char *name)
+{
+    for (size_t k = 0; k < ARRAY_SIZE(ANTI_MOD_PREF); k++)
+        if (strcasecmp(name, ANTI_MOD_PREF[k]) == 0)
+            return true;
+    return false;
+}
+
+/* Walk ONE module's export table exactly once, hooking every catalog API it exports
+ * (module-major: 154 catalog names × N modules would be far too many full-table walks).
+ * Skips forwarders, RIPs already hooked, and the RIPs owned by the 4 WtE hooks. */
+static void install_anti_in_module(CPUState *cpu, uint64_t img_base,
+                                   bool *api_done, uint64_t *seen, int *seen_n,
+                                   int *installed)
+{
+    pe_export_dir_t edir;
+    uint32_t dir_rva = 0, dir_size = 0;
+    if (!pe_get_export_dir(cpu, img_base, &edir, &dir_rva, &dir_size)) return;
+
+    for (uint32_t i = 0; i < edir.name_ptr_count; i++) {
+        char buf[96];
+        if (!pe_read_export_name(cpu, img_base, &edir, i, buf, sizeof(buf))) continue;
+        int idx = anti_index_by_name(buf);
+        if (idx < 0 || api_done[idx]) continue;
+
+        uint32_t fn_rva = pe_export_fn_rva(cpu, img_base, &edir, i, dir_rva, dir_size);
+        if (!fn_rva) continue;  /* forwarder / unreadable */
+        uint64_t rip = img_base + fn_rva;
+
+        if (rip == g_state.rip_ldr_load_dll  || rip == g_state.rip_nt_allocate_vm ||
+            rip == g_state.rip_nt_protect_vm || rip == g_state.rip_nt_map_view) {
+            api_done[idx] = true;
+            continue;
+        }
+        bool dup = false;
+        for (int s = 0; s < *seen_n; s++)
+            if (seen[s] == rip) { dup = true; break; }
+        api_done[idx] = true;
+        if (dup) continue;
+        seen[(*seen_n)++] = rip;
+
+        if (register_entry_hook_id(cpu, NYX_ANTI_APIS[idx].export_name, rip,
+                                   nyx_hook_id_make_anti_entry((uint16_t)idx)) == 0) {
+            (*installed)++;
+            nyx_printf("[NYX-HOOK] anti %-28s @ rip=0x%lx idx=%d cat=%u\n",
+                       NYX_ANTI_APIS[idx].export_name, (unsigned long)rip, idx,
+                       NYX_ANTI_APIS[idx].category);
+        }
+    }
+}
+
+/* Register every resolvable NYX_ANTI_APIS[] entry as a generic anti-observe hook.
+ * Preference-ordered modules first so a forwarded export resolves to its real
+ * implementer.  Returns the number installed. */
+static int install_anti_hooks(CPUState *cpu, wte_state_t *ws)
+{
+    static bool api_done[NYX_ANTI_APIS_COUNT];   /* install runs once per session */
+    memset(api_done, 0, sizeof(api_done));
+    uint64_t seen[NYX_ANTI_APIS_COUNT];
+    int      seen_n = 0;
+    int      installed = 0;
+
+    for (size_t k = 0; k < ARRAY_SIZE(ANTI_MOD_PREF); k++) {
+        uint64_t base = find_module_base_ci(ws, ANTI_MOD_PREF[k]);
+        if (base)
+            install_anti_in_module(cpu, base, api_done, seen, &seen_n, &installed);
+    }
+    for (int i = 0; i < ws->dll_module_count; i++) {
+        if (is_pref_module(ws->dll_modules[i].name)) continue;  /* already walked */
+        install_anti_in_module(cpu, ws->dll_modules[i].base,
+                               api_done, seen, &seen_n, &installed);
+    }
+    nyx_printf("[NYX-HOOK] anti-observe install: %d hooks (of %d catalog entries)\n",
+               installed, NYX_ANTI_APIS_COUNT);
+    return installed;
+}
+
+/* Decode a captured (stem, value) to its catalog meaning + artifact class. */
+static const nyx_anti_meaning_t *anti_lookup_meaning(const char *stem, uint32_t value)
+{
+    for (int i = 0; i < NYX_ANTI_MEANINGS_COUNT; i++) {
+        if (NYX_ANTI_MEANINGS[i].value == value &&
+            strcmp(NYX_ANTI_MEANINGS[i].stem, stem) == 0)
+            return &NYX_ANTI_MEANINGS[i];
+    }
+    return NULL;
 }
 
 int nyx_api_hook_install(CPUState *cpu, uint64_t ntdll_base, bool is_64bit)
@@ -275,8 +410,12 @@ int nyx_api_hook_install(CPUState *cpu, uint64_t ntdll_base, bool is_64bit)
     if (register_entry_hook(cpu, "NtMapViewOfSection",
             g_state.rip_nt_map_view, NYX_HOOK_NT_MAP_VIEW_ENTRY) == 0) total++;
 
+    /* Generic anti-analysis observation hooks (full catalog). */
+    int anti = install_anti_hooks(cpu, wte_get_state());
+
     g_state.active = (total > 0);
-    nyx_printf("[NYX-HOOK] install complete: %d/%d hooks active\n", total, 4);
+    nyx_printf("[NYX-HOOK] install complete: %d/%d WtE hooks + %d anti hooks active\n",
+               total, 4, anti);
     return total;
 }
 
@@ -539,6 +678,138 @@ static void on_nt_map_view_return(CPUState *cpu, nyx_pending_call_t *p,
         wte_register_loaded_dll(cpu, (uint64_t)base);
 }
 
+/* ── Anti-observe entry/return ────────────────────────────────── */
+
+/* Read a guest string for logging: printable-only, truncated. wide=UTF-16LE. */
+static void anti_read_guest_str(CPUState *cpu, uint32_t ptr, bool wide,
+                                char *out, size_t out_sz)
+{
+    memset(out, 0, out_sz);
+    if (!ptr || out_sz == 0) return;
+    size_t o = 0;
+    for (size_t b = 0; o + 1 < out_sz && b < 260; b++) {
+        if (wide) {
+            uint16_t wc = 0;
+            if (!read_virtual_memory(ptr + b * 2, (uint8_t *)&wc, 2, cpu)) break;
+            if (wc == 0) break;
+            out[o++] = (wc >= 0x20 && wc < 0x7f) ? (char)wc : '?';
+        } else {
+            uint8_t c = 0;
+            if (!read_virtual_memory(ptr + b, &c, 1, cpu)) break;
+            if (c == 0) break;
+            out[o++] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+        }
+    }
+    out[o] = 0;
+}
+
+static void on_anti_entry_hit(CPUState *cpu, uint16_t api_idx, uint64_t rip)
+{
+    if (api_idx >= NYX_ANTI_APIS_COUNT) return;
+    const nyx_anti_api_t *api = &NYX_ANTI_APIS[api_idx];
+    X86CPU      *cpux86 = X86_CPU(cpu);
+    CPUX86State *env    = &cpux86->env;
+    uint64_t     esp    = env->regs[R_ESP] & 0xFFFFFFFFULL;
+
+    uint32_t disc = 0, outp = 0;
+    if (api->disc_arg_idx >= 0) read_stack_arg32(cpu, esp, api->disc_arg_idx, &disc);
+    if (api->out_arg_idx  >= 0) read_stack_arg32(cpu, esp, api->out_arg_idx,  &outp);
+
+    /* Entry-time log: decode integer discriminators, dump string args, else note call. */
+    if (api->disc_arg_idx >= 0) {
+        const nyx_anti_meaning_t *m = anti_lookup_meaning(api->stem, disc);
+        if (m) {
+            const char *tag = (m->artifact == NYX_ANTI_ART_DEBUG) ? "[ANTI-DEBUG]"
+                            : (m->artifact == NYX_ANTI_ART_VM)    ? "[ANTI-VM]"
+                            : "[ANTI]";
+            nyx_printf("%s %s(%s=0x%x)\n", tag, api->export_name, m->meaning, disc);
+        } else {
+            nyx_printf("[ANTI] %s(arg%d=0x%x) cat=%u\n",
+                       api->export_name, api->disc_arg_idx, disc, api->category);
+        }
+    } else if (api->str_arg_idx >= 0) {
+        uint32_t sp = 0;
+        read_stack_arg32(cpu, esp, api->str_arg_idx, &sp);
+        size_t nlen = strlen(api->export_name);
+        bool wide = (nlen > 0 && api->export_name[nlen - 1] == 'W');
+        char sbuf[160];
+        anti_read_guest_str(cpu, sp, wide, sbuf, sizeof(sbuf));
+        nyx_printf("[ANTI] %s(\"%s\")\n", api->export_name, sbuf);
+    } else {
+        nyx_printf("[ANTI] %s() called\n", api->export_name);
+    }
+
+    /* Arm a return hook only when the result carries the signal: an output buffer
+     * (NtQueryInformationProcess writes the DebugObject there), or a no-arg
+     * anti-debug boolean returned in EAX (IsDebuggerPresent-style). */
+    bool want_return = api->read_return ||
+        (api->category == NYX_ANTI_DEBUG &&
+         api->disc_arg_idx < 0 && api->str_arg_idx < 0);
+    if (!want_return) return;
+
+    uint32_t ret_addr_32 = 0;
+    if (!read_guest_u32(cpu, esp, &ret_addr_32)) return;
+    int slot = pending_alloc_slot();
+    if (slot < 0) return;
+
+    nyx_pending_call_t *p = &g_state.pending[slot];
+    memset(p, 0, sizeof(*p));
+    p->in_use      = true;
+    p->slot_idx    = (uint16_t)slot;
+    p->nonce       = g_state.next_nonce++;
+    p->entry_kind  = NYX_HOOK_ANTI_OBSERVE;
+    p->entry_rip   = rip;
+    p->entry_rsp   = esp;
+    p->return_addr = (uint64_t)ret_addr_32;
+    p->args.anti.api_idx    = api_idx;
+    p->args.anti.disc_value = disc;
+    p->args.anti.out_ptr    = outp;
+
+    uint64_t rhid = nyx_hook_id_make_return((uint16_t)slot,
+                                            (uint16_t)NYX_HOOK_ANTI_OBSERVE,
+                                            p->nonce);
+    p->return_hook_id = rhid;
+    if (register_return_hook(cpu, p->return_addr, rhid) < 0)
+        pending_free_slot(slot);
+}
+
+static void on_anti_return(CPUState *cpu, nyx_pending_call_t *p, uint32_t eax)
+{
+    const nyx_anti_api_t *api = &NYX_ANTI_APIS[p->args.anti.api_idx];
+    uint32_t disc = p->args.anti.disc_value;
+    uint32_t outval = 0;
+    if (p->args.anti.out_ptr)
+        read_guest_u32(cpu, p->args.anti.out_ptr, &outval);
+
+    const nyx_anti_meaning_t *m =
+        (api->disc_arg_idx >= 0) ? anti_lookup_meaning(api->stem, disc) : NULL;
+
+    /* Verdict for the well-known anti-debug output semantics. */
+    bool detected = false;
+    if (m && m->artifact == NYX_ANTI_ART_DEBUG) {
+        if (strcmp(api->stem, "ntqueryinformationprocess") == 0) {
+            if (disc == 0x1e || disc == 0x07) detected = (outval != 0);
+            else if (disc == 0x1f)            detected = (outval == 0);
+        } else if (strcmp(api->stem, "ntquerysysteminformation") == 0 && disc == 0x23) {
+            detected = (outval != 0);
+        }
+    }
+    if (strcmp(api->stem, "checkremotedebuggerpresent") == 0)
+        detected = (outval != 0);
+    /* IsDebuggerPresent-style: no discriminator/output, EAX is the boolean. */
+    if (api->disc_arg_idx < 0 && api->out_arg_idx < 0 &&
+        api->category == NYX_ANTI_DEBUG)
+        detected = (eax != 0);
+
+    const char *verdict = detected ? "  ** DEBUGGER DETECTED **" : "";
+    if (m)
+        nyx_printf("[ANTI-DEBUG] %s(%s) -> out=0x%x eax=0x%x%s\n",
+                   api->export_name, m->meaning, outval, eax, verdict);
+    else
+        nyx_printf("[ANTI] %s -> out=0x%x eax=0x%x%s\n",
+                   api->export_name, outval, eax, verdict);
+}
+
 static void on_return_hit(CPUState *cpu, uint64_t hook_id, uint64_t rip)
 {
     uint16_t slot   = nyx_hook_id_return_slot(hook_id);
@@ -574,6 +845,7 @@ static void on_return_hit(CPUState *cpu, uint64_t hook_id, uint64_t rip)
     case NYX_HOOK_NT_ALLOCATE_VM_ENTRY:  on_nt_allocate_return  (cpu, p, eax); break;
     case NYX_HOOK_NT_PROTECT_VM_ENTRY:   on_nt_protect_return   (cpu, p, eax); break;
     case NYX_HOOK_NT_MAP_VIEW_ENTRY:     on_nt_map_view_return  (cpu, p, eax); break;
+    case NYX_HOOK_ANTI_OBSERVE:          on_anti_return         (cpu, p, eax); break;
     default: break;
     }
 
@@ -594,6 +866,8 @@ void nyx_api_hook_dispatch(CPUState *cpu, uint64_t hook_id,
     (void)cr3;
     if (nyx_hook_id_is_return(hook_id)) {
         on_return_hit(cpu, hook_id, rip);
+    } else if (nyx_hook_id_is_anti_entry(hook_id)) {
+        on_anti_entry_hit(cpu, nyx_hook_id_anti_index(hook_id), rip);
     } else {
         on_entry_hit(cpu, (nyx_hook_kind_t)hook_id, rip);
     }

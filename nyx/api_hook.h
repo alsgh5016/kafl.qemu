@@ -28,6 +28,10 @@ typedef enum {
     NYX_HOOK_NT_ALLOCATE_VM_ENTRY    = 2,
     NYX_HOOK_NT_PROTECT_VM_ENTRY     = 3,
     NYX_HOOK_NT_MAP_VIEW_ENTRY       = 4,
+    /* Generic anti-analysis observation hook. One kind serves every entry in the
+     * generated NYX_ANTI_APIS[] table; the specific API is carried as an index in
+     * the entry hook_id (see nyx_hook_id_make_anti_entry) and in the pending slot. */
+    NYX_HOOK_ANTI_OBSERVE            = 5,
 } nyx_hook_kind_t;
 
 /* hook_id layout
@@ -40,6 +44,22 @@ typedef enum {
  * ENTRY hook_id is just nyx_hook_kind_t value (1..4) — bit 63 = 0.
  */
 #define NYX_HOOK_ID_RETURN_FLAG  (1ULL << 63)
+/* ENTRY hook_id for a generic anti-observe hook: bit 62 set, catalog index in low
+ * 16 bits. Distinguishes it from the 4 bespoke WtE entry kinds (plain 1..4). */
+#define NYX_HOOK_ID_ANTI_FLAG    (1ULL << 62)
+
+static inline uint64_t nyx_hook_id_make_anti_entry(uint16_t api_idx)
+{
+    return NYX_HOOK_ID_ANTI_FLAG | ((uint64_t)api_idx & 0xFFFFULL);
+}
+static inline bool nyx_hook_id_is_anti_entry(uint64_t id)
+{
+    return (id & NYX_HOOK_ID_RETURN_FLAG) == 0 && (id & NYX_HOOK_ID_ANTI_FLAG) != 0;
+}
+static inline uint16_t nyx_hook_id_anti_index(uint64_t id)
+{
+    return (uint16_t)(id & 0xFFFFULL);
+}
 
 static inline uint64_t nyx_hook_id_make_return(uint16_t slot_idx,
                                                uint16_t entry_kind,
@@ -87,6 +107,10 @@ typedef struct {
                  uint64_t old_protect_ptr; }                     protect;
         struct { uint64_t section_handle;   uint64_t process_handle;
                  uint64_t base_ptr;          uint64_t alloc_attrs; } map;
+        /* Generic anti-observe capture: which catalog API, its discriminator arg
+         * value, and the output-buffer pointer to read back on return (0 if none). */
+        struct { uint16_t api_idx;          uint32_t disc_value;
+                 uint32_t out_ptr; }                                 anti;
     } args;
 } nyx_pending_call_t;
 
