@@ -110,7 +110,7 @@ typedef struct {
         /* Generic anti-observe capture: which catalog API, its discriminator arg
          * value, and the output-buffer pointer to read back on return (0 if none). */
         struct { uint16_t api_idx;          uint32_t disc_value;
-                 uint32_t out_ptr; }                                 anti;
+                 uint64_t out_ptr; }                                 anti;
     } args;
 } nyx_pending_call_t;
 

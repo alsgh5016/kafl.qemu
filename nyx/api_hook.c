@@ -288,6 +288,40 @@ static bool is_pref_module(const char *name)
     return false;
 }
 
+static bool anti_string_has_vm_artifact(const char *s)
+{
+    static const char *const tokens[] = {
+        "vbox", "virtualbox", "vmware", "vmci", "hgfs", "vmhgfs",
+        "vmmouse", "vmtool", "qemu", "xen", "parallels", "prl_",
+        "sbiedll", "sandboxie", "vmusbmouse", "vboxguest", "vboxminirt",
+        "vboxtray", "vmwaretools",
+    };
+
+    if (!s || !*s) return false;
+
+    char *lower = g_ascii_strdown(s, -1);
+    bool matched = false;
+    for (size_t i = 0; i < ARRAY_SIZE(tokens); i++) {
+        if (g_strrstr(lower, tokens[i])) {
+            matched = true;
+            break;
+        }
+    }
+    g_free(lower);
+    return matched;
+}
+
+static const char *anti_category_tag(uint8_t category)
+{
+    switch (category) {
+    case NYX_ANTI_DEBUG:  return "[ANTI-DEBUG]";
+    case NYX_ANTI_VM:     return "[ANTI-VM]";
+    case NYX_ANTI_TIMING: return "[ANTI-TIMING]";
+    case NYX_ANTI_INJECT: return "[ANTI-INJECT]";
+    default:              return "[ANTI]";
+    }
+}
+
 /* Walk ONE module's export table exactly once, hooking every catalog API it exports
  * (module-major: 154 catalog names × N modules would be far too many full-table walks).
  * Skips forwarders, RIPs already hooked, and the RIPs owned by the 4 WtE hooks. */
@@ -426,11 +460,56 @@ static bool read_guest_u32(CPUState *cpu, uint64_t va, uint32_t *out)
     return read_virtual_memory(va, (uint8_t *)out, 4, cpu);
 }
 
+static bool read_guest_ptr(CPUState *cpu, uint64_t va, uint64_t *out)
+{
+    if (g_state.is_64bit) {
+        return read_virtual_memory(va, (uint8_t *)out, 8, cpu);
+    }
+
+    uint32_t value = 0;
+    if (!read_guest_u32(cpu, va, &value))
+        return false;
+    *out = value;
+    return true;
+}
+
 /* stdcall: [ESP+0]=RetAddr, [ESP+4]=arg1, [ESP+8]=arg2, ...
  * idx is 0-based for the first argument. */
 static bool read_stack_arg32(CPUState *cpu, uint64_t esp, int idx, uint32_t *out)
 {
     return read_guest_u32(cpu, esp + 4ULL * (idx + 1), out);
+}
+
+static bool read_stack_arg64(CPUState *cpu, uint64_t rsp, int idx, uint64_t *out)
+{
+    X86CPU      *cpux86 = X86_CPU(cpu);
+    CPUX86State *env    = &cpux86->env;
+
+    switch (idx) {
+    case 0: *out = env->regs[R_ECX]; return true;
+    case 1: *out = env->regs[R_EDX]; return true;
+    case 2: *out = env->regs[8];     return true;
+    case 3: *out = env->regs[9];     return true;
+    default:
+        return read_guest_ptr(cpu, rsp + 8ULL * (idx + 1), out);
+    }
+}
+
+static bool read_call_arg(CPUState *cpu, uint64_t sp, int idx, uint64_t *out)
+{
+    if (g_state.is_64bit)
+        return read_stack_arg64(cpu, sp, idx, out);
+
+    uint32_t value = 0;
+    if (!read_stack_arg32(cpu, sp, idx, &value))
+        return false;
+    *out = value;
+    return true;
+}
+
+static bool read_return_addr(CPUState *cpu, uint64_t sp, uint64_t *out)
+{
+    return read_guest_ptr(cpu, sp, out);
 }
 
 /* ── Pending stack ────────────────────────────────────────────── */
@@ -488,12 +567,14 @@ static void on_entry_hit(CPUState *cpu, nyx_hook_kind_t kind, uint64_t rip)
 {
     X86CPU      *cpux86 = X86_CPU(cpu);
     CPUX86State *env    = &cpux86->env;
-    uint64_t     esp    = env->regs[R_ESP] & 0xFFFFFFFFULL;
+    uint64_t     sp     = g_state.is_64bit
+        ? env->regs[R_ESP]
+        : (env->regs[R_ESP] & 0xFFFFFFFFULL);
 
-    uint32_t ret_addr_32 = 0;
-    if (!read_guest_u32(cpu, esp, &ret_addr_32)) {
-        nyx_printf("[NYX-HOOK] ENTRY kind=%d: cannot read return addr (ESP=0x%lx)\n",
-                   (int)kind, (unsigned long)esp);
+    uint64_t ret_addr = 0;
+    if (!read_return_addr(cpu, sp, &ret_addr)) {
+        nyx_printf("[NYX-HOOK] ENTRY kind=%d: cannot read return addr (SP=0x%lx)\n",
+                   (int)kind, (unsigned long)sp);
         return;
     }
 
@@ -510,18 +591,17 @@ static void on_entry_hit(CPUState *cpu, nyx_hook_kind_t kind, uint64_t rip)
     p->nonce       = g_state.next_nonce++;
     p->entry_kind  = kind;
     p->entry_rip   = rip;
-    p->entry_rsp   = esp;
-    p->return_addr = (uint64_t)ret_addr_32;
+    p->entry_rsp   = sp;
+    p->return_addr = ret_addr;
 
-    /* Capture per-function args from stdcall stack. */
-    uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0;
+    uint64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0;
     switch (kind) {
     case NYX_HOOK_LDR_LOAD_DLL_ENTRY:
         /* (PWSTR Path, PULONG Flags, PUNICODE_STRING ModuleFileName, PHANDLE Module) */
-        read_stack_arg32(cpu, esp, 0, &a0);
-        read_stack_arg32(cpu, esp, 1, &a1);
-        read_stack_arg32(cpu, esp, 2, &a2);
-        read_stack_arg32(cpu, esp, 3, &a3);
+        read_call_arg(cpu, sp, 0, &a0);
+        read_call_arg(cpu, sp, 1, &a1);
+        read_call_arg(cpu, sp, 2, &a2);
+        read_call_arg(cpu, sp, 3, &a3);
         p->args.ldr.module_handle_out = a3;
         p->args.ldr.flags             = a1;
         p->args.ldr.name_unicode_str  = a2;
@@ -529,12 +609,12 @@ static void on_entry_hit(CPUState *cpu, nyx_hook_kind_t kind, uint64_t rip)
         break;
     case NYX_HOOK_NT_ALLOCATE_VM_ENTRY:
         /* (HANDLE, PVOID *Base, ULONG ZeroBits, PSIZE_T RegionSize, ULONG AllocType, ULONG Protect) */
-        read_stack_arg32(cpu, esp, 0, &a0);
-        read_stack_arg32(cpu, esp, 1, &a1);
-        read_stack_arg32(cpu, esp, 2, &a2);
-        read_stack_arg32(cpu, esp, 3, &a3);
-        read_stack_arg32(cpu, esp, 4, &a4);
-        read_stack_arg32(cpu, esp, 5, &a5);
+        read_call_arg(cpu, sp, 0, &a0);
+        read_call_arg(cpu, sp, 1, &a1);
+        read_call_arg(cpu, sp, 2, &a2);
+        read_call_arg(cpu, sp, 3, &a3);
+        read_call_arg(cpu, sp, 4, &a4);
+        read_call_arg(cpu, sp, 5, &a5);
         p->args.alloc.process_handle = a0;
         p->args.alloc.base_ptr       = a1;
         p->args.alloc.zero_bits      = a2;
@@ -544,11 +624,11 @@ static void on_entry_hit(CPUState *cpu, nyx_hook_kind_t kind, uint64_t rip)
         break;
     case NYX_HOOK_NT_PROTECT_VM_ENTRY:
         /* (HANDLE, PVOID *Base, PSIZE_T NumberOfBytes, ULONG NewProtect, PULONG OldProtect) */
-        read_stack_arg32(cpu, esp, 0, &a0);
-        read_stack_arg32(cpu, esp, 1, &a1);
-        read_stack_arg32(cpu, esp, 2, &a2);
-        read_stack_arg32(cpu, esp, 3, &a3);
-        read_stack_arg32(cpu, esp, 4, &a4);
+        read_call_arg(cpu, sp, 0, &a0);
+        read_call_arg(cpu, sp, 1, &a1);
+        read_call_arg(cpu, sp, 2, &a2);
+        read_call_arg(cpu, sp, 3, &a3);
+        read_call_arg(cpu, sp, 4, &a4);
         p->args.protect.process_handle    = a0;
         p->args.protect.base_ptr          = a1;
         p->args.protect.size_ptr          = a2;
@@ -560,10 +640,10 @@ static void on_entry_hit(CPUState *cpu, nyx_hook_kind_t kind, uint64_t rip)
          *  PLARGE_INTEGER Offset, PSIZE_T ViewSize, SECTION_INHERIT Inherit, ULONG AllocType,
          *  ULONG Win32Protect)
          * We capture the first 3 args + the AllocType (slot 8) for SEC_IMAGE detection. */
-        read_stack_arg32(cpu, esp, 0, &a0);
-        read_stack_arg32(cpu, esp, 1, &a1);
-        read_stack_arg32(cpu, esp, 2, &a2);
-        read_stack_arg32(cpu, esp, 8, &a3);
+        read_call_arg(cpu, sp, 0, &a0);
+        read_call_arg(cpu, sp, 1, &a1);
+        read_call_arg(cpu, sp, 2, &a2);
+        read_call_arg(cpu, sp, 8, &a3);
         p->args.map.section_handle = a0;
         p->args.map.process_handle = a1;
         p->args.map.base_ptr       = a2;
@@ -586,9 +666,9 @@ static void on_entry_hit(CPUState *cpu, nyx_hook_kind_t kind, uint64_t rip)
         return;
     }
 
-    nyx_printf("[NYX-HOOK] ENTRY kind=%d slot=%d esp=0x%08x ret=0x%08x "
-               "args=[0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x]\n",
-               (int)kind, slot, (uint32_t)esp, (uint32_t)p->return_addr,
+    nyx_printf("[NYX-HOOK] ENTRY kind=%d slot=%d sp=0x%lx ret=0x%lx "
+               "args=[0x%lx 0x%lx 0x%lx 0x%lx 0x%lx 0x%lx]\n",
+               (int)kind, slot, (unsigned long)sp, (unsigned long)p->return_addr,
                a0, a1, a2, a3, a4, a5);
 }
 
@@ -602,14 +682,14 @@ static void on_ldr_load_dll_return(CPUState *cpu, nyx_pending_call_t *p,
         return;
     }
     /* Module is a PHANDLE → read the HMODULE (= base address). */
-    uint32_t module_base = 0;
+    uint64_t module_base = 0;
     if (p->args.ldr.handle_ptr)
-        read_guest_u32(cpu, p->args.ldr.handle_ptr, &module_base);
-    nyx_printf("[NYX-HOOK] LdrLoadDll OK status=0x%x base=0x%08x\n",
+        read_guest_ptr(cpu, p->args.ldr.handle_ptr, &module_base);
+    nyx_printf("[NYX-HOOK] LdrLoadDll OK status=0x%x base=0x%lx\n",
                status, module_base);
 
     if (module_base != 0)
-        wte_register_loaded_dll(cpu, (uint64_t)module_base);
+        wte_register_loaded_dll(cpu, module_base);
 }
 
 static void on_nt_allocate_return(CPUState *cpu, nyx_pending_call_t *p,
@@ -622,19 +702,19 @@ static void on_nt_allocate_return(CPUState *cpu, nyx_pending_call_t *p,
     /* PAGE_EXECUTE_* family: 0x10 (X), 0x20 (RX), 0x40 (RWX), 0x80 (WCX) */
     bool has_exec = (p->args.alloc.protect & 0xF0) != 0;
 
-    uint32_t base = 0, size = 0;
+    uint64_t base = 0, size = 0;
     if (p->args.alloc.base_ptr)
-        read_guest_u32(cpu, p->args.alloc.base_ptr, &base);
+        read_guest_ptr(cpu, p->args.alloc.base_ptr, &base);
     if (p->args.alloc.size_ptr)
-        read_guest_u32(cpu, p->args.alloc.size_ptr, &size);
+        read_guest_ptr(cpu, p->args.alloc.size_ptr, &size);
 
-    nyx_printf("[NYX-HOOK] NtAllocate OK base=0x%08x size=0x%08x "
-               "alloc_type=0x%x protect=0x%x %s\n",
+    nyx_printf("[NYX-HOOK] NtAllocate OK base=0x%lx size=0x%lx "
+               "alloc_type=0x%lx protect=0x%lx %s\n",
                base, size, p->args.alloc.alloc_type, p->args.alloc.protect,
                has_exec ? "[EXEC]" : "");
 
     if (has_exec && base != 0 && size != 0)
-        wte_register_dynamic_exec_region(cpu, (uint64_t)base, (uint64_t)size);
+        wte_register_dynamic_exec_region(cpu, base, size);
 }
 
 static void on_nt_protect_return(CPUState *cpu, nyx_pending_call_t *p,
@@ -645,18 +725,18 @@ static void on_nt_protect_return(CPUState *cpu, nyx_pending_call_t *p,
     bool has_exec = (p->args.protect.new_protect & 0xF0) != 0;
     if (!has_exec) return;  /* downgrades / non-exec — ignore */
 
-    uint32_t base = 0, size = 0;
+    uint64_t base = 0, size = 0;
     if (p->args.protect.base_ptr)
-        read_guest_u32(cpu, p->args.protect.base_ptr, &base);
+        read_guest_ptr(cpu, p->args.protect.base_ptr, &base);
     if (p->args.protect.size_ptr)
-        read_guest_u32(cpu, p->args.protect.size_ptr, &size);
+        read_guest_ptr(cpu, p->args.protect.size_ptr, &size);
 
-    nyx_printf("[NYX-HOOK] NtProtect+EXEC base=0x%08x size=0x%08x "
-               "new_protect=0x%x\n",
+    nyx_printf("[NYX-HOOK] NtProtect+EXEC base=0x%lx size=0x%lx "
+               "new_protect=0x%lx\n",
                base, size, p->args.protect.new_protect);
 
     if (base != 0 && size != 0)
-        wte_register_dynamic_exec_region(cpu, (uint64_t)base, (uint64_t)size);
+        wte_register_dynamic_exec_region(cpu, base, size);
 }
 
 static void on_nt_map_view_return(CPUState *cpu, nyx_pending_call_t *p,
@@ -666,22 +746,22 @@ static void on_nt_map_view_return(CPUState *cpu, nyx_pending_call_t *p,
 
     /* alloc_attrs SEC_IMAGE = 0x01000000 — DLL/EXE image mapping */
     bool is_image = (p->args.map.alloc_attrs & 0x01000000U) != 0;
-    uint32_t base = 0;
+    uint64_t base = 0;
     if (p->args.map.base_ptr)
-        read_guest_u32(cpu, p->args.map.base_ptr, &base);
+        read_guest_ptr(cpu, p->args.map.base_ptr, &base);
 
-    nyx_printf("[NYX-HOOK] NtMapView OK base=0x%08x alloc_attrs=0x%x %s\n",
+    nyx_printf("[NYX-HOOK] NtMapView OK base=0x%lx alloc_attrs=0x%lx %s\n",
                base, p->args.map.alloc_attrs,
                is_image ? "[SEC_IMAGE]" : "");
 
     if (is_image && base != 0)
-        wte_register_loaded_dll(cpu, (uint64_t)base);
+        wte_register_loaded_dll(cpu, base);
 }
 
 /* ── Anti-observe entry/return ────────────────────────────────── */
 
 /* Read a guest string for logging: printable-only, truncated. wide=UTF-16LE. */
-static void anti_read_guest_str(CPUState *cpu, uint32_t ptr, bool wide,
+static void anti_read_guest_str(CPUState *cpu, uint64_t ptr, bool wide,
                                 char *out, size_t out_sz)
 {
     memset(out, 0, out_sz);
@@ -709,11 +789,14 @@ static void on_anti_entry_hit(CPUState *cpu, uint16_t api_idx, uint64_t rip)
     const nyx_anti_api_t *api = &NYX_ANTI_APIS[api_idx];
     X86CPU      *cpux86 = X86_CPU(cpu);
     CPUX86State *env    = &cpux86->env;
-    uint64_t     esp    = env->regs[R_ESP] & 0xFFFFFFFFULL;
+    uint64_t     sp     = g_state.is_64bit
+        ? env->regs[R_ESP]
+        : (env->regs[R_ESP] & 0xFFFFFFFFULL);
 
-    uint32_t disc = 0, outp = 0;
-    if (api->disc_arg_idx >= 0) read_stack_arg32(cpu, esp, api->disc_arg_idx, &disc);
-    if (api->out_arg_idx  >= 0) read_stack_arg32(cpu, esp, api->out_arg_idx,  &outp);
+    uint64_t disc_arg = 0, outp = 0;
+    if (api->disc_arg_idx >= 0) read_call_arg(cpu, sp, api->disc_arg_idx, &disc_arg);
+    if (api->out_arg_idx  >= 0) read_call_arg(cpu, sp, api->out_arg_idx,  &outp);
+    uint32_t disc = (uint32_t)disc_arg;
 
     /* Entry-time log: decode integer discriminators, dump string args, else note call. */
     if (api->disc_arg_idx >= 0) {
@@ -721,22 +804,24 @@ static void on_anti_entry_hit(CPUState *cpu, uint16_t api_idx, uint64_t rip)
         if (m) {
             const char *tag = (m->artifact == NYX_ANTI_ART_DEBUG) ? "[ANTI-DEBUG]"
                             : (m->artifact == NYX_ANTI_ART_VM)    ? "[ANTI-VM]"
-                            : "[ANTI]";
+                            : "[OBSERVE]";
             nyx_printf("%s %s(%s=0x%x)\n", tag, api->export_name, m->meaning, disc);
         } else {
-            nyx_printf("[ANTI] %s(arg%d=0x%x) cat=%u\n",
+            nyx_printf("[OBSERVE] %s(arg%d=0x%x) cat=%u\n",
                        api->export_name, api->disc_arg_idx, disc, api->category);
         }
     } else if (api->str_arg_idx >= 0) {
-        uint32_t sp = 0;
-        read_stack_arg32(cpu, esp, api->str_arg_idx, &sp);
+        uint64_t str_ptr = 0;
+        read_call_arg(cpu, sp, api->str_arg_idx, &str_ptr);
         size_t nlen = strlen(api->export_name);
         bool wide = (nlen > 0 && api->export_name[nlen - 1] == 'W');
         char sbuf[160];
-        anti_read_guest_str(cpu, sp, wide, sbuf, sizeof(sbuf));
-        nyx_printf("[ANTI] %s(\"%s\")\n", api->export_name, sbuf);
+        anti_read_guest_str(cpu, str_ptr, wide, sbuf, sizeof(sbuf));
+        const char *tag = (api->category == NYX_ANTI_VM && anti_string_has_vm_artifact(sbuf))
+            ? "[ANTI-VM]" : "[OBSERVE]";
+        nyx_printf("%s %s(\"%s\")\n", tag, api->export_name, sbuf);
     } else {
-        nyx_printf("[ANTI] %s() called\n", api->export_name);
+        nyx_printf("%s %s() called\n", anti_category_tag(api->category), api->export_name);
     }
 
     /* Arm a return hook only when the result carries the signal: an output buffer
@@ -747,8 +832,8 @@ static void on_anti_entry_hit(CPUState *cpu, uint16_t api_idx, uint64_t rip)
          api->disc_arg_idx < 0 && api->str_arg_idx < 0);
     if (!want_return) return;
 
-    uint32_t ret_addr_32 = 0;
-    if (!read_guest_u32(cpu, esp, &ret_addr_32)) return;
+    uint64_t ret_addr = 0;
+    if (!read_return_addr(cpu, sp, &ret_addr)) return;
     int slot = pending_alloc_slot();
     if (slot < 0) return;
 
@@ -759,8 +844,8 @@ static void on_anti_entry_hit(CPUState *cpu, uint16_t api_idx, uint64_t rip)
     p->nonce       = g_state.next_nonce++;
     p->entry_kind  = NYX_HOOK_ANTI_OBSERVE;
     p->entry_rip   = rip;
-    p->entry_rsp   = esp;
-    p->return_addr = (uint64_t)ret_addr_32;
+    p->entry_rsp   = sp;
+    p->return_addr = ret_addr;
     p->args.anti.api_idx    = api_idx;
     p->args.anti.disc_value = disc;
     p->args.anti.out_ptr    = outp;
@@ -777,21 +862,33 @@ static void on_anti_return(CPUState *cpu, nyx_pending_call_t *p, uint32_t eax)
 {
     const nyx_anti_api_t *api = &NYX_ANTI_APIS[p->args.anti.api_idx];
     uint32_t disc = p->args.anti.disc_value;
-    uint32_t outval = 0;
-    if (p->args.anti.out_ptr)
-        read_guest_u32(cpu, p->args.anti.out_ptr, &outval);
+    uint64_t outval = 0;
+    if (p->args.anti.out_ptr) {
+        if (strcmp(api->stem, "ntqueryinformationprocess") == 0 &&
+            (disc == 0x07 || disc == 0x1e)) {
+            read_guest_ptr(cpu, p->args.anti.out_ptr, &outval);
+        } else {
+            uint32_t out32 = 0;
+            if (read_guest_u32(cpu, p->args.anti.out_ptr, &out32))
+                outval = out32;
+        }
+    }
 
     const nyx_anti_meaning_t *m =
         (api->disc_arg_idx >= 0) ? anti_lookup_meaning(api->stem, disc) : NULL;
+    uint8_t artifact = m ? m->artifact : NYX_ANTI_ART_NONE;
+    bool category_defined_anti = (api->disc_arg_idx < 0 && api->str_arg_idx < 0);
 
     /* Verdict for the well-known anti-debug output semantics. */
     bool detected = false;
-    if (m && m->artifact == NYX_ANTI_ART_DEBUG) {
+    if (artifact == NYX_ANTI_ART_DEBUG) {
         if (strcmp(api->stem, "ntqueryinformationprocess") == 0) {
             if (disc == 0x1e || disc == 0x07) detected = (outval != 0);
             else if (disc == 0x1f)            detected = (outval == 0);
         } else if (strcmp(api->stem, "ntquerysysteminformation") == 0 && disc == 0x23) {
-            detected = (outval != 0);
+            uint8_t debugger_enabled = outval & 0xFF;
+            uint8_t debugger_not_present = (outval >> 8) & 0xFF;
+            detected = (debugger_enabled != 0 && debugger_not_present == 0);
         }
     }
     if (strcmp(api->stem, "checkremotedebuggerpresent") == 0)
@@ -802,12 +899,17 @@ static void on_anti_return(CPUState *cpu, nyx_pending_call_t *p, uint32_t eax)
         detected = (eax != 0);
 
     const char *verdict = detected ? "  ** DEBUGGER DETECTED **" : "";
-    if (m)
-        nyx_printf("[ANTI-DEBUG] %s(%s) -> out=0x%x eax=0x%x%s\n",
-                   api->export_name, m->meaning, outval, eax, verdict);
-    else
-        nyx_printf("[ANTI] %s -> out=0x%x eax=0x%x%s\n",
+    const char *tag = (artifact == NYX_ANTI_ART_DEBUG) ? "[ANTI-DEBUG]"
+                    : (artifact == NYX_ANTI_ART_VM)    ? "[ANTI-VM]"
+                    : category_defined_anti             ? anti_category_tag(api->category)
+                    : "[OBSERVE]";
+    if (m) {
+        nyx_printf("%s %s(%s) -> out=0x%lx eax=0x%x%s\n",
+                   tag, api->export_name, m->meaning, outval, eax, verdict);
+    } else {
+        nyx_printf("[OBSERVE] %s -> out=0x%lx eax=0x%x%s\n",
                    api->export_name, outval, eax, verdict);
+    }
 }
 
 static void on_return_hit(CPUState *cpu, uint64_t hook_id, uint64_t rip)
