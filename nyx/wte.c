@@ -1599,6 +1599,10 @@ void wte_register_loaded_dll(CPUState *cpu, uint64_t module_base)
  *    type quirk)
  *  - packer fetches code from the page: no NX on SPTE → fetch
  *    succeeds, WtE detection bypassed
+ *
+ * Newly mapped pages in these ranges are missed-write candidates: seed
+ * them like late-bind pages so first trapped execute uses the normal
+ * diff/RIP-overlap WtE gate.
  */
 void wte_recheck_dyn_ranges(CPUState *cpu)
 {
@@ -1632,12 +1636,16 @@ void wte_recheck_dyn_ranges(CPUState *cpu)
 
             entry = wte_lookup_or_create_va(va, gfn);
             entry->gpa = gpa;
-            cpu_physical_memory_read(gpa, entry->baseline, WTE_PAGE_SIZE);
+            memset(entry->baseline, 0, WTE_PAGE_SIZE);
             entry->baseline_valid = true;
-            memcpy(entry->current, entry->baseline, WTE_PAGE_SIZE);
-            entry->flags &= ~WTE_PAGE_X_ALLOWED;
+            cpu_physical_memory_read(gpa, entry->current, WTE_PAGE_SIZE);
+            wte_compute_diff(entry);
+            entry->flags &= ~(WTE_PAGE_X_ALLOWED | WTE_PAGE_WRITTEN);
             entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_X_BLOCKED |
                             WTE_PAGE_W_PROTECTED;
+            if (entry->diff_count > 0) {
+                entry->flags |= WTE_PAGE_WRITTEN;
+            }
 
             nx_batch[nx_count++] = gfn;
             wp_batch[wp_count++] = gfn;
