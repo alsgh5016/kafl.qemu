@@ -2413,19 +2413,23 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
             page_va = rip & ~0xFFFULL;
             entry = wte_lookup_or_create_va(page_va, gfn);
             entry->gpa = gpa & ~0xFFFULL;
-            cpu_physical_memory_read(entry->gpa, entry->baseline,
-                                     WTE_PAGE_SIZE);
+            memset(entry->baseline, 0, WTE_PAGE_SIZE);
             entry->baseline_valid = true;
-            memcpy(entry->current, entry->baseline, WTE_PAGE_SIZE);
+            cpu_physical_memory_read(entry->gpa, entry->current,
+                                     WTE_PAGE_SIZE);
+            wte_compute_diff(entry);
             entry->flags &= ~WTE_PAGE_X_ALLOWED;
             entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_X_BLOCKED |
                             WTE_PAGE_W_PROTECTED;
+            if (entry->diff_count > 0) {
+                entry->flags |= WTE_PAGE_WRITTEN;
+            }
             wte_kvm_set_wp(&gfn, 1);
             nyx_printf("[WtE][LATE-BIND] dyn-range hit: VA=0x%lx GFN=0x%lx "
                         "RIP=0x%lx — tracking now\n",
                         (unsigned long)page_va, (unsigned long)gfn,
                         (unsigned long)rip);
-            /* Fall through as first execution; future writes trap via W=0. */
+            /* Fall through to WRITTEN for missed lazy-commit writes. */
         } else {
             /* Completely unknown page — just allow execution */
             nyx_printf("[WtE][EXEC] Untracked GFN=0x%lx RIP=0x%lx, allowing\n",
