@@ -566,9 +566,9 @@ void wte_protect_pe_range(CPUState *cpu, uint64_t image_base,
  *
  * For each page in [base, base+size):
  *   1. Resolve guest VA → PA via target_cr3 page-table walk
- *   2. Create a DYNAMIC entry with baseline=0 (any non-zero byte is
- *      treated as packer-written)
- *   3. Set EPT NX so the next instruction fetch triggers WtE
+ *   2. Create a DYNAMIC entry with baseline=current page contents
+ *   3. Set EPT W=0 + NX so writes are real events and the next
+ *      instruction fetch still triggers WtE
  *
  * Replaces the timing-sensitive periodic rescan: install is bounded
  * to exactly the range the packer just allocated, deterministically.
@@ -615,7 +615,8 @@ void wte_register_dynamic_exec_region(CPUState *cpu,
     }
 
     uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
-    int      nx_count   = 0;
+    uint64_t wp_batch[WTE_MAX_BATCH_GFNS];
+    int      nx_count   = 0, wp_count = 0;
     int      registered = 0, skipped_pe = 0, unmapped = 0;
 
     for (uint64_t va = va_start; va < va_end; va += WTE_PAGE_SIZE) {
@@ -636,23 +637,32 @@ void wte_register_dynamic_exec_region(CPUState *cpu,
 
         if (!(entry->flags & (WTE_PAGE_X_BLOCKED | WTE_PAGE_X_ALLOWED))) {
             entry->gpa = gpa;
-            entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_WRITTEN;
-            memset(entry->baseline, 0, WTE_PAGE_SIZE);
+            cpu_physical_memory_read(gpa, entry->baseline, WTE_PAGE_SIZE);
             entry->baseline_valid = true;
-            cpu_physical_memory_read(gpa, entry->current, WTE_PAGE_SIZE);
+            memcpy(entry->current, entry->baseline, WTE_PAGE_SIZE);
         }
-        entry->flags |= WTE_PAGE_X_BLOCKED;
+        entry->flags &= ~WTE_PAGE_X_ALLOWED;
+        entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_X_BLOCKED |
+                        WTE_PAGE_W_PROTECTED;
 
         nx_batch[nx_count++] = gfn;
+        wp_batch[wp_count++] = gfn;
         registered++;
         if (nx_count >= WTE_MAX_BATCH_GFNS) {
             wte_kvm_set_nx(nx_batch, nx_count);
             nx_count = 0;
         }
+        if (wp_count >= WTE_MAX_BATCH_GFNS) {
+            wte_kvm_set_wp(wp_batch, wp_count);
+            wp_count = 0;
+        }
     }
     if (nx_count > 0) wte_kvm_set_nx(nx_batch, nx_count);
+    if (wp_count > 0) {
+        wte_kvm_set_wp(wp_batch, wp_count);
+    }
 
-    nyx_printf("[WtE][DYN-REG] base=0x%lx size=0x%lx → %d NX'd, "
+    nyx_printf("[WtE][DYN-REG] base=0x%lx size=0x%lx → %d W=0+NX'd, "
                "%d PE-skip, %d unmapped\n",
                (unsigned long)base, (unsigned long)size,
                registered, skipped_pe, unmapped);
@@ -1597,7 +1607,8 @@ void wte_recheck_dyn_ranges(CPUState *cpu)
     if (cr3 == 0) return;
 
     uint64_t nx_batch[WTE_MAX_BATCH_GFNS];
-    int      nx_count    = 0;
+    uint64_t wp_batch[WTE_MAX_BATCH_GFNS];
+    int      nx_count    = 0, wp_count = 0;
     int      newly_nxd   = 0;
 
     for (int r = 0; r < wte_state.dyn_range_count; r++) {
@@ -1621,24 +1632,33 @@ void wte_recheck_dyn_ranges(CPUState *cpu)
 
             entry = wte_lookup_or_create_va(va, gfn);
             entry->gpa = gpa;
-            entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_WRITTEN |
-                            WTE_PAGE_X_BLOCKED;
-            memset(entry->baseline, 0, WTE_PAGE_SIZE);
+            cpu_physical_memory_read(gpa, entry->baseline, WTE_PAGE_SIZE);
             entry->baseline_valid = true;
-            cpu_physical_memory_read(gpa, entry->current, WTE_PAGE_SIZE);
+            memcpy(entry->current, entry->baseline, WTE_PAGE_SIZE);
+            entry->flags &= ~WTE_PAGE_X_ALLOWED;
+            entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_X_BLOCKED |
+                            WTE_PAGE_W_PROTECTED;
 
             nx_batch[nx_count++] = gfn;
+            wp_batch[wp_count++] = gfn;
             newly_nxd++;
             if (nx_count >= WTE_MAX_BATCH_GFNS) {
                 wte_kvm_set_nx(nx_batch, nx_count);
                 nx_count = 0;
             }
+            if (wp_count >= WTE_MAX_BATCH_GFNS) {
+                wte_kvm_set_wp(wp_batch, wp_count);
+                wp_count = 0;
+            }
         }
     }
     if (nx_count > 0) wte_kvm_set_nx(nx_batch, nx_count);
+    if (wp_count > 0) {
+        wte_kvm_set_wp(wp_batch, wp_count);
+    }
 
     if (newly_nxd > 0)
-        nyx_printf("[WtE][DYN-RECHECK] %d newly mapped page(s) NX'd "
+        nyx_printf("[WtE][DYN-RECHECK] %d newly mapped page(s) W=0+NX'd "
                    "(across %d range(s))\n",
                    newly_nxd, wte_state.dyn_range_count);
 }
@@ -2393,16 +2413,19 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
             page_va = rip & ~0xFFFULL;
             entry = wte_lookup_or_create_va(page_va, gfn);
             entry->gpa = gpa & ~0xFFFULL;
-            entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_WRITTEN;
-            memset(entry->baseline, 0, WTE_PAGE_SIZE);
-            entry->baseline_valid = true;
-            cpu_physical_memory_read(entry->gpa, entry->current,
+            cpu_physical_memory_read(entry->gpa, entry->baseline,
                                      WTE_PAGE_SIZE);
+            entry->baseline_valid = true;
+            memcpy(entry->current, entry->baseline, WTE_PAGE_SIZE);
+            entry->flags &= ~WTE_PAGE_X_ALLOWED;
+            entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_X_BLOCKED |
+                            WTE_PAGE_W_PROTECTED;
+            wte_kvm_set_wp(&gfn, 1);
             nyx_printf("[WtE][LATE-BIND] dyn-range hit: VA=0x%lx GFN=0x%lx "
-                       "RIP=0x%lx — tracking now\n",
-                       (unsigned long)page_va, (unsigned long)gfn,
-                       (unsigned long)rip);
-            /* fall through to WRITTEN branch below */
+                        "RIP=0x%lx — tracking now\n",
+                        (unsigned long)page_va, (unsigned long)gfn,
+                        (unsigned long)rip);
+            /* Fall through as first execution; future writes trap via W=0. */
         } else {
             /* Completely unknown page — just allow execution */
             nyx_printf("[WtE][EXEC] Untracked GFN=0x%lx RIP=0x%lx, allowing\n",
