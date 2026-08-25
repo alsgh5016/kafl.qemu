@@ -2138,15 +2138,36 @@ void wte_check_deferred_pages(CPUState *cpu)
 
 /* ── DLL Module Enumeration (PEB→Ldr walk) ─────────────────────── */
 
-static void wte_read_name(CPUState *cpu, uint64_t buf, uint16_t len,
-                          char *out, int out_max)
+static bool wte_read_memory_cr3(CPUState *cpu, uint64_t cr3, uint64_t va,
+                                uint8_t *data, uint32_t size)
+{
+    if (cr3 == 0 || va == 0 || size == 0) {
+        return false;
+    }
+
+    uint64_t first = va & ~(WTE_PAGE_SIZE - 1ULL);
+    uint64_t last = (va + size - 1) & ~(WTE_PAGE_SIZE - 1ULL);
+
+    for (uint64_t page = first; page <= last; page += WTE_PAGE_SIZE) {
+        if (!is_addr_mapped_cr3(page, cpu, cr3)) {
+            return false;
+        }
+    }
+
+    return read_virtual_memory_cr3(va, data, size, cpu, cr3);
+}
+
+static void wte_read_name(CPUState *cpu, uint64_t cr3, uint64_t buf,
+                          uint16_t len, char *out, int out_max)
 {
     memset(out, 0, out_max);
     if (len == 0 || buf == 0) return;
     int nchars = (len / 2 < out_max - 1) ? len / 2 : out_max - 1;
     uint16_t wbuf[WTE_DLL_NAME_LEN];
     memset(wbuf, 0, sizeof(wbuf));
-    read_virtual_memory(buf, (uint8_t *)wbuf, nchars * 2, cpu);
+    if (!wte_read_memory_cr3(cpu, cr3, buf, (uint8_t *)wbuf, nchars * 2)) {
+        return;
+    }
     for (int c = 0; c < nchars; c++)
         out[c] = (char)(wbuf[c] & 0xFF);
 }
@@ -2163,80 +2184,109 @@ static void wte_read_name(CPUState *cpu, uint64_t buf, uint16_t len,
  *   cur+0x24 = BaseDllName.Length (2B), cur+0x28 = BaseDllName.Buffer (4B)
  */
 
-int wte_walk_module_list(CPUState *cpu, wte_dll_entry_t *out, int max)
+int wte_walk_module_list(CPUState *cpu, wte_dll_entry_t *out, int max,
+                         uint64_t cr3)
 {
     X86CPU      *cpux86 = X86_CPU(cpu);
     CPUX86State *env    = &cpux86->env;
     int count = 0;
 
+    if (cr3 == 0) {
+        return 0;
+    }
+
     if (wte_state.is_64bit) {
         uint64_t teb = env->segs[R_GS].base;
         uint64_t peb = 0, ldr = 0;
-        if (!read_virtual_memory(teb + 0x60, (uint8_t *)&peb, 8, cpu) || peb == 0) {
+        if (!wte_read_memory_cr3(cpu, cr3, teb + 0x60,
+                                 (uint8_t *)&peb, 8) || peb == 0) {
             nyx_printf("[WtE][DLL] Failed to read PEB64 (GS=0x%lx)\n",
                        (unsigned long)teb);
             return 0;
         }
-        if (!read_virtual_memory(peb + 0x18, (uint8_t *)&ldr, 8, cpu) || ldr == 0) {
+        if (!wte_read_memory_cr3(cpu, cr3, peb + 0x18,
+                                 (uint8_t *)&ldr, 8) || ldr == 0) {
             nyx_printf("[WtE][DLL] Failed to read PEB64->Ldr\n");
             return 0;
         }
         uint64_t list_head = ldr + 0x20;
         uint64_t cur = 0;
-        read_virtual_memory(list_head, (uint8_t *)&cur, 8, cpu);
+        if (!wte_read_memory_cr3(cpu, cr3, list_head, (uint8_t *)&cur, 8)) {
+            return 0;
+        }
 
         while (cur != 0 && cur != list_head && count < max) {
             uint64_t dll_base = 0; uint32_t dll_size = 0;
             uint16_t name_len = 0; uint64_t name_buf = 0;
-            read_virtual_memory(cur + 0x20, (uint8_t *)&dll_base, 8, cpu);
-            read_virtual_memory(cur + 0x30, (uint8_t *)&dll_size, 4, cpu);
-            read_virtual_memory(cur + 0x48, (uint8_t *)&name_len, 2, cpu);
-            read_virtual_memory(cur + 0x50, (uint8_t *)&name_buf, 8, cpu);
+            if (!wte_read_memory_cr3(cpu, cr3, cur + 0x20,
+                                     (uint8_t *)&dll_base, 8) ||
+                !wte_read_memory_cr3(cpu, cr3, cur + 0x30,
+                                     (uint8_t *)&dll_size, 4) ||
+                !wte_read_memory_cr3(cpu, cr3, cur + 0x48,
+                                     (uint8_t *)&name_len, 2) ||
+                !wte_read_memory_cr3(cpu, cr3, cur + 0x50,
+                                     (uint8_t *)&name_buf, 8)) {
+                break;
+            }
             if (dll_base != 0 && dll_size != 0) {
-                wte_read_name(cpu, name_buf, name_len,
+                wte_read_name(cpu, cr3, name_buf, name_len,
                               out[count].name, WTE_DLL_NAME_LEN);
                 out[count].base = dll_base;
                 out[count].end  = dll_base + dll_size;
                 count++;
             }
             uint64_t next = 0;
-            if (!read_virtual_memory(cur, (uint8_t *)&next, 8, cpu)) break;
+            if (!wte_read_memory_cr3(cpu, cr3, cur, (uint8_t *)&next, 8)) {
+                break;
+            }
             if (next == cur) break;
             cur = next;
         }
     } else {
         uint32_t teb = (uint32_t)(env->segs[R_FS].base);
         uint32_t peb = 0, ldr = 0;
-        if (!read_virtual_memory((uint64_t)(teb + 0x30),
-                                  (uint8_t *)&peb, 4, cpu) || peb == 0) {
+        if (!wte_read_memory_cr3(cpu, cr3, (uint64_t)(teb + 0x30),
+                                 (uint8_t *)&peb, 4) || peb == 0) {
             nyx_printf("[WtE][DLL] Failed to read PEB32 (FS=0x%x)\n", teb);
             return 0;
         }
-        if (!read_virtual_memory((uint64_t)(peb + 0x0C),
-                                  (uint8_t *)&ldr, 4, cpu) || ldr == 0) {
+        if (!wte_read_memory_cr3(cpu, cr3, (uint64_t)(peb + 0x0C),
+                                 (uint8_t *)&ldr, 4) || ldr == 0) {
             nyx_printf("[WtE][DLL] Failed to read PEB32->Ldr\n");
             return 0;
         }
         uint32_t list_head = ldr + 0x14;
         uint32_t cur = 0;
-        read_virtual_memory((uint64_t)list_head, (uint8_t *)&cur, 4, cpu);
+        if (!wte_read_memory_cr3(cpu, cr3, (uint64_t)list_head,
+                                 (uint8_t *)&cur, 4)) {
+            return 0;
+        }
 
         while (cur != 0 && cur != list_head && count < max) {
             uint32_t dll_base = 0, dll_size = 0;
             uint16_t name_len = 0; uint32_t name_buf = 0;
-            read_virtual_memory((uint64_t)(cur + 0x10), (uint8_t *)&dll_base, 4, cpu);
-            read_virtual_memory((uint64_t)(cur + 0x18), (uint8_t *)&dll_size, 4, cpu);
-            read_virtual_memory((uint64_t)(cur + 0x24), (uint8_t *)&name_len, 2, cpu);
-            read_virtual_memory((uint64_t)(cur + 0x28), (uint8_t *)&name_buf, 4, cpu);
+            if (!wte_read_memory_cr3(cpu, cr3, (uint64_t)(cur + 0x10),
+                                     (uint8_t *)&dll_base, 4) ||
+                !wte_read_memory_cr3(cpu, cr3, (uint64_t)(cur + 0x18),
+                                     (uint8_t *)&dll_size, 4) ||
+                !wte_read_memory_cr3(cpu, cr3, (uint64_t)(cur + 0x24),
+                                     (uint8_t *)&name_len, 2) ||
+                !wte_read_memory_cr3(cpu, cr3, (uint64_t)(cur + 0x28),
+                                     (uint8_t *)&name_buf, 4)) {
+                break;
+            }
             if (dll_base != 0 && dll_size != 0) {
-                wte_read_name(cpu, (uint64_t)name_buf, name_len,
+                wte_read_name(cpu, cr3, (uint64_t)name_buf, name_len,
                               out[count].name, WTE_DLL_NAME_LEN);
                 out[count].base = dll_base;
                 out[count].end  = dll_base + dll_size;
                 count++;
             }
             uint32_t next = 0;
-            if (!read_virtual_memory((uint64_t)cur, (uint8_t *)&next, 4, cpu)) break;
+            if (!wte_read_memory_cr3(cpu, cr3, (uint64_t)cur,
+                                     (uint8_t *)&next, 4)) {
+                break;
+            }
             if (next == cur) break;
             cur = next;
         }
@@ -2248,7 +2298,8 @@ int wte_walk_module_list(CPUState *cpu, wte_dll_entry_t *out, int max)
 void wte_enumerate_dlls(CPUState *cpu)
 {
     wte_dll_entry_t raw[WTE_MAX_DLL_MODULES];
-    int total = wte_walk_module_list(cpu, raw, WTE_MAX_DLL_MODULES);
+    int total = wte_walk_module_list(cpu, raw, WTE_MAX_DLL_MODULES,
+                                     wte_state.target_cr3);
 
     wte_state.dll_module_count = 0;
     for (int i = 0; i < total; i++) {
@@ -2568,7 +2619,8 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
                 .wte_count       = wte_state.wte_count,
                 .total_wte_count = wte_state.total_wte_count,
             };
-            dump_full_process_memory(cpu, env, wte_label, &evt, 0);
+            dump_full_process_memory(cpu, env, wte_label, &evt,
+                                     wte_state.target_cr3);
         }
 
         /* Phase 4: post-WtE rescan removed.  api_hook NtAllocate/NtProtect

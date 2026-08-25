@@ -825,13 +825,15 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                                      uint64_t cr3_override)
 {
     int seq = dump_seq_counter++;
+    uint64_t cr3 = (cr3_override != 0) ? cr3_override : env->cr[3];
 
     /* --- 1+2. Enumerate loaded modules via PEB→Ldr (bitness-aware) --- */
     wte_dll_entry_t *modules = calloc(MAX_MODS, sizeof(wte_dll_entry_t));
-    int num_modules = wte_walk_module_list(cpu, modules, MAX_MODS);
+    int num_modules = wte_walk_module_list(cpu, modules, MAX_MODS, cr3);
 
-    nyx_printf("    [FULLDUMP] #%03d (%s): %d modules loaded\n",
-               seq, label, num_modules);
+    nyx_printf("    [FULLDUMP] #%03d (%s): dump_cr3=0x%lx, "
+               "%d modules loaded\n",
+               seq, label, (unsigned long)cr3, num_modules);
     for (int m = 0; m < num_modules; m++) {
         nyx_printf("    [FULLDUMP]   %-30s @ 0x%016lx  size=0x%lx\n",
                    modules[m].name,
@@ -909,8 +911,8 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
         fprintf(map_f, "#   RIP: 0x%016lx  RFLAGS: 0x%016lx\n",
                 (unsigned long)env->eip,
                 (unsigned long)env->eflags);
-        fprintf(map_f, "#   CR3: 0x%016lx\n",
-                (unsigned long)env->cr[3]);
+        fprintf(map_f, "#   CR3: current=0x%016lx dump=0x%016lx\n",
+                (unsigned long)env->cr[3], (unsigned long)cr3);
     }
 
     fprintf(map_f, "\n");
@@ -941,7 +943,6 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
     int pg_count = 0;
     mapped_page_t *pages = malloc(pg_capacity * sizeof(mapped_page_t));
 
-    uint64_t cr3 = (cr3_override != 0) ? cr3_override : env->cr[3];
     uint64_t pml4_base = cr3 & 0x000FFFFFFFFFF000ULL;
     uint64_t pml4_table[512];
     cpu_physical_memory_read(pml4_base, pml4_table, 4096);
@@ -1455,7 +1456,10 @@ bool handle_hypercall_kafl_hook(struct kvm_run *run,
                     /* Full process memory dump */
                     {
                         const char *dump_label = (proc_name[0] != '\0') ? proc_name : "unknown";
-                        dump_full_process_memory(cpu, env, dump_label, NULL, 0);
+                        uint64_t dump_cr3 = wte_is_active()
+                            ? wte_get_state()->target_cr3 : 0;
+                        dump_full_process_memory(cpu, env, dump_label, NULL,
+                                                 dump_cr3);
                     }
                 }
 hook_single_step:

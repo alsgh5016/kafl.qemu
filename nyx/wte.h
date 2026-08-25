@@ -405,7 +405,8 @@ void wte_sweep_trigger_note_jit(void);
 void wte_sweep_trigger_check(CPUState *cpu);
 
 /* DLL module enumeration (PEB→Ldr walk) and RIP filtering */
-int  wte_walk_module_list(CPUState *cpu, wte_dll_entry_t *out, int max);
+int  wte_walk_module_list(CPUState *cpu, wte_dll_entry_t *out, int max,
+                          uint64_t cr3);
 void wte_enumerate_dlls(CPUState *cpu);
 bool wte_is_dll_rip(uint64_t rip, CPUState *cpu);
 
