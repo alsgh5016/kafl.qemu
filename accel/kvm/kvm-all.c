@@ -97,6 +97,7 @@ struct KVMState
     // clang-format on
     bool nyx_no_pt_mode;
     bool nyx_dirty_ring;
+    bool nyx_strict_pt_available;
 // clang-format off
 #endif
 
@@ -392,6 +393,11 @@ static int kvm_get_vcpu(KVMState *s, unsigned long vcpu_id)
 int kvm_get_vm_fd(KVMState *s)
 {
     return s->vmfd;
+}
+
+bool kvm_nyx_strict_pt_available(void)
+{
+    return kvm_state != NULL && kvm_state->nyx_strict_pt_available;
 }
 
 KVMMemoryListener *kvm_get_kml(int as_id)
@@ -2005,6 +2011,9 @@ static int kvm_init(MachineState *ms)
         fast_reload_set_mode(get_fast_reload_snapshot(),
                              RELOAD_MEMORY_MODE_DIRTY_RING);
     }
+
+    s->nyx_strict_pt_available =
+        ioctl(s->fd, KVM_CHECK_EXTENSION, KVM_CAP_NYX_STRICT_PT) == 1;
 // clang-format off
 #endif
     ret = kvm_ioctl(s, KVM_GET_API_VERSION, 0);
@@ -2531,7 +2540,9 @@ int kvm_cpu_exec(CPUState *cpu)
          * (timer interrupt, I/O, HLT, etc.) but NOT on our own exits
          * (WtE EPT violations, MTF) to avoid per-write overhead. */
         if (wte_is_active() &&
+            !wte_is_strict_mode() &&
             run->exit_reason != KVM_EXIT_KAFL_WTE &&
+            run->exit_reason != KVM_EXIT_KAFL_STRICT_PT &&
             run->exit_reason != KVM_EXIT_KAFL_NYX_HOOK &&
             run->exit_reason != KVM_EXIT_KAFL_MTF) {
             wte_check_deferred_pages(cpu);

@@ -218,6 +218,7 @@ int kvm_has_intx_set_mask(void);
 
 #ifdef QEMU_NYX
 int kvm_get_vm_fd(KVMState *s);
+bool kvm_nyx_strict_pt_available(void);
 #endif
 
 int kvm_init_vcpu(CPUState *cpu);
