@@ -9,7 +9,6 @@
  */
 
 #include <linux/types.h>
-
 #include <linux/ioctl.h>
 #include <asm/kvm.h>
 
@@ -204,6 +203,22 @@ struct kvm_hyperv_exit {
 	} u;
 };
 
+struct kvm_nyx_strict_pt_exit {
+	__u16 version;
+	__u16 reserved0;
+	__u32 flags;
+	__aligned_u64 session_id;
+	__aligned_u64 range_id;
+	__aligned_u64 generation;
+	__aligned_u64 gva;
+	__aligned_u64 gpa;
+	__aligned_u64 rip;
+	__aligned_u64 cr3;
+	__u32 page_index;
+	__u32 reserved1;
+	__aligned_u64 reserved[3];
+};
+
 #define KVM_S390_GET_SKEYS_NONE   1
 #define KVM_S390_SKEYS_MAX        1048576
 
@@ -308,11 +323,13 @@ struct kvm_hyperv_exit {
 #define KVM_EXIT_KAFL_WTE 142
 #define KVM_EXIT_KAFL_WTE_SETUP 143
 #define KVM_EXIT_KAFL_NYX_HOOK 144
+#define KVM_EXIT_KAFL_STRICT_PT 145
 
 
 
 #define KVM_CAP_NYX_PT 512
 #define KVM_CAP_NYX_FDL 513
+#define KVM_CAP_NYX_STRICT_PT 514
 
 #endif
 
@@ -491,6 +508,8 @@ struct kvm_run {
 			__u64 cr3;
 			__u64 hook_id;
 		} kafl_nyx_hook;
+		/* KVM_EXIT_KAFL_STRICT_PT */
+		struct kvm_nyx_strict_pt_exit kafl_strict_pt;
 		/* Fix the size of the union. */
 		char padding[256];
 	};
@@ -1797,6 +1816,122 @@ struct kvm_nyx_dyn_range {
 	__u64 base;
 	__u64 end;
 };
+
+#define KVM_NYX_STRICT_PT_CONTROL_SIZE 128
+
+#define KVM_NYX_STRICT_PT_ABI_VERSION_1 1
+
+enum kvm_nyx_strict_pt_command {
+	KVM_NYX_STRICT_PT_QUERY = 0,
+	KVM_NYX_STRICT_PT_ENABLE = 1,
+	KVM_NYX_STRICT_PT_DISABLE = 2,
+	KVM_NYX_STRICT_PT_RESET = 3,
+	KVM_NYX_STRICT_PT_RANGE_ADD = 4,
+	KVM_NYX_STRICT_PT_RANGE_REMOVE = 5,
+	KVM_NYX_STRICT_PT_ACK = 6,
+	KVM_NYX_STRICT_PT_GET_STATUS = 7,
+};
+
+enum kvm_nyx_strict_pt_state {
+	KVM_NYX_STRICT_PT_DISABLED = 0,
+	KVM_NYX_STRICT_PT_ENABLED = 1,
+	KVM_NYX_STRICT_PT_BROKEN = 2,
+};
+
+/* CPU-driven page-table writes only; no DMA coverage is advertised. */
+#define KVM_NYX_STRICT_PT_FEAT_CPU_PT_WRITE_TRACKING	(1ULL << 0)
+#define KVM_NYX_STRICT_PT_FEAT_ROOT_LOCAL_EPT		(1ULL << 1)
+#define KVM_NYX_STRICT_PT_FEAT_GENERATION_ACK		(1ULL << 2)
+#define KVM_NYX_STRICT_PT_FEAT_HUGE_GUEST_LEAVES	(1ULL << 3)
+#define KVM_NYX_STRICT_PT_FEAT_RESET			(1ULL << 4)
+
+#define KVM_NYX_STRICT_PT_EXIT_FIRST_EXEC		(1U << 0)
+
+struct kvm_nyx_strict_pt_query {
+	__aligned_u64 features;
+	__u32 abi_min_version;
+	__u32 abi_max_version;
+	__u32 max_ranges;
+	__u32 max_pages_per_range;
+	__u32 max_vcpus;
+	__u32 exit_reason;
+	__aligned_u64 reserved[10];
+};
+
+struct kvm_nyx_strict_pt_enable {
+	/* Raw CR3; the kernel ignores PCID bits 0:11 and NO_FLUSH bit 63. */
+	__aligned_u64 target_cr3;
+	__aligned_u64 session_id;
+	__aligned_u64 reserved[12];
+};
+
+struct kvm_nyx_strict_pt_reset {
+	__aligned_u64 session_id;
+	__aligned_u64 new_session_id;
+	__aligned_u64 reserved[12];
+};
+
+struct kvm_nyx_strict_pt_range_add {
+	__aligned_u64 session_id;
+	__aligned_u64 gva_start;
+	__aligned_u64 gva_end;
+	__aligned_u64 range_id;
+	__aligned_u64 reserved[10];
+};
+
+struct kvm_nyx_strict_pt_range_remove {
+	__aligned_u64 session_id;
+	__aligned_u64 range_id;
+	__aligned_u64 reserved[12];
+};
+
+struct kvm_nyx_strict_pt_ack {
+	__aligned_u64 session_id;
+	__aligned_u64 range_id;
+	__aligned_u64 generation;
+	__u32 page_index;
+	__u32 reserved0;
+	__aligned_u64 reserved[10];
+};
+
+struct kvm_nyx_strict_pt_status {
+	__aligned_u64 session_id;
+	__aligned_u64 next_generation;
+	__u32 state;
+	__u32 active_ranges;
+	__u32 vcpu_count;
+	__u32 reserved0;
+	__aligned_u64 ranges_added;
+	__aligned_u64 ranges_removed;
+	__aligned_u64 resets;
+	__aligned_u64 pt_write_events;
+	__aligned_u64 mapping_changes;
+	__aligned_u64 nx_arms;
+	__aligned_u64 strict_exits;
+	__aligned_u64 acks;
+	__aligned_u64 stale_acks;
+	__aligned_u64 fail_closed;
+};
+
+struct kvm_nyx_strict_pt_control {
+	__u16 version;
+	__u16 command;
+	__u32 flags;
+	__u32 size;
+	__u32 reserved0;
+	union {
+		struct kvm_nyx_strict_pt_query query;
+		struct kvm_nyx_strict_pt_enable enable;
+		struct kvm_nyx_strict_pt_reset reset;
+		struct kvm_nyx_strict_pt_range_add range_add;
+		struct kvm_nyx_strict_pt_range_remove range_remove;
+		struct kvm_nyx_strict_pt_ack ack;
+		struct kvm_nyx_strict_pt_status status;
+		__u8 reserved[112];
+	} u;
+};
+
+#define KVM_NYX_STRICT_PT_CONTROL _IOWR(KVMIO, 0xfe, struct kvm_nyx_strict_pt_control)
 
 /* KVM dirty-ring */
 #define KVM_CAP_DIRTY_LOG_RING 192
