@@ -1,4 +1,6 @@
 obj-y += \
+checked_io.o \
+dump_state.o \
 memory_access.o \
 interface.o \
 fast_vm_reload.o \
@@ -35,6 +37,6 @@ state/state.o \
 state/snapshot_state.o \
 pt.o \
 mem_split.o \
+wte_policy.o \
 wte.o \
 api_hook.o
-

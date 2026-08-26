@@ -148,6 +148,10 @@ check-unit-y += tests/test-bufferiszero$(EXESUF)
 check-unit-y += tests/test-uuid$(EXESUF)
 check-unit-y += tests/ptimer-test$(EXESUF)
 check-unit-y += tests/test-qapi-util$(EXESUF)
+check-unit-y += tests/test-wte-dynamic-first-exec-policy$(EXESUF)
+check-unit-y += tests/test-wte-strict-policy$(EXESUF)
+check-unit-y += tests/test-wte-strict-abi$(EXESUF)
+check-unit-y += tests/test-wte-dump-durability$(EXESUF)
 
 check-block-$(call land,$(CONFIG_POSIX),$(CONFIG_SOFTMMU)) += tests/check-block.sh
 
