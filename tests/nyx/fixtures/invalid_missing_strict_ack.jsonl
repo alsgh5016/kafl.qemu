@@ -1,0 +1,5 @@
+{"event":"REGISTER_COMMIT","range_id":25,"page_index":4,"generation":6}
+{"event":"STRICT_EXEC_EXIT","range_id":25,"page_index":4,"generation":6}
+{"event":"QEMU_DUMP_BEGIN","range_id":25,"page_index":4,"generation":6}
+{"event":"QEMU_DUMP_END","range_id":25,"page_index":4,"generation":6}
+{"event":"GUEST_EXECUTED","range_id":25,"page_index":4,"generation":6}
