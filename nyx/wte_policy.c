@@ -16,6 +16,27 @@ wte_exec_policy_decide(const struct wte_exec_policy_input *input)
     return WTE_EXEC_POLICY_ACTION_FALLTHROUGH_TO_LEGACY;
 }
 
+enum wte_dynamic_registration_policy_action
+wte_dynamic_registration_policy_decide(
+    const struct wte_dynamic_registration_policy_input *input)
+{
+    if (!input->already_dynamic || !input->baseline_valid) {
+        return WTE_DYNAMIC_REGISTRATION_POLICY_ARM_FIRST_EXEC;
+    }
+
+    if (input->first_exec_pending) {
+        return input->gfn_changed ? WTE_DYNAMIC_REGISTRATION_POLICY_MAPPING_REFRESH
+                                  : WTE_DYNAMIC_REGISTRATION_POLICY_KEEP_STATE;
+    }
+
+    if (input->content_changed) {
+        return WTE_DYNAMIC_REGISTRATION_POLICY_ARM_FIRST_EXEC;
+    }
+
+    return input->gfn_changed ? WTE_DYNAMIC_REGISTRATION_POLICY_MAPPING_REFRESH
+                              : WTE_DYNAMIC_REGISTRATION_POLICY_KEEP_STATE;
+}
+
 static bool wte_strict_has_required_features(uint64_t features)
 {
     return (features & WTE_STRICT_REQUIRED_FEATURE_MASK) ==

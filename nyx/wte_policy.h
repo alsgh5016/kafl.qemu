@@ -23,13 +23,31 @@ struct wte_exec_policy_input {
     bool rip_overlaps_diff;
 };
 
+struct wte_dynamic_registration_policy_input {
+    bool already_dynamic;
+    bool baseline_valid;
+    bool first_exec_pending;
+    bool content_changed;
+    bool gfn_changed;
+};
+
 enum wte_exec_policy_action {
     WTE_EXEC_POLICY_ACTION_FALLTHROUGH_TO_LEGACY = 0,
     WTE_EXEC_POLICY_ACTION_DUMP_FIRST_EXEC = 1,
 };
 
+enum wte_dynamic_registration_policy_action {
+    WTE_DYNAMIC_REGISTRATION_POLICY_KEEP_STATE = 0,
+    WTE_DYNAMIC_REGISTRATION_POLICY_ARM_FIRST_EXEC = 1,
+    WTE_DYNAMIC_REGISTRATION_POLICY_MAPPING_REFRESH = 2,
+};
+
 enum wte_exec_policy_action
 wte_exec_policy_decide(const struct wte_exec_policy_input *input);
+
+enum wte_dynamic_registration_policy_action
+wte_dynamic_registration_policy_decide(
+    const struct wte_dynamic_registration_policy_input *input);
 
 enum wte_strict_result {
     WTE_STRICT_RESULT_OK = 0,
