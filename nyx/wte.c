@@ -17,8 +17,11 @@
 #include "qemu/osdep.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "exec/cpu-common.h"
 #include "sysemu/kvm.h"
@@ -27,6 +30,7 @@
 #include "nyx/debug.h"
 #include "nyx/helpers.h"
 #include "nyx/memory_access.h"
+#include "nyx/wte_policy.h"
 #include "nyx/state/state.h"
 #include "nyx/wte.h"
 #include "nyx/api_hook.h"
@@ -39,7 +43,7 @@
 #include "target/i386/cpu.h"
 
 /* Defined in hypercall.c */
-extern void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
+extern bool dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                                      const char *label,
                                      const wte_dump_event_t *event,
                                      uint64_t cr3_override);
@@ -54,6 +58,348 @@ extern uint32_t              kvm_dirty_gfns_index_mask;
 /* ── WtE Singleton ─────────────────────────────────────────────── */
 
 static wte_state_t wte_state;
+
+struct wte_strict_runtime_context {
+    CPUState *cpu;
+    FILE *trace_file;
+};
+
+static bool wte_prepare_common(uint64_t cr3, bool is_64bit)
+{
+    wte_state.active = true;
+    wte_state.target_cr3 = cr3;
+    wte_state.is_64bit = is_64bit;
+    wte_state.round = 0;
+    wte_state.wte_count = 0;
+    wte_state.total_wte_count = 0;
+    wte_state.renx_count = 0;
+    wte_state.dll_filter_enabled = true;
+    wte_state.dll_module_count = 0;
+    wte_state.dll_filtered_count = 0;
+    wte_state.dll_filtered_total = 0;
+    wte_state.mtf_active = false;
+    wte_state.mtf_reason = WTE_MTF_REASON_WRITE;
+    wte_state.mtf_target_va = 0;
+    wte_state.mtf_target_gfn = 0;
+    wte_state.last_scanned_ring_index = kvm_dirty_gfns_index;
+    wte_state.pt_decode_cursor = 0;
+    wte_strict_state_init(&wte_state.strict_state);
+    return true;
+}
+
+static bool wte_fsync_and_close(FILE *file)
+{
+    if (file == NULL) {
+        return false;
+    }
+
+    if (fflush(file) != 0) {
+        fclose(file);
+        return false;
+    }
+
+    if (fsync(fileno(file)) != 0) {
+        fclose(file);
+        return false;
+    }
+
+    return fclose(file) == 0;
+}
+
+static enum wte_strict_result wte_strict_runtime_range_remove(
+    void *opaque,
+    uint64_t session_id,
+    uint64_t range_id)
+{
+    struct kvm_nyx_strict_pt_control control;
+
+    (void)opaque;
+    memset(&control, 0, sizeof(control));
+    control.version = KVM_NYX_STRICT_PT_ABI_VERSION_1;
+    control.command = KVM_NYX_STRICT_PT_RANGE_REMOVE;
+    control.size = KVM_NYX_STRICT_PT_CONTROL_SIZE;
+    control.u.range_remove.session_id = session_id;
+    control.u.range_remove.range_id = range_id;
+
+    return kvm_vm_ioctl(kvm_state, KVM_NYX_STRICT_PT_CONTROL, &control) < 0
+               ? WTE_STRICT_RESULT_INVALID_RANGE
+               : WTE_STRICT_RESULT_OK;
+}
+
+static enum wte_strict_result wte_strict_runtime_query(
+    void *opaque,
+    struct wte_strict_query_response *response)
+{
+    struct kvm_nyx_strict_pt_control control;
+    int ret;
+
+    (void)opaque;
+    memset(&control, 0, sizeof(control));
+    control.version = KVM_NYX_STRICT_PT_ABI_VERSION_1;
+    control.command = KVM_NYX_STRICT_PT_QUERY;
+    control.size = KVM_NYX_STRICT_PT_CONTROL_SIZE;
+
+    ret = kvm_vm_ioctl(kvm_state, KVM_NYX_STRICT_PT_CONTROL, &control);
+    if (ret < 0) {
+        return WTE_STRICT_RESULT_UNSUPPORTED;
+    }
+
+    response->features = control.u.query.features;
+    response->abi_min_version = control.u.query.abi_min_version;
+    response->abi_max_version = control.u.query.abi_max_version;
+    response->max_ranges = control.u.query.max_ranges;
+    response->max_pages_per_range = control.u.query.max_pages_per_range;
+    response->max_vcpus = control.u.query.max_vcpus;
+    response->exit_reason = control.u.query.exit_reason;
+    return WTE_STRICT_RESULT_OK;
+}
+
+static enum wte_strict_result wte_strict_runtime_enable(
+    void *opaque,
+    uint64_t normalized_cr3,
+    uint64_t *session_id_out)
+{
+    struct kvm_nyx_strict_pt_control control;
+
+    (void)opaque;
+    memset(&control, 0, sizeof(control));
+    control.version = KVM_NYX_STRICT_PT_ABI_VERSION_1;
+    control.command = KVM_NYX_STRICT_PT_ENABLE;
+    control.size = KVM_NYX_STRICT_PT_CONTROL_SIZE;
+    control.u.enable.target_cr3 = normalized_cr3;
+    control.u.enable.session_id = 0;
+
+    if (kvm_vm_ioctl(kvm_state, KVM_NYX_STRICT_PT_CONTROL, &control) < 0) {
+        return WTE_STRICT_RESULT_UNSUPPORTED;
+    }
+
+    *session_id_out = control.u.enable.session_id;
+    return WTE_STRICT_RESULT_OK;
+}
+
+static enum wte_strict_result wte_strict_runtime_disable(void *opaque,
+                                                         uint64_t session_id)
+{
+    struct kvm_nyx_strict_pt_control control;
+
+    (void)opaque;
+    memset(&control, 0, sizeof(control));
+    control.version = KVM_NYX_STRICT_PT_ABI_VERSION_1;
+    control.command = KVM_NYX_STRICT_PT_DISABLE;
+    control.size = KVM_NYX_STRICT_PT_CONTROL_SIZE;
+    (void)session_id;
+
+    return kvm_vm_ioctl(kvm_state, KVM_NYX_STRICT_PT_CONTROL, &control) < 0
+               ? WTE_STRICT_RESULT_UNSUPPORTED
+               : WTE_STRICT_RESULT_OK;
+}
+
+static enum wte_strict_result wte_strict_runtime_reset(
+    void *opaque,
+    uint64_t session_id,
+    uint64_t *new_session_id_out)
+{
+    struct kvm_nyx_strict_pt_control control;
+
+    (void)opaque;
+    memset(&control, 0, sizeof(control));
+    control.version = KVM_NYX_STRICT_PT_ABI_VERSION_1;
+    control.command = KVM_NYX_STRICT_PT_RESET;
+    control.size = KVM_NYX_STRICT_PT_CONTROL_SIZE;
+    control.u.reset.session_id = session_id;
+    control.u.reset.new_session_id = 0;
+
+    if (kvm_vm_ioctl(kvm_state, KVM_NYX_STRICT_PT_CONTROL, &control) < 0) {
+        return WTE_STRICT_RESULT_UNSUPPORTED;
+    }
+
+    *new_session_id_out = control.u.reset.new_session_id;
+    return WTE_STRICT_RESULT_OK;
+}
+
+static enum wte_strict_result wte_strict_runtime_range_add(
+    void *opaque,
+    uint64_t session_id,
+    uint64_t gva_start,
+    uint64_t gva_end,
+    uint64_t *range_id_out)
+{
+    struct kvm_nyx_strict_pt_control control;
+
+    (void)opaque;
+    memset(&control, 0, sizeof(control));
+    control.version = KVM_NYX_STRICT_PT_ABI_VERSION_1;
+    control.command = KVM_NYX_STRICT_PT_RANGE_ADD;
+    control.size = KVM_NYX_STRICT_PT_CONTROL_SIZE;
+    control.u.range_add.session_id = session_id;
+    control.u.range_add.gva_start = gva_start;
+    control.u.range_add.gva_end = gva_end;
+    control.u.range_add.range_id = 0;
+
+    if (kvm_vm_ioctl(kvm_state, KVM_NYX_STRICT_PT_CONTROL, &control) < 0) {
+        return WTE_STRICT_RESULT_UNSUPPORTED;
+    }
+
+    *range_id_out = control.u.range_add.range_id;
+    return WTE_STRICT_RESULT_OK;
+}
+
+static enum wte_strict_result wte_strict_runtime_ack(
+    void *opaque,
+    uint64_t session_id,
+    uint64_t range_id,
+    uint64_t generation,
+    uint32_t page_index)
+{
+    struct kvm_nyx_strict_pt_control control;
+
+    (void)opaque;
+    memset(&control, 0, sizeof(control));
+    control.version = KVM_NYX_STRICT_PT_ABI_VERSION_1;
+    control.command = KVM_NYX_STRICT_PT_ACK;
+    control.size = KVM_NYX_STRICT_PT_CONTROL_SIZE;
+    control.u.ack.session_id = session_id;
+    control.u.ack.range_id = range_id;
+    control.u.ack.generation = generation;
+    control.u.ack.page_index = page_index;
+
+    return kvm_vm_ioctl(kvm_state, KVM_NYX_STRICT_PT_CONTROL, &control) < 0
+               ? WTE_STRICT_RESULT_ACK_FAILED
+               : WTE_STRICT_RESULT_OK;
+}
+
+static bool wte_strict_trace_append_file(
+    void *opaque,
+    enum wte_strict_trace_event event,
+    const struct wte_strict_identity *identity)
+{
+    struct wte_strict_runtime_context *context = opaque;
+    FILE *trace_file;
+
+    if (context == NULL || identity == NULL || context->trace_file == NULL) {
+        return false;
+    }
+
+    trace_file = context->trace_file;
+
+    return fprintf(trace_file,
+                   "{\"event\":\"%s\",\"range_id\":%llu,"
+                   "\"page_index\":%u,\"generation\":%llu}\n",
+                   wte_strict_trace_event_name(event),
+                   (unsigned long long)identity->range_id,
+                   identity->page_index,
+                   (unsigned long long)identity->generation) > 0;
+}
+
+static bool wte_strict_trace_sync_file(void *opaque)
+{
+    struct wte_strict_runtime_context *context = opaque;
+    FILE *trace_file;
+
+    if (context == NULL || context->trace_file == NULL) {
+        return false;
+    }
+
+    trace_file = context->trace_file;
+
+    return fflush(trace_file) == 0 && fsync(fileno(trace_file)) == 0;
+}
+
+static bool wte_strict_runtime_dump_sync(
+    void *opaque,
+    const struct wte_strict_exit *strict_exit)
+{
+    struct wte_strict_runtime_context *context = opaque;
+    CPUState *cpu = context->cpu;
+    CPUX86State *env = &X86_CPU(cpu)->env;
+    char label[128];
+    wte_dump_event_t event;
+
+    snprintf(label, sizeof(label), "strict_pt_r%llu_p%u_g%llu",
+             (unsigned long long)strict_exit->range_id,
+             strict_exit->page_index,
+             (unsigned long long)strict_exit->generation);
+    memset(&event, 0, sizeof(event));
+    event.type = "STRICT_PT";
+    event.rip = strict_exit->rip;
+    event.va = strict_exit->gva;
+    event.gfn = strict_exit->gpa >> 12;
+
+    return dump_full_process_memory(cpu, env, label, &event,
+                                    wte_strict_normalize_cr3(strict_exit->cr3));
+}
+
+static struct wte_strict_runtime wte_make_strict_runtime(CPUState *cpu)
+{
+    static struct wte_strict_runtime_context context;
+
+    context.cpu = cpu;
+    context.trace_file = wte_state.strict_trace_file;
+
+    const struct wte_strict_runtime runtime = {
+        .opaque = &context,
+        .query = wte_strict_runtime_query,
+        .enable = wte_strict_runtime_enable,
+        .disable = wte_strict_runtime_disable,
+        .reset = wte_strict_runtime_reset,
+        .range_add = wte_strict_runtime_range_add,
+        .range_remove = wte_strict_runtime_range_remove,
+        .ack = wte_strict_runtime_ack,
+        .dump_sync = wte_strict_runtime_dump_sync,
+        .trace_append = wte_strict_trace_append_file,
+        .trace_sync = wte_strict_trace_sync_file,
+    };
+
+    return runtime;
+}
+
+static bool wte_open_strict_trace(void)
+{
+    char *trace_path = NULL;
+    char *dump_dir = NULL;
+    int mkdir_result;
+
+    if (wte_state.strict_trace_file != NULL) {
+        return true;
+    }
+
+    if (asprintf(&dump_dir, "%s/dump", GET_GLOBAL_STATE()->workdir_path) == -1) {
+        return false;
+    }
+
+    mkdir_result = mkdir(dump_dir, 0755);
+    if (mkdir_result != 0 && errno != EEXIST) {
+        free(dump_dir);
+        return false;
+    }
+
+    if (asprintf(&trace_path, "%s/dump/strict_barrier_session_%llu.jsonl",
+                 GET_GLOBAL_STATE()->workdir_path,
+                 (unsigned long long)wte_state.strict_state.session_id) == -1) {
+        free(dump_dir);
+        return false;
+    }
+
+    wte_state.strict_trace_file = fopen(trace_path, "w");
+    free(dump_dir);
+    free(trace_path);
+    return wte_state.strict_trace_file != NULL;
+}
+
+static bool wte_close_strict_trace(void)
+{
+    if (wte_state.strict_trace_file == NULL) {
+        return true;
+    }
+
+    if (!wte_fsync_and_close(wte_state.strict_trace_file)) {
+        wte_state.strict_trace_file = NULL;
+        return false;
+    }
+
+    wte_state.strict_trace_file = NULL;
+    return true;
+}
 
 /* ── VA-based Page Table Helpers ───────────────────────────────── */
 
@@ -161,6 +507,21 @@ static bool wte_rip_overlaps_diff(const wte_page_entry_t *entry, uint64_t rip)
     }
 
     return false;
+}
+
+static enum wte_exec_policy_action
+wte_exec_policy_for_entry(const wte_page_entry_t *entry, uint64_t rip)
+{
+    const struct wte_exec_policy_input input = {
+        .is_dynamic = (entry->flags & WTE_PAGE_IS_DYNAMIC) != 0,
+        .first_exec_pending =
+            (entry->flags & WTE_PAGE_DYN_FIRST_EXEC_PENDING) != 0,
+        .written = (entry->flags & WTE_PAGE_WRITTEN) != 0,
+        .diff_count = entry->diff_count,
+        .rip_overlaps_diff = wte_rip_overlaps_diff(entry, rip),
+    };
+
+    return wte_exec_policy_decide(&input);
 }
 
 /* ── Dump ──────────────────────────────────────────────────────── */
@@ -310,6 +671,7 @@ int wte_kvm_set_cr3(uint64_t cr3)
 void wte_init(void)
 {
     memset(&wte_state, 0, sizeof(wte_state_t));
+    wte_strict_state_init(&wte_state.strict_state);
 
     wte_state.page_table = g_hash_table_new_full(
         g_int64_hash, g_int64_equal, g_free, g_free);
@@ -325,6 +687,10 @@ void wte_init(void)
 
 void wte_destroy(void)
 {
+    if (wte_state.strict_mode && wte_state.active) {
+        wte_deactivate();
+    }
+
     if (wte_state.kvm_wte_enabled) {
         wte_kvm_disable();
     }
@@ -344,23 +710,8 @@ void wte_destroy(void)
 
 void wte_activate(uint64_t cr3, bool is_64bit)
 {
-    wte_state.active     = true;
-    wte_state.target_cr3 = cr3;
-    wte_state.is_64bit   = is_64bit;
-    wte_state.round      = 0;
-    wte_state.wte_count  = 0;
-    wte_state.total_wte_count = 0;
-    wte_state.renx_count = 0;
-
-    wte_state.dll_filter_enabled  = true;
-    wte_state.dll_module_count    = 0;
-    wte_state.dll_filtered_count  = 0;
-    wte_state.dll_filtered_total  = 0;
-
-    wte_state.mtf_active     = false;
-    wte_state.mtf_reason     = WTE_MTF_REASON_WRITE;
-    wte_state.mtf_target_va  = 0;
-    wte_state.mtf_target_gfn = 0;
+    wte_prepare_common(cr3, is_64bit);
+    wte_state.strict_mode = false;
 
     /* Close any open JIT-IL dump before resetting state so num_records
      * gets patched correctly (wte_activate may be called multiple rounds). */
@@ -420,15 +771,68 @@ void wte_activate(uint64_t cr3, bool is_64bit)
     }
     wte_kvm_set_cr3(cr3);
 
-    wte_state.last_scanned_ring_index = kvm_dirty_gfns_index;
-    wte_state.pt_decode_cursor = 0;
-
     nyx_printf("[WtE] Activated: CR3=0x%lx, 64bit=%d, DLL filter=module-list\n",
                (unsigned long)cr3, is_64bit);
 }
 
+bool wte_activate_strict(CPUState *cpu, uint64_t cr3, bool is_64bit,
+                         uint64_t image_base, uint64_t image_size)
+{
+    struct wte_strict_runtime runtime;
+    uint64_t range_id = 0;
+
+    wte_prepare_common(cr3, is_64bit);
+    wte_state.strict_mode = true;
+
+    runtime = wte_make_strict_runtime(cpu);
+    if (wte_strict_enable_session(&wte_state.strict_state, &runtime,
+                                  kvm_nyx_strict_pt_available(), cr3) !=
+        WTE_STRICT_RESULT_OK) {
+        wte_state.active = false;
+        return false;
+    }
+
+    if (!wte_open_strict_trace()) {
+        (void)wte_strict_disable_session(&wte_state.strict_state, &runtime);
+        wte_state.active = false;
+        return false;
+    }
+
+    runtime = wte_make_strict_runtime(cpu);
+    if (wte_strict_register_range(&wte_state.strict_state, &runtime,
+                                  image_base & ~UINT64_C(0xfff),
+                                  (image_base + image_size + UINT64_C(0xfff)) &
+                                      ~UINT64_C(0xfff),
+                                  &range_id) != WTE_STRICT_RESULT_OK) {
+        (void)wte_close_strict_trace();
+        (void)wte_strict_disable_session(&wte_state.strict_state, &runtime);
+        wte_state.active = false;
+        return false;
+    }
+
+    wte_state.pe_base_va = image_base & ~UINT64_C(0xfff);
+    wte_state.pe_end_va =
+        (image_base + image_size + UINT64_C(0xfff)) & ~UINT64_C(0xfff);
+    wte_state.strict_state.pe_range_id = range_id;
+
+    return true;
+}
+
 void wte_deactivate(void)
 {
+    if (wte_state.strict_mode) {
+        struct wte_strict_runtime runtime = wte_make_strict_runtime(qemu_get_cpu(0));
+
+        if (wte_strict_disable_session(&wte_state.strict_state, &runtime) !=
+            WTE_STRICT_RESULT_OK) {
+            nyx_abort("Strict PT disable failed");
+        }
+
+        if (!wte_close_strict_trace()) {
+            nyx_abort("Strict PT trace close failed");
+        }
+    }
+
     /* Finalize JIT-IL dump if open */
     if (wte_state.jit_tap.dump_file)
         wte_jit_il_close();
@@ -476,6 +880,7 @@ void wte_deactivate(void)
         wte_kvm_disable();
     }
     wte_state.active = false;
+    wte_state.strict_mode = false;
 }
 
 /* ── PE Range Protection: W=0 + X=0 ──────────────────────────── */
@@ -580,6 +985,27 @@ void wte_register_dynamic_exec_region(CPUState *cpu,
     uint64_t cr3 = wte_state.target_cr3;
     if (cr3 == 0 || size == 0) return;
 
+    if (wte_state.strict_mode) {
+        uint64_t range_id = 0;
+        const struct wte_strict_runtime runtime =
+            wte_make_strict_runtime(cpu);
+
+        if (wte_strict_register_range(&wte_state.strict_state, &runtime,
+                                      base & ~(WTE_PAGE_SIZE - 1ULL),
+                                      (base + size + WTE_PAGE_SIZE - 1) &
+                                          ~(WTE_PAGE_SIZE - 1ULL),
+                                      &range_id) != WTE_STRICT_RESULT_OK) {
+            nyx_abort("Strict PT dynamic range registration failed");
+        }
+
+        if (base == wte_state.pe_base_va &&
+            ((base + size + WTE_PAGE_SIZE - 1) & ~(WTE_PAGE_SIZE - 1ULL)) ==
+                wte_state.pe_end_va) {
+            wte_state.strict_state.pe_range_id = range_id;
+        }
+        return;
+    }
+
     uint64_t va_start = base & ~(WTE_PAGE_SIZE - 1ULL);
     uint64_t va_end   = (base + size + WTE_PAGE_SIZE - 1) &
                         ~(WTE_PAGE_SIZE - 1ULL);
@@ -643,7 +1069,8 @@ void wte_register_dynamic_exec_region(CPUState *cpu,
         }
         entry->flags &= ~WTE_PAGE_X_ALLOWED;
         entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_X_BLOCKED |
-                        WTE_PAGE_W_PROTECTED;
+                        WTE_PAGE_W_PROTECTED |
+                        WTE_PAGE_DYN_FIRST_EXEC_PENDING;
 
         nx_batch[nx_count++] = gfn;
         wp_batch[wp_count++] = gfn;
@@ -1519,6 +1946,39 @@ void wte_register_loaded_dll(CPUState *cpu, uint64_t module_base)
 {
     if (!wte_state.active || module_base == 0) return;
 
+    if (wte_state.strict_mode) {
+        const struct wte_strict_runtime runtime = wte_make_strict_runtime(cpu);
+        uint64_t dll_end = 0;
+
+        wte_enumerate_dlls(cpu);
+        for (int i = 0; i < wte_state.dll_module_count; i++) {
+            if (wte_state.dll_modules[i].base == module_base) {
+                dll_end = wte_state.dll_modules[i].end;
+                break;
+            }
+        }
+
+        if (dll_end == 0) {
+            return;
+        }
+
+        for (size_t i = 0; i < wte_state.strict_state.range_count;) {
+            const struct wte_strict_range_state range = wte_state.strict_state.ranges[i];
+            const bool overlaps = range.gva_start < dll_end && range.gva_end > module_base;
+
+            if (range.range_id == wte_state.strict_state.pe_range_id || !overlaps) {
+                i++;
+                continue;
+            }
+
+            if (wte_strict_remove_range(&wte_state.strict_state, &runtime,
+                                        range.range_id) != WTE_STRICT_RESULT_OK) {
+                nyx_abort("Strict PT dynamic range remove failed");
+            }
+        }
+        return;
+    }
+
     /* Refresh dll_modules so subsequent wte_is_dll_rip / dump filtering
      * sees the new DLL.  Cheap PEB→Ldr walk. */
     wte_enumerate_dlls(cpu);
@@ -1567,6 +2027,7 @@ void wte_register_loaded_dll(CPUState *cpu, uint64_t module_base)
                 clear_batch[clear_count++] = entry->gfn;
         }
         entry->flags &= ~(WTE_PAGE_IS_DYNAMIC | WTE_PAGE_WRITTEN |
+                          WTE_PAGE_DYN_FIRST_EXEC_PENDING |
                           WTE_PAGE_X_BLOCKED);
         entry->flags |= WTE_PAGE_X_ALLOWED;
         untracked++;
@@ -1642,7 +2103,8 @@ void wte_recheck_dyn_ranges(CPUState *cpu)
             wte_compute_diff(entry);
             entry->flags &= ~(WTE_PAGE_X_ALLOWED | WTE_PAGE_WRITTEN);
             entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_X_BLOCKED |
-                            WTE_PAGE_W_PROTECTED;
+                            WTE_PAGE_W_PROTECTED |
+                            WTE_PAGE_DYN_FIRST_EXEC_PENDING;
             if (entry->diff_count > 0) {
                 entry->flags |= WTE_PAGE_WRITTEN;
             }
@@ -2479,7 +2941,8 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
             wte_compute_diff(entry);
             entry->flags &= ~WTE_PAGE_X_ALLOWED;
             entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_X_BLOCKED |
-                            WTE_PAGE_W_PROTECTED;
+                            WTE_PAGE_W_PROTECTED |
+                            WTE_PAGE_DYN_FIRST_EXEC_PENDING;
             if (entry->diff_count > 0) {
                 entry->flags |= WTE_PAGE_WRITTEN;
             }
@@ -2496,6 +2959,52 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
             wte_kvm_clear_nx(&gfn, 1);
             return;
         }
+    }
+
+    if (wte_exec_policy_for_entry(entry, rip) ==
+        WTE_EXEC_POLICY_ACTION_DUMP_FIRST_EXEC) {
+        wte_state.wte_count++;
+        wte_state.total_wte_count++;
+
+        {
+            X86CPU *cpux86 = X86_CPU(cpu);
+            CPUX86State *env = &cpux86->env;
+            char wte_label[128];
+            uint32_t _tid = wte_get_thread_id(cpu);
+            snprintf(wte_label, sizeof(wte_label),
+                     "dyn_first_exec_rip0x%lx_va0x%lx_tid0x%08x",
+                     (unsigned long)rip,
+                     (unsigned long)entry->va, _tid);
+            uint64_t _teb = wte_state.is_64bit
+                ? env->segs[R_GS].base
+                : (uint64_t)(uint32_t)env->segs[R_FS].base;
+            wte_dump_event_t evt = {
+                .type            = "DYN_FIRST_EXEC",
+                .rip             = rip,
+                .va              = entry->va,
+                .gfn             = entry->gfn,
+                .fs_base         = _teb,
+                .diff_count      = entry->diff_count,
+                .wte_count       = wte_state.wte_count,
+                .total_wte_count = wte_state.total_wte_count,
+            };
+            (void)dump_full_process_memory(cpu, env, wte_label, &evt,
+                                           wte_state.target_cr3);
+        }
+
+        if (wte_kvm_clear_nx(&gfn, 1) < 0) {
+            return;
+        }
+
+        cpu_physical_memory_read(entry->gpa, entry->current, WTE_PAGE_SIZE);
+        memcpy(entry->baseline, entry->current, WTE_PAGE_SIZE);
+        entry->baseline_valid = true;
+        entry->diff_count = 0;
+        entry->flags &= ~(WTE_PAGE_DYN_FIRST_EXEC_PENDING |
+                          WTE_PAGE_WRITTEN | WTE_PAGE_X_BLOCKED);
+        entry->write_count = 0;
+        entry->flags |= WTE_PAGE_X_ALLOWED;
+        return;
     }
 
     /* Check if this page was written */
@@ -2619,8 +3128,8 @@ void wte_handle_exec_violation(uint64_t gfn, uint64_t gpa,
                 .wte_count       = wte_state.wte_count,
                 .total_wte_count = wte_state.total_wte_count,
             };
-            dump_full_process_memory(cpu, env, wte_label, &evt,
-                                     wte_state.target_cr3);
+            (void)dump_full_process_memory(cpu, env, wte_label, &evt,
+                                           wte_state.target_cr3);
         }
 
         /* Phase 4: post-WtE rescan removed.  api_hook NtAllocate/NtProtect
@@ -2847,6 +3356,13 @@ void wte_reset_round(void)
 {
     if (!wte_state.active) return;
 
+    if (wte_state.strict_mode) {
+        wte_handle_strict_pre_restore_reset(qemu_get_cpu(0));
+        wte_handle_strict_post_restore_reset(qemu_get_cpu(0));
+        wte_state.round++;
+        return;
+    }
+
     nyx_printf("[WtE] Round %d complete: %d WtE (%d DLL-filtered, "
                "%d CoW-recovered)\n",
                wte_state.round, wte_state.wte_count,
@@ -2926,7 +3442,74 @@ void wte_reset_round(void)
 /* ── Status / Debug ────────────────────────────────────────────── */
 
 bool wte_is_active(void) { return wte_state.active; }
+bool wte_is_strict_mode(void) { return wte_state.strict_mode; }
 wte_state_t *wte_get_state(void) { return &wte_state; }
+
+void wte_handle_strict_exit(CPUState *cpu,
+                            const struct kvm_nyx_strict_pt_exit *strict_exit)
+{
+    const struct wte_strict_exit event = {
+        .version = strict_exit->version,
+        .reserved0 = strict_exit->reserved0,
+        .flags = strict_exit->flags,
+        .session_id = strict_exit->session_id,
+        .range_id = strict_exit->range_id,
+        .generation = strict_exit->generation,
+        .gva = strict_exit->gva,
+        .gpa = strict_exit->gpa,
+        .rip = strict_exit->rip,
+        .cr3 = strict_exit->cr3,
+        .page_index = strict_exit->page_index,
+        .reserved1 = strict_exit->reserved1,
+        .reserved = {
+            strict_exit->reserved[0],
+            strict_exit->reserved[1],
+            strict_exit->reserved[2],
+        },
+    };
+    const struct wte_strict_runtime runtime = wte_make_strict_runtime(cpu);
+
+    if (wte_strict_handle_exit(&wte_state.strict_state, &runtime, &event) !=
+        WTE_STRICT_RESULT_OK) {
+        nyx_abort("Strict PT exit handling failed");
+    }
+}
+
+void wte_handle_strict_pre_restore_reset(CPUState *cpu)
+{
+    const struct wte_strict_runtime runtime = wte_make_strict_runtime(cpu);
+
+    if (!wte_state.strict_mode) {
+        return;
+    }
+
+    if (!wte_close_strict_trace()) {
+        nyx_abort("Strict PT trace rollover close failed");
+    }
+
+    if (wte_strict_prepare_reset(&wte_state.strict_state, &runtime) !=
+        WTE_STRICT_RESULT_OK) {
+        nyx_abort("Strict PT pre-restore reset failed");
+    }
+}
+
+void wte_handle_strict_post_restore_reset(CPUState *cpu)
+{
+    const struct wte_strict_runtime runtime = wte_make_strict_runtime(cpu);
+
+    if (!wte_state.strict_mode) {
+        return;
+    }
+
+    if (!wte_open_strict_trace()) {
+        nyx_abort("Strict PT trace rollover open failed");
+    }
+
+    if (wte_strict_complete_reset(&wte_state.strict_state, &runtime) !=
+        WTE_STRICT_RESULT_OK) {
+        nyx_abort("Strict PT post-restore registration failed");
+    }
+}
 
 void wte_print_debug_summary(void)
 {

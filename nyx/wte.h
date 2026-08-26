@@ -20,9 +20,11 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdint.h>
 
 #include "qemu/osdep.h"
+#include "nyx/wte_policy.h"
 
 /* ── Constants ─────────────────────────────────────────────────── */
 
@@ -51,8 +53,9 @@
 #define WTE_PAGE_IS_PE         (1 << 4)  /* belongs to target PE image   */
 #define WTE_PAGE_IS_DYNAMIC    (1 << 5)  /* dynamically detected region  */
 #define WTE_PAGE_DEFERRED      (1 << 6)  /* same-page write: W=1+X=1,
-                                          * pending verification at next
-                                          * EPT violation on other page  */
+                                           * pending verification at next
+                                           * EPT violation on other page  */
+#define WTE_PAGE_DYN_FIRST_EXEC_PENDING (1 << 7)
 
 /* JIT tap vtable slot for ICorStaticInfo::getEHinfo (.NET 4.x x86 ABI).
  * Slot 8 = 8th pure virtual after the base-class vtable starts. */
@@ -103,6 +106,7 @@ typedef struct {
 
 typedef struct {
     bool     active;
+    bool     strict_mode;
     bool     kvm_wte_enabled;
 
     /* Target process */
@@ -271,6 +275,9 @@ typedef struct {
     } dyn_ranges[64];
     int dyn_range_count;
 
+    struct wte_strict_state strict_state;
+    FILE *strict_trace_file;
+
 } wte_state_t;
 
 /* ── Public API ────────────────────────────────────────────────── */
@@ -279,7 +286,14 @@ typedef struct {
 void wte_init(void);
 void wte_destroy(void);
 void wte_activate(uint64_t cr3, bool is_64bit);
+bool wte_activate_strict(CPUState *cpu, uint64_t cr3, bool is_64bit,
+                         uint64_t image_base, uint64_t image_size);
 void wte_deactivate(void);
+bool wte_is_strict_mode(void);
+void wte_handle_strict_exit(CPUState *cpu,
+                            const struct kvm_nyx_strict_pt_exit *strict_exit);
+void wte_handle_strict_pre_restore_reset(CPUState *cpu);
+void wte_handle_strict_post_restore_reset(CPUState *cpu);
 
 /* KVM ioctl wrappers */
 int  wte_kvm_enable(void);

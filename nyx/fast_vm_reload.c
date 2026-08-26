@@ -420,6 +420,7 @@ void fast_reload_create_in_memory(fast_reload_t *self)
 void fast_reload_restore(fast_reload_t *self)
 {
     assert(self != NULL);
+    wte_handle_strict_pre_restore_reset(qemu_get_cpu(0));
     self->dirty_pages = 0;
 
     /* flush all pending block writes */
@@ -436,6 +437,7 @@ void fast_reload_restore(fast_reload_t *self)
 
     nyx_device_state_post_restore(self->device_state);
     kvm_arch_put_registers(qemu_get_cpu(0), KVM_PUT_FULL_STATE_FAST);
+    wte_handle_strict_post_restore_reset(qemu_get_cpu(0));
     qemu_get_cpu(0)->vcpu_dirty = false;
 
     return;

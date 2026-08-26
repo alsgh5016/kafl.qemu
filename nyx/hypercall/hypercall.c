@@ -25,6 +25,7 @@ along with QEMU-PT.  If not, see <http://www.gnu.org/licenses/>.
 #include "qemu/main-loop.h"
 #include "qemu-common.h"
 #include <linux/kvm.h>
+#include <errno.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 
@@ -53,6 +54,8 @@ along with QEMU-PT.  If not, see <http://www.gnu.org/licenses/>.
 #include "nyx/synchronization.h"
 #include "nyx/wte.h"
 #include "nyx/api_hook.h"
+#include "nyx/checked_io.h"
+#include "nyx/dump_state.h"
 
 bool hypercall_enabled = false;
 static bool init_state = true;
@@ -774,13 +777,37 @@ typedef struct {
     uint8_t  content[WTE_PAGE_SIZE];          /* Page content (4096 bytes) */
 } crossdump_page_t;
 
-static struct {
-    crossdump_page_t *pages;                  /* Array of saved pages      */
-    int               count;                  /* Number of pages saved     */
-    int               capacity;               /* Allocated capacity        */
-    int               prev_seq;               /* Sequence # of prev dump   */
-    bool              valid;                   /* Has previous snapshot?    */
-} crossdump_prev = { NULL, 0, 0, -1, false };
+typedef nyx_dump_snapshot_state_t crossdump_snapshot_t;
+
+static crossdump_snapshot_t crossdump_prev = { NULL, 0, 0, -1, false };
+
+static crossdump_page_t *crossdump_previous_pages(void)
+{
+    return crossdump_prev.pages;
+}
+
+#define DUMP_WRITE_FMT(stream, ...)                                             \
+    do {                                                                        \
+        if (!nyx_checked_fprintf(io_ops, (stream), __VA_ARGS__)) {             \
+            goto cleanup;                                                       \
+        }                                                                       \
+    } while (0)
+
+#define DUMP_WRITE_EXACT(stream, buffer, size)                                  \
+    do {                                                                        \
+        if (!nyx_checked_write_exact(io_ops, (stream), (buffer), (size))) {    \
+            goto cleanup;                                                       \
+        }                                                                       \
+    } while (0)
+
+#define DUMP_CLOSE_DURABLE(stream)                                              \
+    do {                                                                        \
+        if (!nyx_checked_flush_fsync_close(io_ops, (stream))) {                \
+            (stream) = NULL;                                                    \
+            goto cleanup;                                                       \
+        }                                                                       \
+        (stream) = NULL;                                                        \
+    } while (0)
 
 void wte_crossdump_init(void)
 {
@@ -812,23 +839,60 @@ static int crossdump_find_va(uint64_t va)
     int lo = 0, hi = crossdump_prev.count - 1;
     while (lo <= hi) {
         int mid = (lo + hi) / 2;
-        if (crossdump_prev.pages[mid].va == va) return mid;
-        if (crossdump_prev.pages[mid].va < va) lo = mid + 1;
+        if (crossdump_previous_pages()[mid].va == va) return mid;
+        if (crossdump_previous_pages()[mid].va < va) lo = mid + 1;
         else hi = mid - 1;
     }
     return -1;  /* not found */
 }
 
-void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
-                                     const char *label,
-                                     const wte_dump_event_t *event,
-                                     uint64_t cr3_override)
+bool dump_full_process_memory(CPUState *cpu, CPUX86State *env,
+                              const char *label,
+                              const wte_dump_event_t *event,
+                              uint64_t cr3_override)
 {
-    int seq = dump_seq_counter++;
+    const nyx_checked_io_ops_t *io_ops = nyx_checked_io_default_ops();
+    FILE *map_f = NULL;
+    FILE *tl_f = NULL;
+    FILE *diff_f = NULL;
+    FILE *artifact_f = NULL;
+    char *dump_root_dir = NULL;
+    char *dump_dir = NULL;
+    char *map_path = NULL;
+    char *tl_path = NULL;
+    char *diff_path = NULL;
+    char *artifact_path = NULL;
+    wte_dll_entry_t *modules = NULL;
+    mapped_page_t *pages = NULL;
+    crossdump_page_t *cur_snap = NULL;
+    crossdump_page_t *replacement_pages = NULL;
+    void *old_snapshot_pages = NULL;
+    int replacement_capacity = 0;
+    int seq = dump_seq_counter;
     uint64_t cr3 = (cr3_override != 0) ? cr3_override : env->cr[3];
+    int pg_capacity = 65536;
+    int pg_count = 0;
+    int region_count = 0;
+    uint64_t total_bytes = 0;
+    int cur_snap_count = 0;
+    int written_pages = 0;
+    int skipped_pages = 0;
+    int diff_changed_pages = 0;
+    int diff_new_pages = 0;
+    int diff_removed_pages = 0;
+    uint64_t diff_total_changed_bytes = 0;
+    int previous_snapshot_seq = crossdump_prev.prev_seq;
+    bool is_incremental;
+    bool had_previous_snapshot;
+    bool write_timeline_header = false;
+
+    dump_seq_counter = seq + 1;
 
     /* --- 1+2. Enumerate loaded modules via PEB→Ldr (bitness-aware) --- */
-    wte_dll_entry_t *modules = calloc(MAX_MODS, sizeof(wte_dll_entry_t));
+    modules = calloc(MAX_MODS, sizeof(wte_dll_entry_t));
+    if (modules == NULL) {
+        return false;
+    }
     int num_modules = wte_walk_module_list(cpu, modules, MAX_MODS, cr3);
 
     nyx_printf("    [FULLDUMP] #%03d (%s): dump_cr3=0x%lx, "
@@ -842,36 +906,50 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
     }
 
     /* --- 3. Create dump directory --- */
-    char *dump_dir = NULL;
-    assert(asprintf(&dump_dir, "%s/dump/fulldump_%03d_%s",
-                    GET_GLOBAL_STATE()->workdir_path,
-                    seq, label) != -1);
-    mkdir(dump_dir, 0755);
+    if (asprintf(&dump_root_dir, "%s/dump",
+                 GET_GLOBAL_STATE()->workdir_path) == -1) {
+        dump_root_dir = NULL;
+        goto cleanup;
+    }
+    if (mkdir(dump_root_dir, 0755) != 0 && errno != EEXIST) {
+        goto cleanup;
+    }
+
+    if (asprintf(&dump_dir, "%s/dump/fulldump_%03d_%s",
+                 GET_GLOBAL_STATE()->workdir_path,
+                 seq, label) == -1) {
+        dump_dir = NULL;
+        goto cleanup;
+    }
+    if (mkdir(dump_dir, 0755) != 0 && errno != EEXIST) {
+        goto cleanup;
+    }
 
     /* --- 4. Open memory map file --- */
-    char *map_path = NULL;
-    assert(asprintf(&map_path, "%s/memory_map.txt", dump_dir) != -1);
-    FILE *map_f = fopen(map_path, "w");
-    if (!map_f) {
-        nyx_printf("    [FULLDUMP] Failed to create %s\n", map_path);
-        free(map_path); free(dump_dir); free(modules);
-        return;
+    if (asprintf(&map_path, "%s/memory_map.txt", dump_dir) == -1) {
+        map_path = NULL;
+        goto cleanup;
     }
-    fprintf(map_f, "# Full process memory dump #%03d\n", seq);
-    fprintf(map_f, "# Trigger: %s\n", label);
-    fprintf(map_f, "# Modules: %d\n", num_modules);
+    if (!nyx_checked_fopen(io_ops, map_path, "w", &map_f)) {
+        nyx_printf("    [FULLDUMP] Failed to create %s\n", map_path);
+        goto cleanup;
+    }
+    DUMP_WRITE_FMT(map_f, "# Full process memory dump #%03d\n", seq);
+    DUMP_WRITE_FMT(map_f, "# Trigger: %s\n", label);
+    DUMP_WRITE_FMT(map_f, "# Modules: %d\n", num_modules);
 
     if (event) {
-        fprintf(map_f, "#\n");
-        fprintf(map_f, "# WtE Event:\n");
-        fprintf(map_f, "#   Type:       %s\n", event->type);
-        fprintf(map_f, "#   RIP:        0x%lx\n", (unsigned long)event->rip);
-        fprintf(map_f, "#   Target VA:  0x%lx\n", (unsigned long)event->va);
-        fprintf(map_f, "#   Target GFN: 0x%lx\n", (unsigned long)event->gfn);
-        fprintf(map_f, "#   Diffs:      %d bytes changed in target page\n",
-                event->diff_count);
-        fprintf(map_f, "#   WtE#:       %d (total)\n",
-                event->total_wte_count);
+        DUMP_WRITE_FMT(map_f, "#\n");
+        DUMP_WRITE_FMT(map_f, "# WtE Event:\n");
+        DUMP_WRITE_FMT(map_f, "#   Type:       %s\n", event->type);
+        DUMP_WRITE_FMT(map_f, "#   RIP:        0x%lx\n", (unsigned long)event->rip);
+        DUMP_WRITE_FMT(map_f, "#   Target VA:  0x%lx\n", (unsigned long)event->va);
+        DUMP_WRITE_FMT(map_f, "#   Target GFN: 0x%lx\n", (unsigned long)event->gfn);
+        DUMP_WRITE_FMT(map_f,
+                       "#   Diffs:      %d bytes changed in target page\n",
+                       event->diff_count);
+        DUMP_WRITE_FMT(map_f, "#   WtE#:       %d (total)\n",
+                       event->total_wte_count);
     }
 
     /* --- Guest register snapshot at dump time --- */
@@ -881,51 +959,52 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
         bool cs_d = !!(cs_flags & (1 << 22));  /* Default size (32-bit) */
         const char *mode = cs_l ? "64-bit" : (cs_d ? "32-bit (compat)" : "16-bit");
 
-        fprintf(map_f, "#\n");
-        fprintf(map_f, "# Guest Registers (mode: %s, CS.L=%d CS.D=%d):\n",
-                mode, cs_l, cs_d);
-        fprintf(map_f, "#   RAX: 0x%016lx  RBX: 0x%016lx\n",
-                (unsigned long)env->regs[R_EAX],
-                (unsigned long)env->regs[R_EBX]);
-        fprintf(map_f, "#   RCX: 0x%016lx  RDX: 0x%016lx\n",
-                (unsigned long)env->regs[R_ECX],
-                (unsigned long)env->regs[R_EDX]);
-        fprintf(map_f, "#   RSI: 0x%016lx  RDI: 0x%016lx\n",
-                (unsigned long)env->regs[R_ESI],
-                (unsigned long)env->regs[R_EDI]);
-        fprintf(map_f, "#   RBP: 0x%016lx  RSP: 0x%016lx\n",
-                (unsigned long)env->regs[R_EBP],
-                (unsigned long)env->regs[R_ESP]);
-        fprintf(map_f, "#   R8:  0x%016lx  R9:  0x%016lx\n",
-                (unsigned long)env->regs[8],
-                (unsigned long)env->regs[9]);
-        fprintf(map_f, "#   R10: 0x%016lx  R11: 0x%016lx\n",
-                (unsigned long)env->regs[10],
-                (unsigned long)env->regs[11]);
-        fprintf(map_f, "#   R12: 0x%016lx  R13: 0x%016lx\n",
-                (unsigned long)env->regs[12],
-                (unsigned long)env->regs[13]);
-        fprintf(map_f, "#   R14: 0x%016lx  R15: 0x%016lx\n",
-                (unsigned long)env->regs[14],
-                (unsigned long)env->regs[15]);
-        fprintf(map_f, "#   RIP: 0x%016lx  RFLAGS: 0x%016lx\n",
-                (unsigned long)env->eip,
-                (unsigned long)env->eflags);
-        fprintf(map_f, "#   CR3: current=0x%016lx dump=0x%016lx\n",
-                (unsigned long)env->cr[3], (unsigned long)cr3);
+        DUMP_WRITE_FMT(map_f, "#\n");
+        DUMP_WRITE_FMT(map_f,
+                       "# Guest Registers (mode: %s, CS.L=%d CS.D=%d):\n",
+                       mode, cs_l, cs_d);
+        DUMP_WRITE_FMT(map_f, "#   RAX: 0x%016lx  RBX: 0x%016lx\n",
+                       (unsigned long)env->regs[R_EAX],
+                       (unsigned long)env->regs[R_EBX]);
+        DUMP_WRITE_FMT(map_f, "#   RCX: 0x%016lx  RDX: 0x%016lx\n",
+                       (unsigned long)env->regs[R_ECX],
+                       (unsigned long)env->regs[R_EDX]);
+        DUMP_WRITE_FMT(map_f, "#   RSI: 0x%016lx  RDI: 0x%016lx\n",
+                       (unsigned long)env->regs[R_ESI],
+                       (unsigned long)env->regs[R_EDI]);
+        DUMP_WRITE_FMT(map_f, "#   RBP: 0x%016lx  RSP: 0x%016lx\n",
+                       (unsigned long)env->regs[R_EBP],
+                       (unsigned long)env->regs[R_ESP]);
+        DUMP_WRITE_FMT(map_f, "#   R8:  0x%016lx  R9:  0x%016lx\n",
+                       (unsigned long)env->regs[8],
+                       (unsigned long)env->regs[9]);
+        DUMP_WRITE_FMT(map_f, "#   R10: 0x%016lx  R11: 0x%016lx\n",
+                       (unsigned long)env->regs[10],
+                       (unsigned long)env->regs[11]);
+        DUMP_WRITE_FMT(map_f, "#   R12: 0x%016lx  R13: 0x%016lx\n",
+                       (unsigned long)env->regs[12],
+                       (unsigned long)env->regs[13]);
+        DUMP_WRITE_FMT(map_f, "#   R14: 0x%016lx  R15: 0x%016lx\n",
+                       (unsigned long)env->regs[14],
+                       (unsigned long)env->regs[15]);
+        DUMP_WRITE_FMT(map_f, "#   RIP: 0x%016lx  RFLAGS: 0x%016lx\n",
+                       (unsigned long)env->eip,
+                       (unsigned long)env->eflags);
+        DUMP_WRITE_FMT(map_f, "#   CR3: current=0x%016lx dump=0x%016lx\n",
+                       (unsigned long)env->cr[3], (unsigned long)cr3);
     }
 
-    fprintf(map_f, "\n");
-    fprintf(map_f, "# %-10s  %-10s  %-10s  %-5s  %-40s  %s\n",
-            "START", "END", "SIZE", "PERM", "FILE", "MODULE");
+    DUMP_WRITE_FMT(map_f, "\n");
+    DUMP_WRITE_FMT(map_f, "# %-10s  %-10s  %-10s  %-5s  %-40s  %s\n",
+                   "START", "END", "SIZE", "PERM", "FILE", "MODULE");
 
     for (int m = 0; m < num_modules; m++) {
-        fprintf(map_f, "# MODULE: %-30s  base=0x%016lx  size=0x%lx\n",
-                modules[m].name,
-                (unsigned long)modules[m].base,
-                (unsigned long)(modules[m].end - modules[m].base));
+        DUMP_WRITE_FMT(map_f, "# MODULE: %-30s  base=0x%016lx  size=0x%lx\n",
+                       modules[m].name,
+                       (unsigned long)modules[m].base,
+                       (unsigned long)(modules[m].end - modules[m].base));
     }
-    fprintf(map_f, "\n");
+    DUMP_WRITE_FMT(map_f, "\n");
 
     /* --- 5. Bulk page table walk to collect mapped user-space pages --- */
     /*
@@ -939,9 +1018,10 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
      *   bit 63 (NX):  0=executable, 1=no-execute
      *   Effective = AND of all levels (PML4, PDPT, PD, PT)
      */
-    int pg_capacity = 65536;
-    int pg_count = 0;
-    mapped_page_t *pages = malloc(pg_capacity * sizeof(mapped_page_t));
+    pages = malloc(pg_capacity * sizeof(mapped_page_t));
+    if (pages == NULL) {
+        goto cleanup;
+    }
 
     uint64_t pml4_base = cr3 & 0x000FFFFFFFFFF000ULL;
     uint64_t pml4_table[512];
@@ -979,10 +1059,16 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                 for (int k = 0; k < 512 * 512; k++) {
                     uint64_t va = base_va + ((uint64_t)k << 12);
                     if (va < 0x10000) continue;
-                    if (pg_count >= pg_capacity) {
+                     if (pg_count >= pg_capacity) {
+                        mapped_page_t *resized_pages;
                         pg_capacity *= 2;
-                        pages = realloc(pages, pg_capacity * sizeof(mapped_page_t));
-                    }
+                        resized_pages = realloc(pages,
+                                                pg_capacity * sizeof(mapped_page_t));
+                        if (resized_pages == NULL) {
+                            goto cleanup;
+                        }
+                        pages = resized_pages;
+                     }
                     pages[pg_count].va   = va;
                     pages[pg_count].phys = page_phys + ((uint64_t)k << 12);
                     pages[pg_count].perm = 0x01
@@ -1018,8 +1104,14 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                         uint64_t va = base_va + ((uint64_t)k << 12);
                         if (va < 0x10000) continue;
                         if (pg_count >= pg_capacity) {
+                            mapped_page_t *resized_pages;
                             pg_capacity *= 2;
-                            pages = realloc(pages, pg_capacity * sizeof(mapped_page_t));
+                            resized_pages = realloc(
+                                pages, pg_capacity * sizeof(mapped_page_t));
+                            if (resized_pages == NULL) {
+                                goto cleanup;
+                            }
+                            pages = resized_pages;
                         }
                         pages[pg_count].va   = va;
                         pages[pg_count].phys = page_phys + ((uint64_t)k << 12);
@@ -1048,8 +1140,14 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                     bool x = pd_x && !(pte & (1ULL << 63));
 
                     if (pg_count >= pg_capacity) {
+                        mapped_page_t *resized_pages;
                         pg_capacity *= 2;
-                        pages = realloc(pages, pg_capacity * sizeof(mapped_page_t));
+                        resized_pages = realloc(pages,
+                                                pg_capacity * sizeof(mapped_page_t));
+                        if (resized_pages == NULL) {
+                            goto cleanup;
+                        }
+                        pages = resized_pages;
                     }
                     pages[pg_count].va   = va;
                     pages[pg_count].phys = phys;
@@ -1071,12 +1169,11 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
      * Phase 2: Compare with previous snapshot; write only changed/new pages
      *          to disk.  First dump (no previous) writes everything.
      */
-    int region_count = 0;
-    uint64_t total_bytes = 0;
-
     /* Always allocate current snapshot */
-    crossdump_page_t *cur_snap = malloc(pg_count * sizeof(crossdump_page_t));
-    int cur_snap_count = 0;
+    cur_snap = malloc((size_t)pg_count * sizeof(crossdump_page_t));
+    if (pg_count > 0 && cur_snap == NULL) {
+        goto cleanup;
+    }
 
     /* Phase 1: Read all pages into cur_snap (fast — physical memory reads) */
     for (int p = 0; p < pg_count; p++) {
@@ -1087,9 +1184,8 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
     }
 
     /* Phase 2: Determine which pages to write to disk */
-    bool is_incremental = crossdump_prev.valid && crossdump_prev.count > 0;
-    int written_pages = 0;
-    int skipped_pages = 0;
+    is_incremental = crossdump_prev.valid && crossdump_prev.count > 0;
+    had_previous_snapshot = crossdump_prev.valid && crossdump_prev.count > 0;
 
     if (!is_incremental) {
         /* First dump: write all regions (full baseline) */
@@ -1124,37 +1220,41 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                 }
             }
 
-            char *reg_path = NULL;
-            assert(asprintf(&reg_path, "%s/region_%016lx_%lx_%s.bin",
-                            dump_dir, (unsigned long)region_start,
-                            (unsigned long)region_size, perm_str) != -1);
-            FILE *rf = fopen(reg_path, "w");
-            if (rf) {
-                for (int p = region_first; p <= region_last; p++) {
-                    fwrite(cur_snap[p].content, 1, 0x1000, rf);
-                }
-                fclose(rf);
+            if (asprintf(&artifact_path, "%s/region_%016lx_%lx_%s.bin",
+                         dump_dir, (unsigned long)region_start,
+                         (unsigned long)region_size, perm_str) == -1) {
+                artifact_path = NULL;
+                goto cleanup;
             }
+            if (!nyx_checked_fopen(io_ops, artifact_path, "wb", &artifact_f)) {
+                goto cleanup;
+            }
+            for (int p = region_first; p <= region_last; p++) {
+                DUMP_WRITE_EXACT(artifact_f, cur_snap[p].content, WTE_PAGE_SIZE);
+            }
+            DUMP_CLOSE_DURABLE(artifact_f);
 
-            fprintf(map_f, "  0x%016lx  0x%016lx  0x%016lx  %-5s  region_%016lx_%lx_%s.bin  %s\n",
-                    (unsigned long)region_start,
-                    (unsigned long)(region_start + region_size),
-                    (unsigned long)region_size,
-                    perm_str,
-                    (unsigned long)region_start,
-                    (unsigned long)region_size,
-                    perm_str,
-                    mod_name ? mod_name : "");
+            DUMP_WRITE_FMT(map_f,
+                           "  0x%016lx  0x%016lx  0x%016lx  %-5s  region_%016lx_%lx_%s.bin  %s\n",
+                           (unsigned long)region_start,
+                           (unsigned long)(region_start + region_size),
+                           (unsigned long)region_size,
+                           perm_str,
+                           (unsigned long)region_start,
+                           (unsigned long)region_size,
+                           perm_str,
+                           mod_name ? mod_name : "");
 
             region_count++;
             total_bytes += region_size;
             written_pages += (region_last - region_first + 1);
-            free(reg_path);
+            free(artifact_path);
+            artifact_path = NULL;
         }
     } else {
         /* Incremental dump: only write changed/new pages */
-        fprintf(map_f, "# INCREMENTAL (base: dump #%03d)\n\n",
-                crossdump_prev.prev_seq);
+        DUMP_WRITE_FMT(map_f, "# INCREMENTAL (base: dump #%03d)\n\n",
+                       crossdump_prev.prev_seq);
 
         for (int p = 0; p < cur_snap_count; p++) {
             uint64_t va = cur_snap[p].va;
@@ -1165,7 +1265,7 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                 page_changed = true;  /* New page */
             } else {
                 page_changed = (memcmp(cur_snap[p].content,
-                                       crossdump_prev.pages[prev_idx].content,
+                                       crossdump_previous_pages()[prev_idx].content,
                                        WTE_PAGE_SIZE) != 0);
             }
 
@@ -1191,128 +1291,134 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                 }
             }
 
-            char *pg_path = NULL;
-            assert(asprintf(&pg_path, "%s/page_%016lx_%s.bin",
-                            dump_dir, (unsigned long)va, perm_str) != -1);
-            FILE *pf = fopen(pg_path, "w");
-            if (pf) {
-                fwrite(cur_snap[p].content, 1, 0x1000, pf);
-                fclose(pf);
+            if (asprintf(&artifact_path, "%s/page_%016lx_%s.bin",
+                         dump_dir, (unsigned long)va, perm_str) == -1) {
+                artifact_path = NULL;
+                goto cleanup;
             }
+            if (!nyx_checked_fopen(io_ops, artifact_path, "wb", &artifact_f)) {
+                goto cleanup;
+            }
+            DUMP_WRITE_EXACT(artifact_f, cur_snap[p].content, WTE_PAGE_SIZE);
+            DUMP_CLOSE_DURABLE(artifact_f);
 
-            fprintf(map_f, "  0x%016lx  0x%016lx  0x00001000  %-5s  page_%016lx_%s.bin  %-7s  %s\n",
-                    (unsigned long)va, (unsigned long)(va + 0x1000),
-                    perm_str, (unsigned long)va, perm_str,
-                    prev_idx < 0 ? "NEW" : "CHANGED",
-                    mod_name ? mod_name : "");
+            DUMP_WRITE_FMT(map_f,
+                           "  0x%016lx  0x%016lx  0x00001000  %-5s  page_%016lx_%s.bin  %-7s  %s\n",
+                           (unsigned long)va, (unsigned long)(va + 0x1000),
+                           perm_str, (unsigned long)va, perm_str,
+                           prev_idx < 0 ? "NEW" : "CHANGED",
+                           mod_name ? mod_name : "");
 
             region_count++;
             total_bytes += 0x1000;
             written_pages++;
-            free(pg_path);
+            free(artifact_path);
+            artifact_path = NULL;
         }
     }
 
     free(pages);
-    fprintf(map_f, "\n# Total: %d %s, %lu bytes written (%d pages total, %d skipped)\n",
-            region_count, is_incremental ? "changed pages" : "regions",
-            (unsigned long)total_bytes, pg_count, skipped_pages);
-    fclose(map_f);
-
-    nyx_printf("    [FULLDUMP] %s: wrote %d %s (%lu bytes, %d/%d pages) -> %s/\n",
-               is_incremental ? "INCREMENTAL" : "FULL",
-               region_count, is_incremental ? "changed pages" : "regions",
-               (unsigned long)total_bytes, written_pages, pg_count, dump_dir);
+    pages = NULL;
+    DUMP_WRITE_FMT(map_f,
+                   "\n# Total: %d %s, %lu bytes written (%d pages total, %d skipped)\n",
+                   region_count,
+                   is_incremental ? "changed pages" : "regions",
+                   (unsigned long)total_bytes, pg_count, skipped_pages);
+    DUMP_CLOSE_DURABLE(map_f);
 
     /* --- 6b. Append to cumulative WtE timeline --- */
     if (event) {
-        char *tl_path = NULL;
-        assert(asprintf(&tl_path, "%s/dump/wte_timeline.txt",
-                        GET_GLOBAL_STATE()->workdir_path) != -1);
-        FILE *tl_f = fopen(tl_path, "a");
-        if (tl_f) {
-            /* Write header on first event */
-            if (seq == 0) {
-                fprintf(tl_f, "# WtE Detection Timeline\n");
-                fprintf(tl_f, "# SEQ  TYPE       RIP         VA          "
-                        "GFN        FS_BASE     DIFFS  PAGES_WRITTEN  PAGES_TOTAL  "
-                        "WTE#  LABEL\n");
-            }
-            fprintf(tl_f, "%03d  %-9s  0x%08lx  0x%08lx  0x%06lx  0x%08lx  %5d  %13d  %11d  "
-                    "#%-4d  %s\n",
-                    seq, event->type,
-                    (unsigned long)event->rip, (unsigned long)event->va,
-                    (unsigned long)event->gfn, (unsigned long)event->fs_base,
-                    event->diff_count,
-                    written_pages, pg_count,
-                    event->total_wte_count, label);
-            fclose(tl_f);
+        struct stat tl_stat;
+
+        if (asprintf(&tl_path, "%s/wte_timeline.txt", dump_root_dir) == -1) {
+            tl_path = NULL;
+            goto cleanup;
         }
-        free(tl_path);
+        write_timeline_header =
+            stat(tl_path, &tl_stat) != 0 || tl_stat.st_size == 0;
+        if (!nyx_checked_fopen(io_ops, tl_path, "a", &tl_f)) {
+            goto cleanup;
+        }
+        if (write_timeline_header) {
+            DUMP_WRITE_FMT(tl_f, "# WtE Detection Timeline\n");
+            DUMP_WRITE_FMT(tl_f,
+                           "# SEQ  TYPE       RIP         VA          "
+                           "GFN        FS_BASE     DIFFS  PAGES_WRITTEN  PAGES_TOTAL  "
+                           "WTE#  LABEL\n");
+        }
+        DUMP_WRITE_FMT(tl_f,
+                       "%03d  %-9s  0x%08lx  0x%08lx  0x%06lx  0x%08lx  %5d  %13d  %11d  "
+                       "#%-4d  %s\n",
+                       seq, event->type,
+                       (unsigned long)event->rip, (unsigned long)event->va,
+                       (unsigned long)event->gfn, (unsigned long)event->fs_base,
+                       event->diff_count,
+                       written_pages, pg_count,
+                       event->total_wte_count, label);
+        DUMP_CLOSE_DURABLE(tl_f);
     }
 
     /* --- 7. Cross-dump byte diff: compare with previous snapshot --- */
     if (cur_snap && crossdump_prev.valid && crossdump_prev.count > 0) {
-        char *diff_path = NULL;
-        assert(asprintf(&diff_path, "%s/diff_report.txt", dump_dir) != -1);
-        FILE *diff_f = fopen(diff_path, "w");
-        if (diff_f) {
-            fprintf(diff_f, "# Cross-dump byte diff report\n");
-            fprintf(diff_f, "# Current dump:  #%03d (%s)\n", seq, label);
-            fprintf(diff_f, "# Previous dump: #%03d\n", crossdump_prev.prev_seq);
-            fprintf(diff_f, "# Current pages: %d, Previous pages: %d\n\n",
-                    cur_snap_count, crossdump_prev.count);
+        if (asprintf(&diff_path, "%s/diff_report.txt", dump_dir) == -1) {
+            diff_path = NULL;
+            goto cleanup;
+        }
+        if (!nyx_checked_fopen(io_ops, diff_path, "w", &diff_f)) {
+            goto cleanup;
+        }
+        DUMP_WRITE_FMT(diff_f, "# Cross-dump byte diff report\n");
+        DUMP_WRITE_FMT(diff_f, "# Current dump:  #%03d (%s)\n", seq, label);
+        DUMP_WRITE_FMT(diff_f, "# Previous dump: #%03d\n", crossdump_prev.prev_seq);
+        DUMP_WRITE_FMT(diff_f, "# Current pages: %d, Previous pages: %d\n\n",
+                       cur_snap_count, crossdump_prev.count);
 
-            int changed_pages = 0;
-            int new_pages = 0;
-            int removed_pages = 0;
-            uint64_t total_changed_bytes = 0;
+        /* Compare each current page with previous snapshot */
+        for (int c = 0; c < cur_snap_count; c++) {
+            uint64_t va = cur_snap[c].va;
+            int prev_idx = crossdump_find_va(va);
 
-            /* Compare each current page with previous snapshot */
-            for (int c = 0; c < cur_snap_count; c++) {
-                uint64_t va = cur_snap[c].va;
-                int prev_idx = crossdump_find_va(va);
+            if (prev_idx < 0) {
+                const char *mname = NULL;
 
-                if (prev_idx < 0) {
-                    /* Page exists in current but not in previous = new page */
-                    new_pages++;
-
-                    /* Identify module */
-                    const char *mname = NULL;
-                    for (int m = 0; m < num_modules; m++) {
-                        if (va >= modules[m].base &&
-                            va < modules[m].end) {
-                            mname = modules[m].name;
-                            break;
-                        }
+                diff_new_pages++;
+                for (int m = 0; m < num_modules; m++) {
+                    if (va >= modules[m].base && va < modules[m].end) {
+                        mname = modules[m].name;
+                        break;
                     }
+                }
 
-                    fprintf(diff_f, "NEW   VA=0x%016lx  %s\n",
-                            (unsigned long)va, mname ? mname : "(unmapped)");
+                DUMP_WRITE_FMT(diff_f, "NEW   VA=0x%016lx  %s\n",
+                               (unsigned long)va,
+                               mname ? mname : "(unmapped)");
+                continue;
+            }
+
+            {
+                const uint8_t *prev_data =
+                    crossdump_previous_pages()[prev_idx].content;
+                const uint8_t *cur_data = cur_snap[c].content;
+
+                if (memcmp(prev_data, cur_data, WTE_PAGE_SIZE) == 0) {
                     continue;
                 }
 
-                /* Page exists in both — do byte-level comparison */
-                const uint8_t *prev_data = crossdump_prev.pages[prev_idx].content;
-                const uint8_t *cur_data  = cur_snap[c].content;
-
-                if (memcmp(prev_data, cur_data, WTE_PAGE_SIZE) == 0) {
-                    continue;  /* Identical — skip */
-                }
-
-                /* Find changed byte ranges within this page */
-                changed_pages++;
+                diff_changed_pages++;
                 int range_count = 0;
                 uint16_t range_offsets[WTE_MAX_DIFF_RANGES];
                 uint16_t range_lengths[WTE_MAX_DIFF_RANGES];
                 int page_changed_bytes = 0;
-
                 int b = 0;
+                const char *mname = NULL;
+
                 while (b < WTE_PAGE_SIZE && range_count < WTE_MAX_DIFF_RANGES) {
                     if (prev_data[b] != cur_data[b]) {
                         int start = b;
-                        while (b < WTE_PAGE_SIZE && prev_data[b] != cur_data[b])
+
+                        while (b < WTE_PAGE_SIZE && prev_data[b] != cur_data[b]) {
                             b++;
+                        }
                         range_offsets[range_count] = (uint16_t)start;
                         range_lengths[range_count] = (uint16_t)(b - start);
                         page_changed_bytes += (b - start);
@@ -1322,82 +1428,127 @@ void dump_full_process_memory(CPUState *cpu, CPUX86State *env,
                     }
                 }
 
-                total_changed_bytes += page_changed_bytes;
+                diff_total_changed_bytes += page_changed_bytes;
 
-                /* Identify module */
-                const char *mname = NULL;
                 for (int m = 0; m < num_modules; m++) {
-                    if (va >= modules[m].base &&
-                        va < modules[m].end) {
+                    if (va >= modules[m].base && va < modules[m].end) {
                         mname = modules[m].name;
                         break;
                     }
                 }
 
-                fprintf(diff_f, "CHANGED  VA=0x%016lx  %d ranges  %d bytes  %s\n",
-                        (unsigned long)va, range_count, page_changed_bytes,
-                        mname ? mname : "(unmapped)");
+                DUMP_WRITE_FMT(diff_f,
+                               "CHANGED  VA=0x%016lx  %d ranges  %d bytes  %s\n",
+                               (unsigned long)va, range_count,
+                               page_changed_bytes,
+                               mname ? mname : "(unmapped)");
                 for (int r = 0; r < range_count; r++) {
-                    fprintf(diff_f, "    offset=0x%04x  len=%d\n",
-                            range_offsets[r], range_lengths[r]);
+                    DUMP_WRITE_FMT(diff_f, "    offset=0x%04x  len=%d\n",
+                                   range_offsets[r], range_lengths[r]);
                 }
             }
-
-            /* Check for removed pages (in prev but not in current) */
-            for (int p = 0; p < crossdump_prev.count; p++) {
-                uint64_t prev_va = crossdump_prev.pages[p].va;
-                bool found = false;
-                int lo = 0, hi = cur_snap_count - 1;
-                while (lo <= hi) {
-                    int mid = (lo + hi) / 2;
-                    if (cur_snap[mid].va == prev_va) { found = true; break; }
-                    if (cur_snap[mid].va < prev_va) lo = mid + 1;
-                    else hi = mid - 1;
-                }
-                if (!found) {
-                    removed_pages++;
-                    fprintf(diff_f, "REMOVED  VA=0x%016lx\n", (unsigned long)prev_va);
-                }
-            }
-
-            fprintf(diff_f, "\n# Summary: %d changed, %d new, %d removed pages  "
-                    "(%lu bytes changed total)\n",
-                    changed_pages, new_pages, removed_pages,
-                    (unsigned long)total_changed_bytes);
-            fclose(diff_f);
-
-            nyx_printf("    [FULLDUMP] Cross-dump diff: %d changed, %d new, %d removed "
-                       "pages (%lu bytes changed) vs dump #%03d\n",
-                       changed_pages, new_pages, removed_pages,
-                       (unsigned long)total_changed_bytes,
-                       crossdump_prev.prev_seq);
         }
-        free(diff_path);
-    } else if (cur_snap && !crossdump_prev.valid) {
-        nyx_printf("    [FULLDUMP] Cross-dump diff: first dump, no previous to compare\n");
+
+        for (int p = 0; p < crossdump_prev.count; p++) {
+            uint64_t prev_va = crossdump_previous_pages()[p].va;
+            bool found = false;
+            int lo = 0;
+            int hi = cur_snap_count - 1;
+
+            while (lo <= hi) {
+                int mid = (lo + hi) / 2;
+
+                if (cur_snap[mid].va == prev_va) {
+                    found = true;
+                    break;
+                }
+                if (cur_snap[mid].va < prev_va) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            if (!found) {
+                diff_removed_pages++;
+                DUMP_WRITE_FMT(diff_f, "REMOVED  VA=0x%016lx\n",
+                               (unsigned long)prev_va);
+            }
+        }
+
+        DUMP_WRITE_FMT(diff_f,
+                       "\n# Summary: %d changed, %d new, %d removed pages  "
+                       "(%lu bytes changed total)\n",
+                       diff_changed_pages, diff_new_pages, diff_removed_pages,
+                       (unsigned long)diff_total_changed_bytes);
+        DUMP_CLOSE_DURABLE(diff_f);
     }
 
     /* --- 8. Swap current snapshot into previous for next comparison --- */
-    if (cur_snap) {
-        /* Reuse the crossdump_prev.pages buffer if large enough */
-        if (cur_snap_count > crossdump_prev.capacity) {
-            free(crossdump_prev.pages);
-            crossdump_prev.capacity = cur_snap_count + 1024;
-            crossdump_prev.pages = malloc(crossdump_prev.capacity *
-                                          sizeof(crossdump_page_t));
-        }
-        memcpy(crossdump_prev.pages, cur_snap,
-               cur_snap_count * sizeof(crossdump_page_t));
-        crossdump_prev.count = cur_snap_count;
-        crossdump_prev.prev_seq = seq;
-        crossdump_prev.valid = true;
-        free(cur_snap);
+    if (!nyx_checked_fsync_dir(io_ops, dump_dir) ||
+        !nyx_checked_fsync_dir(io_ops, dump_root_dir)) {
+        goto cleanup;
     }
+
+    replacement_pages = cur_snap;
+    replacement_capacity = cur_snap_count;
+    if (!nyx_dump_snapshot_publish(&crossdump_prev,
+                                   true, (void **)&replacement_pages,
+                                   cur_snap_count, replacement_capacity, seq,
+                                   &old_snapshot_pages)) {
+        goto cleanup;
+    }
+    cur_snap = NULL;
+    free(old_snapshot_pages);
+
+    if (had_previous_snapshot) {
+        nyx_printf("    [FULLDUMP] Cross-dump diff: %d changed, %d new, %d removed "
+                   "pages (%lu bytes changed) vs dump #%03d\n",
+                   diff_changed_pages, diff_new_pages, diff_removed_pages,
+                   (unsigned long)diff_total_changed_bytes,
+                   previous_snapshot_seq);
+    } else {
+        nyx_printf("    [FULLDUMP] Cross-dump diff: first dump, no previous to compare\n");
+    }
+    nyx_printf("    [FULLDUMP] %s: wrote %d %s (%lu bytes, %d/%d pages) -> %s/\n",
+               is_incremental ? "INCREMENTAL" : "FULL",
+               region_count, is_incremental ? "changed pages" : "regions",
+               (unsigned long)total_bytes, written_pages, pg_count, dump_dir);
 
     free(modules);
     free(map_path);
+    free(tl_path);
+    free(diff_path);
+    free(dump_root_dir);
     free(dump_dir);
+    return true;
+
+cleanup:
+    if (artifact_f != NULL) {
+        fclose(artifact_f);
+    }
+    if (diff_f != NULL) {
+        fclose(diff_f);
+    }
+    if (tl_f != NULL) {
+        fclose(tl_f);
+    }
+    if (map_f != NULL) {
+        fclose(map_f);
+    }
+    free(artifact_path);
+    free(replacement_pages);
+    free(cur_snap);
+    free(pages);
+    free(modules);
+    free(map_path);
+    free(tl_path);
+    free(diff_path);
+    free(dump_root_dir);
+    free(dump_dir);
+    return false;
 }
+
+
 
 bool handle_hypercall_kafl_hook(struct kvm_run *run,
                                 CPUState       *cpu,
@@ -1944,6 +2095,11 @@ int handle_kafl_hypercall(struct kvm_run *run,
         ret = 0;
         break;
     }
+    case KVM_EXIT_KAFL_STRICT_PT:
+        kvm_arch_get_registers(cpu);
+        wte_handle_strict_exit(cpu, &run->kafl_strict_pt);
+        ret = 0;
+        break;
     case KVM_EXIT_KAFL_WTE_SETUP:
     {
         /*
@@ -1989,15 +2145,16 @@ int handle_kafl_hypercall(struct kvm_run *run,
             break;
         }
 
-        bool is_32bit   = (setup.flags & (1 << 0)) != 0;  /* WTE_FLAG_32BIT */
-        bool eager_nx    = (setup.flags & (1 << 1)) != 0;  /* WTE_FLAG_EAGER_NX */
+        bool is_32bit = (setup.flags & WTE_FLAG_32BIT) != 0;
+        bool eager_nx = (setup.flags & WTE_FLAG_EAGER_NX) != 0;
+        bool strict_pt = wte_strict_mode_requested(setup.flags);
 
         nyx_printf("[WtE] WTE_SETUP: PID=%lu image_base=0x%lx image_size=0x%lx "
-                   "flags=0x%x (32bit=%d eager_nx=%d) harness_cr3=0x%lx\n",
+                   "flags=0x%x (32bit=%d eager_nx=%d strict=%d) harness_cr3=0x%lx\n",
                    (unsigned long)setup.target_pid,
                    (unsigned long)setup.image_base,
                    (unsigned long)setup.image_size,
-                   setup.flags, is_32bit, eager_nx,
+                   setup.flags, is_32bit, eager_nx, strict_pt,
                    (unsigned long)harness_cr3);
 
         /* Step 1: Create root snapshot for baseline (if not already created)
@@ -2050,7 +2207,16 @@ int handle_kafl_hypercall(struct kvm_run *run,
 
         /* Step 3: Initialize and activate WtE with child CR3 */
         wte_init();
-        wte_activate(child_cr3, !is_32bit);  /* is_64bit = !is_32bit */
+        if (strict_pt) {
+            if (!wte_activate_strict(cpu, child_cr3, !is_32bit,
+                                     setup.image_base, setup.image_size)) {
+                set_return_value(cpu, 0);
+                ret = 0;
+                break;
+            }
+        } else {
+            wte_activate(child_cr3, !is_32bit);
+        }
         nyx_printf("[WtE] WTE_SETUP: WtE activated (cr3=0x%lx, %s)\n",
                    (unsigned long)child_cr3, is_32bit ? "32-bit" : "64-bit");
 
@@ -2063,9 +2229,9 @@ int handle_kafl_hypercall(struct kvm_run *run,
         }
 
         /* Step 4: Protect target PE pages with W=0 + X=0 (Dual-Watch) */
-        if (setup.image_base != 0 && setup.image_size != 0) {
+        if (!strict_pt && setup.image_base != 0 && setup.image_size != 0) {
             wte_protect_pe_range(cpu, setup.image_base,
-                                setup.image_size, child_cr3);
+                                 setup.image_size, child_cr3);
             nyx_printf("[WtE] WTE_SETUP: Dual-Watch protection set on PE "
                        "[0x%lx - 0x%lx]\n",
                        (unsigned long)setup.image_base,
@@ -2079,7 +2245,7 @@ int handle_kafl_hypercall(struct kvm_run *run,
          * crashing QEMU with 'Broken pipe'. */
 
         /* Step 6: Diagnostic — map target PE VA→GFN for tracking */
-        if (setup.image_base != 0 && setup.image_size != 0) {
+        if (!strict_pt && setup.image_base != 0 && setup.image_size != 0) {
             wte_diagnose_target_pe(cpu, setup.image_base, setup.image_size);
         }
 
@@ -2127,8 +2293,8 @@ int handle_kafl_hypercall(struct kvm_run *run,
                 .wte_count       = 0,
                 .total_wte_count = 0,
             };
-            dump_full_process_memory(cpu, env, "ep_initial_packed",
-                                     &ep_evt, child_cr3);
+            (void)dump_full_process_memory(cpu, env, "ep_initial_packed",
+                                           &ep_evt, child_cr3);
         }
 
         /* Return child CR3 to guest so harness can use it for SUBMIT_CR3 */
