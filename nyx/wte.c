@@ -1061,12 +1061,88 @@ void wte_register_dynamic_exec_region(CPUState *cpu,
         wte_page_entry_t *entry = wte_lookup_or_create_va(va, gfn);
         if (!entry) continue;
 
-        if (!(entry->flags & (WTE_PAGE_X_BLOCKED | WTE_PAGE_X_ALLOWED))) {
-            entry->gpa = gpa;
-            cpu_physical_memory_read(gpa, entry->baseline, WTE_PAGE_SIZE);
-            entry->baseline_valid = true;
-            memcpy(entry->current, entry->baseline, WTE_PAGE_SIZE);
+        const bool already_dynamic =
+            (entry->flags & WTE_PAGE_IS_DYNAMIC) != 0;
+        const bool baseline_valid = entry->baseline_valid;
+        const bool first_exec_pending =
+            (entry->flags & WTE_PAGE_DYN_FIRST_EXEC_PENDING) != 0;
+        const bool gfn_changed = (entry->gfn != gfn);
+
+        uint8_t observed_page[WTE_PAGE_SIZE];
+        cpu_physical_memory_read(gpa, observed_page, WTE_PAGE_SIZE);
+
+        bool content_changed = false;
+        if (baseline_valid) {
+            content_changed =
+                memcmp(entry->baseline, observed_page, WTE_PAGE_SIZE) != 0;
         }
+
+        const struct wte_dynamic_registration_policy_input policy_input = {
+            .already_dynamic = already_dynamic,
+            .baseline_valid = baseline_valid,
+            .first_exec_pending = first_exec_pending,
+            .content_changed = content_changed,
+            .gfn_changed = gfn_changed,
+        };
+
+        enum wte_dynamic_registration_policy_action action =
+            wte_dynamic_registration_policy_decide(&policy_input);
+
+        if (action == WTE_DYNAMIC_REGISTRATION_POLICY_KEEP_STATE) {
+            continue;
+        }
+
+        if (gfn_changed) {
+            uint64_t old_gfn = entry->gfn;
+            if (old_gfn != 0 && old_gfn != gfn) {
+                if (!wte_gfn_has_other_reference(old_gfn, va)) {
+                    if (entry->flags & WTE_PAGE_X_BLOCKED) {
+                        wte_kvm_clear_nx(&old_gfn, 1);
+                    }
+                    if (entry->flags & WTE_PAGE_W_PROTECTED) {
+                        wte_kvm_clear_wp(&old_gfn, 1);
+                    }
+                }
+            }
+        }
+
+        entry->gfn = gfn;
+        entry->gpa = gpa;
+        memcpy(entry->current, observed_page, WTE_PAGE_SIZE);
+
+        if (action == WTE_DYNAMIC_REGISTRATION_POLICY_MAPPING_REFRESH) {
+            if (entry->flags & WTE_PAGE_X_BLOCKED) {
+                nx_batch[nx_count++] = gfn;
+                if (nx_count >= WTE_MAX_BATCH_GFNS) {
+                    wte_kvm_set_nx(nx_batch, nx_count);
+                    nx_count = 0;
+                }
+            }
+            if (entry->flags & WTE_PAGE_W_PROTECTED) {
+                wp_batch[wp_count++] = gfn;
+                if (wp_count >= WTE_MAX_BATCH_GFNS) {
+                    wte_kvm_set_wp(wp_batch, wp_count);
+                    wp_count = 0;
+                }
+            }
+            registered++;
+            continue;
+        }
+
+        if (!already_dynamic || !baseline_valid) {
+            memcpy(entry->baseline, entry->current, WTE_PAGE_SIZE);
+            entry->baseline_valid = true;
+            entry->diff_count = 0;
+            entry->flags &= ~WTE_PAGE_WRITTEN;
+        } else {
+            wte_compute_diff(entry);
+            if (entry->diff_count > 0) {
+                entry->flags |= WTE_PAGE_WRITTEN;
+            } else {
+                entry->flags &= ~WTE_PAGE_WRITTEN;
+            }
+        }
+
         entry->flags &= ~WTE_PAGE_X_ALLOWED;
         entry->flags |= WTE_PAGE_IS_DYNAMIC | WTE_PAGE_X_BLOCKED |
                         WTE_PAGE_W_PROTECTED |
