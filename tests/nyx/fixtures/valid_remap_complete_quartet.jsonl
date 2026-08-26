@@ -1,0 +1,10 @@
+{"event":"REGISTER_COMMIT","range_id":12,"page_index":1,"generation":5}
+{"event":"PT_WRITE","range_id":12,"page_index":1,"generation":5}
+{"event":"PT_REWALK","range_id":12,"page_index":1,"generation":5}
+{"event":"TARGET_NX_INSTALL","range_id":12,"page_index":1,"generation":5}
+{"event":"TLB_FLUSH","range_id":12,"page_index":1,"generation":5}
+{"event":"STRICT_EXEC_EXIT","range_id":12,"page_index":1,"generation":5}
+{"event":"QEMU_DUMP_BEGIN","range_id":12,"page_index":1,"generation":5}
+{"event":"QEMU_DUMP_END","range_id":12,"page_index":1,"generation":5}
+{"event":"STRICT_ACK","range_id":12,"page_index":1,"generation":5}
+{"event":"GUEST_EXECUTED","range_id":12,"page_index":1,"generation":5}
